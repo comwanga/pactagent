@@ -1,4 +1,9 @@
-import { deserializeProofs, type P2PKOptions, type Proof } from "@cashu/cashu-ts";
+import {
+  CheckStateEnum,
+  deserializeProofs,
+  type P2PKOptions,
+  type Proof,
+} from "@cashu/cashu-ts";
 import { describe, expect, it, vi } from "vitest";
 
 import { sats } from "../domain/money";
@@ -10,6 +15,7 @@ import {
   createPrivateCashuFunding,
   createPrivateCashuSpendingKey,
   normalizeCashuTestMintConfiguration,
+  normalizeCashuPrivateProofState,
   type CashuMintCapabilitySnapshot,
   type CashuMintPrivateBackend,
   type CashuPrivatePreparedSwap,
@@ -409,6 +415,23 @@ describe("Cashu test-mint private operations", () => {
       });
     },
   );
+
+  it("rejects an unknown Cashu proof state instead of treating it as spent", () => {
+    expect(normalizeCashuPrivateProofState(CheckStateEnum.SPENT)).toEqual({ state: "spent" });
+
+    let caught: unknown;
+    try {
+      normalizeCashuPrivateProofState("UNKNOWN" as unknown as CheckStateEnum);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(CashuPrivateBackendError);
+    expect(caught).toMatchObject({
+      code: "malformed_response",
+      submissionStatus: "not_submitted",
+    });
+  });
 
   it("rejects value from an unknown or incompatible keyset", async () => {
     const { adapter, backend } = harness();

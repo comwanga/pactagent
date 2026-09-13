@@ -483,6 +483,14 @@ export interface CashuPrivateProofState {
   readonly state: CashuProofState;
 }
 
+/** @internal Normalizes the library wire value without treating unknown states as spent. */
+export function normalizeCashuPrivateProofState(state: unknown): CashuPrivateProofState {
+  if (state === CheckStateEnum.UNSPENT) return Object.freeze({ state: "unspent" });
+  if (state === CheckStateEnum.PENDING) return Object.freeze({ state: "pending" });
+  if (state === CheckStateEnum.SPENT) return Object.freeze({ state: "spent" });
+  throw new CashuPrivateBackendError("malformed_response", "not_submitted");
+}
+
 export type CashuPrivateBackendErrorCode =
   | "timeout"
   | "unavailable"
@@ -1551,14 +1559,7 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
     await this.ensureWallet();
     try {
       const states = await this.wallet.checkProofsStates([...proofs]);
-      return states.map((state) => ({
-        state:
-          state.state === CheckStateEnum.UNSPENT
-            ? "unspent"
-            : state.state === CheckStateEnum.PENDING
-              ? "pending"
-              : "spent",
-      }));
+      return states.map((state) => normalizeCashuPrivateProofState(state.state));
     } catch (error) {
       throw backendFailure(error, "not_submitted");
     }
