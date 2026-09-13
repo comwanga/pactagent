@@ -13,6 +13,7 @@ The first pivot phase provides a local, deterministic open-protocol foundation:
 - deterministic pricing, budget, duration, network, and escrow compatibility checks;
 - a PIP-01 `cashu_escrow` descriptor alongside the existing swap-specific PIP-03 timeout plan;
 - a relay-backed PactAgent service-agreement lifecycle for `document-summary@1`;
+- a private, explicitly configured Cashu test-mint adapter with NUT-11 locking and safe recovery;
 - one bounded `document-summary` fixture and a transparent UI walkthrough.
 
 The PIP-01 path now constructs a kind `30361` descriptor, signs it through the
@@ -37,10 +38,11 @@ the referenced PIP-00 identities and PIP-01 descriptor, reconstructs history fro
 predecessor event IDs, and refuses unauthorized, stale, forked, or terminal-state
 advancement. It does not synthesize a PIP-02 kind `7300` swap for document-summary.
 
-No AI execution, Cashu token handling, mint connection, escrow funding, or real
-funds movement exists. Private documents, full results, Cashu tokens, proofs,
-credentials, preimages, payout instructions, and key material are not part of
-public models.
+No AI execution, agreement-level escrow orchestration, or real funds movement
+exists. The Cashu adapter can connect to one explicitly configured test mint,
+but its required tests are deterministic and offline. Cashu tokens, proofs,
+credentials, preimages, payout instructions, and key material remain private and
+are not part of public models.
 
 ## Technology
 
@@ -82,6 +84,8 @@ The public descriptor wire shape and boundary are documented in the
 [PIP-01 Cashu descriptor flow](docs/pip01-cashu-descriptor.md).
 The application event shape and lifecycle are documented in
 [PactAgent service agreements](docs/pact-service-agreements.md).
+The private mint boundary and opt-in live check are documented in the
+[Cashu test-mint adapter](docs/cashu-test-mint-adapter.md).
 
 ## Collaboration
 
