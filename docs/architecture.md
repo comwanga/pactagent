@@ -17,7 +17,7 @@ P001 Requester ---------------- P002 Provider
                        |
               +--------+--------+
               |                 |
-        NostrRelayAdapter      Cashu         NOT CONNECTED
+        NostrRelayAdapter      Cashu test-mint adapter
               |                 |
               +---- Pontmore ---+
                   public state
@@ -48,9 +48,11 @@ The older Pontmore PoCs were inspected as implementation references only. Where 
 Public protocol candidates include agent capabilities, escrow compatibility, agreement references, amounts, lifecycle states, result hashes/references, and settlement outcomes.
 
 Private data includes uploaded documents, raw prompts, complete provider results,
-sensitive evidence, raw Cashu tokens, mint credentials, preimages, payout
-instructions, commitment salts, and Nostr private keys. None are accepted by the
-public agreement serializers. Private transport is outside issue #10.
+sensitive evidence, raw Cashu tokens and proofs, witnesses, blinded outputs,
+mint credentials, preimages, payout instructions, commitment salts, Cashu
+spending keys, and Nostr private keys. None are accepted by the public agreement
+serializers. The issue #12 adapter confines Cashu material to private wrappers
+and an injected private store; private task transport remains outside issue #10.
 
 ## Authority separation
 
@@ -91,4 +93,7 @@ application dispute-authority record.
 
 Fixtures demonstrate one decision: P001 may select P002's `document-summary` offer at 350 sats because it is below P001's 500-sat budget and 450-sat provider-price ceiling, above P002's 200-sat minimum, within both duration limits, and compatible with the declared Cashu escrow.
 
-No generic marketplace, live discovery, reputation, bidding, task execution, automatic settlement, or dispute adjudication is implemented.
+No generic marketplace, live discovery, reputation, bidding, task execution,
+agreement-level settlement orchestration, or dispute adjudication is implemented.
+The private Cashu adapter reports mint facts only and cannot authorize, sign,
+publish, or advance an agreement transition.
