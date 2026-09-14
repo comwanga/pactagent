@@ -14,6 +14,7 @@ The first pivot phase provides a local, deterministic open-protocol foundation:
 - a PIP-01 `cashu_escrow` descriptor alongside the existing swap-specific PIP-03 timeout plan;
 - a relay-backed PactAgent service-agreement lifecycle for `document-summary@1`;
 - a private, explicitly configured Cashu test-mint adapter with NUT-11 locking and safe recovery;
+- a durable, idempotent Cashu escrow settlement coordinator for the 350-sat PoC;
 - one bounded `document-summary` fixture and a transparent UI walkthrough.
 
 The PIP-01 path now constructs a kind `30361` descriptor, signs it through the
@@ -86,6 +87,8 @@ The application event shape and lifecycle are documented in
 [PactAgent service agreements](docs/pact-service-agreements.md).
 The private mint boundary and opt-in live check are documented in the
 [Cashu test-mint adapter](docs/cashu-test-mint-adapter.md).
+The application settlement contract and coordinator are documented in
+[Cashu escrow settlement](docs/cashu-escrow-settlement.md).
 
 ## Collaboration
 

@@ -1,0 +1,330 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "PactAgent Cashu escrow service",
+    "version": "1.0.0",
+    "description": "Application service contract for one 350-sat document-summary@1 escrow. It is not a Pontmore PIP, Nostr standard, Cashu extension, or wallet API."
+  },
+  "servers": [],
+  "x-pactagent-schema-id": "pactagent/cashu-escrow-service@1",
+  "x-pactagent-advertisement": "deferred-until-stable-https-location",
+  "paths": {
+    "/v1/escrows": {
+      "post": {
+        "operationId": "prepareEscrow",
+        "summary": "Prepare an escrow bound to an accepted PactAgent agreement",
+        "x-pactagent-authentication": "Configured escrow authority and canonical signed agreement history",
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+        "requestBody": { "$ref": "#/components/requestBodies/AgreementRequest" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}/fund": {
+      "post": {
+        "operationId": "fundEscrow",
+        "summary": "Confirm private locked value before publishing escrow_funded",
+        "description": "private_funding_reference resolves only inside the private #12 adapter/store boundary and is never returned by status.",
+        "x-pactagent-authentication": "Configured escrow authority and canonical accepted history",
+        "parameters": [
+          { "$ref": "#/components/parameters/EscrowReference" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/ExpectedVersion" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  { "$ref": "#/components/schemas/AgreementBinding" },
+                  {
+                    "type": "object",
+                    "required": ["private_funding_reference"],
+                    "properties": {
+                      "private_funding_reference": { "$ref": "#/components/schemas/OpaqueReference" }
+                    }
+                  }
+                ]
+              },
+              "example": {
+                "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "private_funding_reference": "private-store-reference-not-public-evidence"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}": {
+      "get": {
+        "operationId": "inspectEscrowStatus",
+        "summary": "Inspect the safe operational escrow projection",
+        "parameters": [{ "$ref": "#/components/parameters/EscrowReference" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/EscrowStatus" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}/release-authorizations": {
+      "post": {
+        "operationId": "submitReleaseAuthorization",
+        "summary": "Bind the requester-signed release_authorized transition to verified completion",
+        "x-pactagent-authentication": "Valid requester signature and canonical #10 predecessor chain",
+        "parameters": [
+          { "$ref": "#/components/parameters/EscrowReference" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/ExpectedVersion" }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/ReleaseAuthorization" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}/release": {
+      "post": {
+        "operationId": "releaseEscrow",
+        "summary": "Execute an authorized release and then publish settled",
+        "x-pactagent-authentication": "Previously consumed requester release authorization plus configured escrow authority",
+        "parameters": [
+          { "$ref": "#/components/parameters/EscrowReference" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/ExpectedVersion" }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/AgreementRequest" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}/refund-authorizations": {
+      "post": {
+        "operationId": "submitRefundAuthorization",
+        "summary": "Bind a requester-signed refund_authorized transition to timeout or rejection",
+        "x-pactagent-authentication": "Valid requester signature and canonical #10 predecessor chain",
+        "parameters": [
+          { "$ref": "#/components/parameters/EscrowReference" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/ExpectedVersion" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  { "$ref": "#/components/schemas/AgreementBinding" },
+                  {
+                    "type": "object",
+                    "required": ["refund_authorization_event_id", "basis"],
+                    "properties": {
+                      "refund_authorization_event_id": { "$ref": "#/components/schemas/EventId" },
+                      "basis": { "type": "string", "enum": ["timeout", "rejected"] }
+                    }
+                  }
+                ]
+              },
+              "example": {
+                "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "refund_authorization_event_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "basis": "timeout"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/escrows/{escrow_reference}/refund": {
+      "post": {
+        "operationId": "refundEscrow",
+        "summary": "Execute an authorized refund and then publish refunded",
+        "x-pactagent-authentication": "Previously consumed requester refund authorization plus configured escrow authority",
+        "parameters": [
+          { "$ref": "#/components/parameters/EscrowReference" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/ExpectedVersion" }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/AgreementRequest" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SettlementResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "EscrowReference": {
+        "name": "escrow_reference",
+        "in": "path",
+        "required": true,
+        "schema": { "$ref": "#/components/schemas/OpaqueReference" }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "schema": { "type": "string", "minLength": 8, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]+$" }
+      },
+      "ExpectedVersion": {
+        "name": "If-Match-Version",
+        "in": "header",
+        "required": true,
+        "schema": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "requestBodies": {
+      "AgreementRequest": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/AgreementBinding" },
+            "example": { "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+          }
+        }
+      },
+      "ReleaseAuthorization": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                { "$ref": "#/components/schemas/AgreementBinding" },
+                {
+                  "type": "object",
+                  "required": ["release_authorization_event_id", "result_reference"],
+                  "properties": {
+                    "release_authorization_event_id": { "$ref": "#/components/schemas/EventId" },
+                    "result_reference": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                  }
+                }
+              ]
+            },
+            "example": {
+              "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "release_authorization_event_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "result_reference": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "EscrowStatus": {
+        "description": "Safe service-local status",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EscrowStatus" } } }
+      },
+      "SettlementResult": {
+        "description": "Confirmed, publication-pending, or reconciliation-required result",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SettlementResult" } } }
+      },
+      "Error": {
+        "description": "Redacted application error",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "EventId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+      "OpaqueReference": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+      "AgreementBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agreement_root_event_id"],
+        "properties": { "agreement_root_event_id": { "$ref": "#/components/schemas/EventId" } }
+      },
+      "EscrowStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["service_version", "escrow_reference", "agreement_id", "agreement_root_event_id", "state", "version", "amount_sats", "unit"],
+        "properties": {
+          "service_version": { "const": 1 },
+          "escrow_reference": { "$ref": "#/components/schemas/OpaqueReference" },
+          "agreement_id": { "type": "string" },
+          "agreement_root_event_id": { "$ref": "#/components/schemas/EventId" },
+          "state": {
+            "type": "string",
+            "enum": ["prepared", "funding_pending", "funding_reconciliation_required", "funding_confirmed", "funded", "release_authorized", "release_pending", "release_reconciliation_required", "release_confirmed", "settled", "refund_authorized", "refund_pending", "refund_reconciliation_required", "refund_confirmed", "refunded"]
+          },
+          "version": { "type": "integer", "minimum": 1 },
+          "amount_sats": { "const": "350" },
+          "unit": { "const": "sat" },
+          "result_reference": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "settlement_reference": { "$ref": "#/components/schemas/OpaqueReference" },
+          "refund_reference": { "$ref": "#/components/schemas/OpaqueReference" },
+          "transition_event_id": { "$ref": "#/components/schemas/EventId" }
+        },
+        "example": {
+          "service_version": 1,
+          "escrow_reference": "pactescrow_11111111-1111-4111-8111-111111111111",
+          "agreement_id": "12345678-1234-4234-9234-123456789abc",
+          "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "funded",
+          "version": 4,
+          "amount_sats": "350",
+          "unit": "sat"
+        }
+      },
+      "SettlementResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome", "escrow"],
+        "properties": {
+          "outcome": { "type": "string", "enum": ["confirmed", "publication_pending", "reconciliation_required"] },
+          "escrow": { "$ref": "#/components/schemas/EscrowStatus" }
+        },
+        "example": {
+          "outcome": "confirmed",
+          "escrow": {
+            "service_version": 1,
+            "escrow_reference": "pactescrow_11111111-1111-4111-8111-111111111111",
+            "agreement_id": "12345678-1234-4234-9234-123456789abc",
+            "agreement_root_event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "funded",
+            "version": 4,
+            "amount_sats": "350",
+            "unit": "sat"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": ["invalid_request", "unsupported_mint_or_unit", "unsupported_spending_condition", "agreement_mismatch", "participant_mismatch", "unauthorized_operation", "invalid_state", "stale_state", "idempotency_conflict", "funding_not_confirmed", "completion_not_authorized", "timeout_not_reached", "already_released", "already_refunded", "settlement_conflict", "mint_unavailable", "reconciliation_required", "privacy_boundary_violation"]
+          },
+          "message": { "type": "string" }
+        },
+        "example": {
+          "code": "stale_state",
+          "message": "Escrow version does not match the expected version"
+        }
+      }
+    }
+  }
+}
