@@ -16,9 +16,9 @@ const SECP256K1_ORDER = hexToBytes(
   "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
 );
 
-type NostrPrivateKey = string & { readonly __nostrPrivateKey: "NostrPrivateKey" };
+export type NostrPrivateKey = string & { readonly __nostrPrivateKey: "NostrPrivateKey" };
 
-function hexToBytes(hex: string): Uint8Array {
+export function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
@@ -26,7 +26,7 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-function bytesToHex(bytes: Uint8Array): string {
+export function bytesToHex(bytes: Uint8Array): string {
   let hex = "";
   for (const b of bytes) hex += b.toString(16).padStart(2, "0");
   return hex;
@@ -43,7 +43,7 @@ function isLessThan(a: Uint8Array, b: Uint8Array): boolean {
   return false;
 }
 
-function parseNostrPrivateKey(value: string): NostrPrivateKey {
+export function parseNostrPrivateKey(value: string): NostrPrivateKey {
   if (typeof value !== "string" || !PRIVATE_KEY_PATTERN.test(value)) {
     throw new InvalidDomainInputError("Nostr private key must be 64 lowercase hexadecimal characters");
   }
