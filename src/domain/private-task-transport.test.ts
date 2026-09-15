@@ -1,68 +1,62 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  createPrivateResultReference,
-  createPrivateTaskReference,
-  parsePrivateTaskEvent,
-  PACTAGENT_PRIVATE_TASK_KIND,
-  PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
   PrivateTaskTransportError,
   validatePrivateResultPayload,
   validatePrivateTaskPayload,
-  validateSealedPrivateTask,
+  validateProvenance,
+  NIP59_SEAL_KIND,
+  NIP59_GIFT_WRAP_KIND,
   type PrivateResultPayload,
   type PrivateTaskPayload,
 } from "./private-task-transport";
-import { nostrPublicKey, type NostrTag, type UnsignedNostrEvent } from "./nostr";
+import { nostrPublicKey } from "./nostr";
 
-const VALID_AGREEMENT_ID = "pact-demo-agreement-001";
 const PROVIDER_PUBKEY = nostrPublicKey("22".repeat(32));
 const REQUESTER_PUBKEY = nostrPublicKey("11".repeat(32));
 
 function createValidPayload(overrides?: Partial<PrivateTaskPayload>): PrivateTaskPayload {
   return {
-    version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-    agreement_id: VALID_AGREEMENT_ID,
     source_document: "This is a confidential document that must not appear in public events.",
     input_media_type: "text/plain",
-    private_prompt: "Summarize this document in 200 words without revealing sensitive details.",
+    private_prompt: "Summarize this document in 200 words.",
     ...overrides,
   };
 }
 
 function createValidResult(overrides?: Partial<PrivateResultPayload>): PrivateResultPayload {
   return {
-    version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-    agreement_id: VALID_AGREEMENT_ID,
-    summary: "The document discusses private matters that are summarized here.",
-    evidence: "Evidence hash chain proving the summary was derived from the source.",
+    summary: "The document discusses private matters.",
     ...overrides,
+  };
+}
+
+function createValidProvenance() {
+  return {
+    agreementId: "pact-demo-agreement-001",
+    agreementRoot: "a".repeat(64),
+    authorizedSender: REQUESTER_PUBKEY,
+    recipient: PROVIDER_PUBKEY,
   };
 }
 
 describe("Private task transport domain", () => {
   describe("validatePrivateTaskPayload", () => {
-    it("accepts a valid payload", () => {
+    it("accepts a valid payload with a prompt", () => {
       const payload = createValidPayload();
       const validated = validatePrivateTaskPayload(payload);
       expect(validated).toEqual(payload);
     });
 
-    it("rejects a payload with unsupported fields", () => {
+    it("accepts a valid payload without a prompt", () => {
+      const payload = createValidPayload({ private_prompt: undefined });
+      const validated = validatePrivateTaskPayload(payload);
+      expect(validated.private_prompt).toBeUndefined();
+    });
+
+    it("rejects unsupported fields", () => {
       expect(() =>
         validatePrivateTaskPayload({ ...createValidPayload(), extra: true } as unknown),
-      ).toThrow(PrivateTaskTransportError);
-    });
-
-    it("rejects a payload missing required fields", () => {
-      const { source_document, ...rest } = createValidPayload();
-      void source_document;
-      expect(() => validatePrivateTaskPayload(rest)).toThrow(PrivateTaskTransportError);
-    });
-
-    it("rejects an unsupported version", () => {
-      expect(() =>
-        validatePrivateTaskPayload({ ...createValidPayload(), version: 2 }),
       ).toThrow(PrivateTaskTransportError);
     });
 
@@ -72,33 +66,21 @@ describe("Private task transport domain", () => {
       ).toThrow(PrivateTaskTransportError);
     });
 
-    it("rejects a payload containing a Cashu token string", () => {
+    it("rejects an unsupported media type", () => {
       expect(() =>
-        validatePrivateTaskPayload({
-          ...createValidPayload(),
-          private_prompt: "cashuAsecret-token-here",
-        }),
+        validatePrivateTaskPayload({ ...createValidPayload(), input_media_type: "image/png" }),
+      ).toThrow(PrivateTaskTransportError);
+    });
+
+    it("rejects a payload containing a Cashu token", () => {
+      expect(() =>
+        validatePrivateTaskPayload({ ...createValidPayload(), private_prompt: "cashuAtoken-leak" }),
       ).toThrow(PrivateTaskTransportError);
     });
 
     it("rejects a payload containing an nsec1 string", () => {
       expect(() =>
-        validatePrivateTaskPayload({
-          ...createValidPayload(),
-          source_document: "nsec1secret-key-material",
-        }),
-      ).toThrow(PrivateTaskTransportError);
-    });
-
-    it("rejects a malformed agreement_id", () => {
-      expect(() =>
-        validatePrivateTaskPayload({ ...createValidPayload(), agreement_id: "  " }),
-      ).toThrow(PrivateTaskTransportError);
-    });
-
-    it("rejects a non-string agreement_id without crashing", () => {
-      expect(() =>
-        validatePrivateTaskPayload({ ...createValidPayload(), agreement_id: 123 } as unknown),
+        validatePrivateTaskPayload({ ...createValidPayload(), source_document: "nsec1secret-key" }),
       ).toThrow(PrivateTaskTransportError);
     });
 
@@ -107,6 +89,11 @@ describe("Private task transport domain", () => {
       expect(() =>
         validatePrivateTaskPayload({ ...createValidPayload(), source_document: oversized }),
       ).toThrow(PrivateTaskTransportError);
+    });
+
+    it("accepts application/pdf media type", () => {
+      const payload = createValidPayload({ input_media_type: "application/pdf" });
+      expect(() => validatePrivateTaskPayload(payload)).not.toThrow();
     });
   });
 
@@ -117,157 +104,61 @@ describe("Private task transport domain", () => {
       expect(validated).toEqual(result);
     });
 
-    it("rejects a result with forbidden material", () => {
+    it("rejects unsupported fields", () => {
       expect(() =>
-        validatePrivateResultPayload({
-          ...createValidResult(),
-          evidence: "cashuBtoken-material",
-        }),
+        validatePrivateResultPayload({ ...createValidResult(), evidence: "extra" } as unknown),
+      ).toThrow(PrivateTaskTransportError);
+    });
+
+    it("rejects an empty summary", () => {
+      expect(() =>
+        validatePrivateResultPayload({ ...createValidResult(), summary: "  " }),
+      ).toThrow(PrivateTaskTransportError);
+    });
+
+    it("rejects a result containing a Cashu token", () => {
+      expect(() =>
+        validatePrivateResultPayload({ ...createValidResult(), summary: "cashuAtoken-leak" }),
       ).toThrow(PrivateTaskTransportError);
     });
   });
 
-  describe("createPrivateTaskReference", () => {
-    it("produces a deterministic sha256 hash", () => {
-      const payload = createValidPayload();
-      const ref1 = createPrivateTaskReference(payload);
-      const ref2 = createPrivateTaskReference(payload);
-      expect(ref1.hash).toBe(ref2.hash);
-      expect(ref1.hash).toMatch(/^[0-9a-f]{64}$/);
-      expect(ref1.scheme).toBe("sha256-hex-canonical-json-v1");
-      expect(ref1.kind).toBe("task");
-      expect(ref1.agreement_id).toBe(payload.agreement_id);
+  describe("validateProvenance", () => {
+    it("accepts valid provenance", () => {
+      const provenance = createValidProvenance();
+      const validated = validateProvenance(provenance);
+      expect(validated).toEqual(provenance);
     });
 
-    it("produces a different hash for different payloads", () => {
-      const ref1 = createPrivateTaskReference(createValidPayload({ source_document: "doc A" }));
-      const ref2 = createPrivateTaskReference(createValidPayload({ source_document: "doc B" }));
-      expect(ref1.hash).not.toBe(ref2.hash);
-    });
-  });
-
-  describe("createPrivateResultReference", () => {
-    it("produces a deterministic sha256 hash for results", () => {
-      const result = createValidResult();
-      const ref = createPrivateResultReference(result);
-      expect(ref.hash).toMatch(/^[0-9a-f]{64}$/);
-      expect(ref.kind).toBe("result");
-    });
-  });
-
-  describe("validateSealedPrivateTask", () => {
-    it("accepts a valid sealed envelope", () => {
-      const sealed = {
-        version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-        recipient: PROVIDER_PUBKEY,
-        sender: REQUESTER_PUBKEY,
-        ciphertext: "base64-encrypted-data",
-        payload_hash: "a".repeat(64),
-        agreement_id: VALID_AGREEMENT_ID,
-      };
-      const validated = validateSealedPrivateTask(sealed);
-      expect(validated).toEqual(sealed);
-    });
-
-    it("rejects an envelope with unsupported fields", () => {
+    it("rejects when sender and recipient are the same", () => {
       expect(() =>
-        validateSealedPrivateTask({
-          version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-          recipient: PROVIDER_PUBKEY,
-          sender: REQUESTER_PUBKEY,
-          ciphertext: "data",
-          payload_hash: "a".repeat(64),
-          agreement_id: VALID_AGREEMENT_ID,
-          extra: true,
-        } as unknown),
+        validateProvenance({ ...createValidProvenance(), recipient: REQUESTER_PUBKEY }),
       ).toThrow(PrivateTaskTransportError);
     });
 
-    it("rejects an envelope with an invalid recipient pubkey", () => {
+    it("rejects an invalid authorizedSender", () => {
       expect(() =>
-        validateSealedPrivateTask({
-          version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-          recipient: "not-a-pubkey",
-          sender: REQUESTER_PUBKEY,
-          ciphertext: "data",
-          payload_hash: "a".repeat(64),
-          agreement_id: VALID_AGREEMENT_ID,
-        }),
+        validateProvenance({ ...createValidProvenance(), authorizedSender: "not-a-pubkey" }),
       ).toThrow(PrivateTaskTransportError);
     });
 
-    it("rejects an envelope with an invalid payload_hash", () => {
+    it("rejects unsupported fields", () => {
       expect(() =>
-        validateSealedPrivateTask({
-          version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-          recipient: PROVIDER_PUBKEY,
-          sender: REQUESTER_PUBKEY,
-          ciphertext: "data",
-          payload_hash: "not-a-hash",
-          agreement_id: VALID_AGREEMENT_ID,
-        }),
+        validateProvenance({ ...createValidProvenance(), extra: true } as unknown),
+      ).toThrow(PrivateTaskTransportError);
+    });
+
+    it("rejects an empty agreementId", () => {
+      expect(() =>
+        validateProvenance({ ...createValidProvenance(), agreementId: "" }),
       ).toThrow(PrivateTaskTransportError);
     });
   });
 
-  describe("parsePrivateTaskEvent", () => {
-    it("round-trips a sealed envelope through an unsigned event", () => {
-      const sealed = {
-        version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-        recipient: PROVIDER_PUBKEY,
-        sender: REQUESTER_PUBKEY,
-        ciphertext: "base64-encrypted-data",
-        payload_hash: "a".repeat(64),
-        agreement_id: VALID_AGREEMENT_ID,
-      };
-      const agreementRoot = "3921:abc:def";
-      const event: UnsignedNostrEvent = {
-        pubkey: REQUESTER_PUBKEY,
-        created_at: 1000,
-        kind: PACTAGENT_PRIVATE_TASK_KIND,
-        tags: [
-          ["d", VALID_AGREEMENT_ID],
-          ["p", PROVIDER_PUBKEY],
-          ["a", agreementRoot],
-        ] as NostrTag[],
-        content: JSON.stringify(sealed),
-      };
-      const parsed = parsePrivateTaskEvent(event);
-      expect(parsed).toEqual(sealed);
-    });
-
-    it("rejects an event with the wrong kind", () => {
-      const event: UnsignedNostrEvent = {
-        pubkey: REQUESTER_PUBKEY,
-        created_at: 1000,
-        kind: 30360,
-        tags: [["d", VALID_AGREEMENT_ID]] as NostrTag[],
-        content: "{}",
-      };
-      expect(() => parsePrivateTaskEvent(event)).toThrow(PrivateTaskTransportError);
-    });
-
-    it("rejects an event where sender does not match pubkey", () => {
-      const sealed = {
-        version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-        recipient: PROVIDER_PUBKEY,
-        sender: PROVIDER_PUBKEY,
-        ciphertext: "data",
-        payload_hash: "a".repeat(64),
-        agreement_id: VALID_AGREEMENT_ID,
-      };
-      const event: UnsignedNostrEvent = {
-        pubkey: REQUESTER_PUBKEY,
-        created_at: 1000,
-        kind: PACTAGENT_PRIVATE_TASK_KIND,
-        tags: [
-          ["d", VALID_AGREEMENT_ID],
-          ["p", PROVIDER_PUBKEY],
-          ["a", "3921:abc:def"],
-        ] as NostrTag[],
-        content: JSON.stringify(sealed),
-      };
-      expect(() => parsePrivateTaskEvent(event)).toThrow(PrivateTaskTransportError);
+  describe("NIP-59 constants", () => {
+    it("uses standard Nostr kinds, not invented PactAgent kinds", () => {
+      expect(NIP59_SEAL_KIND).toBe(13);
+      expect(NIP59_GIFT_WRAP_KIND).toBe(1059);
     });
   });
 });

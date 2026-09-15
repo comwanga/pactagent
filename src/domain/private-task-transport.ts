@@ -1,32 +1,42 @@
-import { createHash } from "node:crypto";
-
-import { InvalidDomainInputError } from "./errors";
 import { findForbiddenPublicMaterial } from "./forbidden-material";
-import type { NostrPublicKey, UnsignedNostrEvent } from "./nostr";
+import type { NostrPublicKey } from "./nostr";
 
 /*
- * Private task companion transport.
+ * Private task companion transport (NIP-59 Gift Wrap).
  *
  * The public Nostr lifecycle (kind 3921 agreement/transition events) carries
- * only safe references and hashes — agreement metadata, state, terms
- * commitments, and result references. The actual document, prompt, complete
- * summary, sensitive evidence, and settlement secrets never appear in public
- * events. Instead they are sealed into an encrypted private task envelope
- * addressed to the intended recipient's Nostr public key and transmitted via a
- * separate private companion channel.
+ * only safe references and hashes. The actual document, prompt, summary, and
+ * settlement secrets are sealed into a NIP-59 Gift Wrap — a kind 1059 wrapper
+ * signed by a one-time key, wrapping a kind 13 seal signed by the real sender,
+ * whose content is NIP-44-encrypted private data addressed to the recipient.
  *
- * This module defines the domain shapes and pure validation. The encryption
- * boundary (NIP-04 ECDH + AES) lives in the lib layer.
+ * The wrapper exposes only the recipient (via the p tag) and a one-time
+ * identity. The real sender, agreement ID, and timestamps are hidden inside
+ * encrypted layers. This module defines the domain shapes and pure validation
+ * that align with the existing #10 document-summary@1 capability profile.
+ *
+ * Private terms and results reuse the exact shapes defined by the #10
+ * capability profile: DocumentSummaryPrivateTerms and DocumentSummaryPrivateResult.
+ * The result reference is computed via the #10 profile's createResultReference
+ * so it is bit-identical to what the agreement completion validator expects.
  */
 
-export const PACTAGENT_PRIVATE_TASK_KIND = 30401;
-export const PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION = 1;
+/*
+ * NIP-59 Gift Wrap constants. Kind 13 is the seal; kind 1059 is the wrap.
+ * Neither is a PactAgent-invented kind — both are Nostr standard kinds.
+ */
+export const NIP59_SEAL_KIND = 13;
+export const NIP59_GIFT_WRAP_KIND = 1059;
 
 export type PrivateTaskTransportErrorCode =
   | "invalid_payload"
   | "invalid_sealed_envelope"
   | "forbidden_material_in_cleartext"
-  | "payload_too_large";
+  | "payload_too_large"
+  | "recipient_mismatch"
+  | "sender_not_authorized";
+
+import { InvalidDomainInputError } from "./errors";
 
 export class PrivateTaskTransportError extends InvalidDomainInputError {
   readonly code: PrivateTaskTransportErrorCode;
@@ -43,82 +53,103 @@ function transportError(code: PrivateTaskTransportErrorCode, message: string): n
 }
 
 /*
- * Private task payload — the sensitive data that must never appear in public
- * events. This includes the source document, the private prompt, the complete
- * summary, sensitive evidence, and settlement secrets.
+ * Private task payload — the sensitive data sealed inside the Gift Wrap.
+ * This shape is compatible with DocumentSummaryPrivateTerms from #10:
+ *   - source_document: the confidential document
+ *   - input_media_type: restricted to text/plain or application/pdf
+ *   - private_prompt: optional instruction
+ *
+ * The agreement_id and agreement_root are NOT inside the payload — they are
+ * passed separately to the seal/open functions so the encrypted content does
+ * not need to carry protocol metadata.
  */
 export interface PrivateTaskPayload {
-  readonly version: 1;
-  readonly agreement_id: string;
   readonly source_document: string;
-  readonly input_media_type: string;
-  readonly private_prompt: string;
+  readonly input_media_type: "text/plain" | "application/pdf";
+  readonly private_prompt?: string;
 }
 
 /*
- * Private result payload — the complete summary and sensitive evidence produced
- * by the provider. Sealed back to the requester.
+ * Private result payload — compatible with DocumentSummaryPrivateResult from #10:
+ *   - summary: the complete summary
  */
 export interface PrivateResultPayload {
-  readonly version: 1;
-  readonly agreement_id: string;
   readonly summary: string;
-  readonly evidence: string;
 }
 
-const PAYLOAD_KEYS = ["version", "agreement_id", "source_document", "input_media_type", "private_prompt"] as const;
-const RESULT_KEYS = ["version", "agreement_id", "summary", "evidence"] as const;
+const ALLOWED_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
+const MAX_DOCUMENT_BYTES = 1_000_000;
 
-export const PRIVATE_TASK_MAXIMUM_DOCUMENT_BYTES = 1_000_000;
-
-/*
- * Sealed envelope — the encrypted private payload plus metadata that is safe
- * to publish in the companion event. The ciphertext is the only private data;
- * all envelope fields are safe for public transport.
- */
-export interface SealedPrivateTask {
-  readonly version: 1;
-  readonly recipient: NostrPublicKey;
-  readonly sender: NostrPublicKey;
-  readonly ciphertext: string;
-  readonly payload_hash: string;
-  readonly agreement_id: string;
-}
-
-export interface PrivateTaskReference {
-  readonly hash: string;
-  readonly scheme: "sha256-hex-canonical-json-v1";
-  readonly kind: "task" | "result";
-  readonly agreement_id: string;
-}
-
-function assertNoForbiddenMaterialInPayload(value: unknown, label: string): void {
+function assertNoForbiddenMaterial(value: unknown, label: string): void {
   const reason = findForbiddenPublicMaterial(value);
   if (reason === undefined) return;
-  if (reason.kind === "secret_or_token") {
-    transportError(
-      "forbidden_material_in_cleartext",
-      `Private task ${label} contains a Cashu token, nsec, or secret material that must not appear in any event`,
-    );
-  }
   transportError(
     "forbidden_material_in_cleartext",
-    `Private task ${label} contains a forbidden private field`,
+    `Private task ${label} contains forbidden Cashu token, nsec, or secret material`,
   );
 }
 
-function requireAgreementId(value: unknown): string {
-  if (typeof value !== "string") {
-    transportError("invalid_payload", "Private task agreement_id must be a string");
+export function validatePrivateTaskPayload(input: unknown): PrivateTaskPayload {
+  if (typeof input !== "object" || input === null) {
+    transportError("invalid_payload", "Private task payload must be an object");
   }
-  const id = value.trim();
-  if (!id || id !== value || /[\u0000-\u001f\u007f]/.test(id)) {
-    transportError("invalid_payload", "Private task agreement_id must be a stable non-empty identifier");
+  const candidate = input as Record<string, unknown>;
+  const allowedKeys = ["source_document", "input_media_type", "private_prompt"];
+  if (Object.keys(candidate).some((key) => !allowedKeys.includes(key))) {
+    transportError("invalid_payload", "Private task payload contains unsupported fields");
   }
-  if (findForbiddenPublicMaterial(id) !== undefined) {
-    transportError("forbidden_material_in_cleartext", "Private task agreement_id contains forbidden material");
+  if (typeof candidate.source_document !== "string" || candidate.source_document.length === 0) {
+    transportError("invalid_payload", "Private task source_document must be a non-empty string");
   }
-  return id;
+  if (Buffer.byteLength(candidate.source_document as string, "utf8") > MAX_DOCUMENT_BYTES) {
+    transportError("payload_too_large", "Private task source_document exceeds the maximum document size");
+  }
+  if (!ALLOWED_MEDIA_TYPES.includes(candidate.input_media_type as (typeof ALLOWED_MEDIA_TYPES)[number])) {
+    transportError("invalid_payload", "Private task input_media_type must be text/plain or application/pdf");
+  }
+  if (candidate.private_prompt !== undefined && (typeof candidate.private_prompt !== "string" || candidate.private_prompt.length === 0)) {
+    transportError("invalid_payload", "Private task private_prompt must be a non-empty string if present");
+  }
+
+  const payload: PrivateTaskPayload = {
+    source_document: candidate.source_document as string,
+    input_media_type: candidate.input_media_type as "text/plain" | "application/pdf",
+    ...(candidate.private_prompt !== undefined ? { private_prompt: candidate.private_prompt as string } : {}),
+  };
+
+  assertNoForbiddenMaterial(payload, "payload");
+  return payload;
+}
+
+export function validatePrivateResultPayload(input: unknown): PrivateResultPayload {
+  if (typeof input !== "object" || input === null) {
+    transportError("invalid_payload", "Private result payload must be an object");
+  }
+  const candidate = input as Record<string, unknown>;
+  if (Object.keys(candidate).some((key) => key !== "summary")) {
+    transportError("invalid_payload", "Private result payload contains unsupported fields");
+  }
+  if (typeof candidate.summary !== "string" || (candidate.summary as string).trim().length === 0) {
+    transportError("invalid_payload", "Private result summary must be a non-empty string");
+  }
+
+  const result: PrivateResultPayload = { summary: candidate.summary as string };
+  assertNoForbiddenMaterial(result, "result");
+  return result;
+}
+
+/*
+ * Provenance binding — the set of Nostr public keys authorized to send a
+ * private task for a given agreement. For a document-summary agreement, the
+ * authorized sender of a task is the requester; the authorized sender of a
+ * result is the provider. This binding is checked after unwrapping so an
+ * unrelated signer cannot inject or replace tasks.
+ */
+export interface PrivateTaskProvenance {
+  readonly agreementId: string;
+  readonly agreementRoot: string;
+  readonly authorizedSender: NostrPublicKey;
+  readonly recipient: NostrPublicKey;
 }
 
 function requireNonEmptyString(value: unknown, field: string): string {
@@ -128,179 +159,35 @@ function requireNonEmptyString(value: unknown, field: string): string {
   return value;
 }
 
-function computePayloadHash(canonical: string): string {
-  return createHash("sha256").update(canonical).digest("hex");
-}
-
-export function validatePrivateTaskPayload(input: unknown): PrivateTaskPayload {
+export function validateProvenance(input: unknown): PrivateTaskProvenance {
   if (typeof input !== "object" || input === null) {
-    transportError("invalid_payload", "Private task payload must be an object");
+    transportError("invalid_payload", "Private task provenance must be an object");
   }
   const candidate = input as Record<string, unknown>;
-  if (Object.keys(candidate).some((key) => !PAYLOAD_KEYS.includes(key as (typeof PAYLOAD_KEYS)[number]))) {
-    transportError("invalid_payload", "Private task payload contains unsupported fields");
+  const allowedKeys = ["agreementId", "agreementRoot", "authorizedSender", "recipient"];
+  if (Object.keys(candidate).some((key) => !allowedKeys.includes(key))) {
+    transportError("invalid_payload", "Private task provenance contains unsupported fields");
   }
-  if (PAYLOAD_KEYS.some((key) => !(key in candidate))) {
-    transportError("invalid_payload", "Private task payload is missing required fields");
+  if (allowedKeys.some((key) => !(key in candidate))) {
+    transportError("invalid_payload", "Private task provenance is missing required fields");
   }
-  if (candidate.version !== PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION) {
-    transportError("invalid_payload", "Private task payload version is not supported");
-  }
-  const agreementId = requireAgreementId(candidate.agreement_id);
-  const sourceDocument = requireNonEmptyString(candidate.source_document, "source_document");
-  if (Buffer.byteLength(sourceDocument, "utf8") > PRIVATE_TASK_MAXIMUM_DOCUMENT_BYTES) {
-    transportError("payload_too_large", "Private task source_document exceeds the maximum document size");
-  }
-  const inputMediaType = requireNonEmptyString(candidate.input_media_type, "input_media_type");
-  const privatePrompt = requireNonEmptyString(candidate.private_prompt, "private_prompt");
-
-  const payload: PrivateTaskPayload = {
-    version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-    agreement_id: agreementId,
-    source_document: sourceDocument,
-    input_media_type: inputMediaType,
-    private_prompt: privatePrompt,
-  };
-
-  assertNoForbiddenMaterialInPayload(payload, "payload");
-  return payload;
-}
-
-export function validatePrivateResultPayload(input: unknown): PrivateResultPayload {
-  if (typeof input !== "object" || input === null) {
-    transportError("invalid_payload", "Private result payload must be an object");
-  }
-  const candidate = input as Record<string, unknown>;
-  if (Object.keys(candidate).some((key) => !RESULT_KEYS.includes(key as (typeof RESULT_KEYS)[number]))) {
-    transportError("invalid_payload", "Private result payload contains unsupported fields");
-  }
-  if (RESULT_KEYS.some((key) => !(key in candidate))) {
-    transportError("invalid_payload", "Private result payload is missing required fields");
-  }
-  if (candidate.version !== PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION) {
-    transportError("invalid_payload", "Private result payload version is not supported");
-  }
-  const agreementId = requireAgreementId(candidate.agreement_id);
-  const summary = requireNonEmptyString(candidate.summary, "summary");
-  const evidence = requireNonEmptyString(candidate.evidence, "evidence");
-
-  const result: PrivateResultPayload = {
-    version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
-    agreement_id: agreementId,
-    summary,
-    evidence,
-  };
-
-  assertNoForbiddenMaterialInPayload(result, "result");
-  return result;
-}
-
-/*
- * Compute a safe public reference (sha256 hash) for a private task payload.
- * This reference can appear in public lifecycle events without revealing the
- * private data. The hash is computed over canonical JSON so it is deterministic.
- */
-export function createPrivateTaskReference(payload: PrivateTaskPayload): PrivateTaskReference {
-  const canonical = canonicalizePayload(payload);
-  return {
-    hash: computePayloadHash(canonical),
-    scheme: "sha256-hex-canonical-json-v1",
-    kind: "task",
-    agreement_id: payload.agreement_id,
-  };
-}
-
-export function createPrivateResultReference(result: PrivateResultPayload): PrivateTaskReference {
-  const canonical = canonicalizeResult(result);
-  return {
-    hash: computePayloadHash(canonical),
-    scheme: "sha256-hex-canonical-json-v1",
-    kind: "result",
-    agreement_id: result.agreement_id,
-  };
-}
-
-function canonicalizePayload(payload: PrivateTaskPayload): string {
-  return JSON.stringify({
-    agreement_id: payload.agreement_id,
-    input_media_type: payload.input_media_type,
-    private_prompt: payload.private_prompt,
-    source_document: payload.source_document,
-    version: payload.version,
-  });
-}
-
-function canonicalizeResult(result: PrivateResultPayload): string {
-  return JSON.stringify({
-    agreement_id: result.agreement_id,
-    evidence: result.evidence,
-    summary: result.summary,
-    version: result.version,
-  });
-}
-
-const SEALED_KEYS = ["version", "recipient", "sender", "ciphertext", "payload_hash", "agreement_id"] as const;
-
-export function validateSealedPrivateTask(input: unknown): SealedPrivateTask {
-  if (typeof input !== "object" || input === null) {
-    transportError("invalid_sealed_envelope", "Sealed private task must be an object");
-  }
-  const candidate = input as Record<string, unknown>;
-  if (Object.keys(candidate).some((key) => !SEALED_KEYS.includes(key as (typeof SEALED_KEYS)[number]))) {
-    transportError("invalid_sealed_envelope", "Sealed private task contains unsupported fields");
-  }
-  if (SEALED_KEYS.some((key) => !(key in candidate))) {
-    transportError("invalid_sealed_envelope", "Sealed private task is missing required fields");
-  }
-  if (candidate.version !== PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION) {
-    transportError("invalid_sealed_envelope", "Sealed private task version is not supported");
+  const agreementId = requireNonEmptyString(candidate.agreementId, "agreementId");
+  const agreementRoot = requireNonEmptyString(candidate.agreementRoot, "agreementRoot");
+  if (typeof candidate.authorizedSender !== "string" || !/^[0-9a-f]{64}$/.test(candidate.authorizedSender)) {
+    transportError("invalid_payload", "Private task authorizedSender must be a valid Nostr public key");
   }
   if (typeof candidate.recipient !== "string" || !/^[0-9a-f]{64}$/.test(candidate.recipient)) {
-    transportError("invalid_sealed_envelope", "Sealed private task recipient must be a valid Nostr public key");
+    transportError("invalid_payload", "Private task recipient must be a valid Nostr public key");
   }
-  if (typeof candidate.sender !== "string" || !/^[0-9a-f]{64}$/.test(candidate.sender)) {
-    transportError("invalid_sealed_envelope", "Sealed private task sender must be a valid Nostr public key");
+  if (candidate.authorizedSender === candidate.recipient) {
+    transportError("invalid_payload", "Private task sender and recipient must be independent identities");
   }
-  if (typeof candidate.ciphertext !== "string" || candidate.ciphertext.length === 0) {
-    transportError("invalid_sealed_envelope", "Sealed private task ciphertext must be a non-empty string");
-  }
-  if (typeof candidate.payload_hash !== "string" || !/^[0-9a-f]{64}$/.test(candidate.payload_hash)) {
-    transportError("invalid_sealed_envelope", "Sealed private task payload_hash must be a sha256 hex digest");
-  }
-  const agreementId = requireAgreementId(candidate.agreement_id);
-
+  assertNoForbiddenMaterial(agreementId, "agreementId");
+  assertNoForbiddenMaterial(agreementRoot, "agreementRoot");
   return {
-    version: PACTAGENT_PRIVATE_TASK_TRANSPORT_VERSION,
+    agreementId,
+    agreementRoot,
+    authorizedSender: candidate.authorizedSender as NostrPublicKey,
     recipient: candidate.recipient as NostrPublicKey,
-    sender: candidate.sender as NostrPublicKey,
-    ciphertext: candidate.ciphertext,
-    payload_hash: candidate.payload_hash,
-    agreement_id: agreementId,
   };
-}
-
-export function parsePrivateTaskEvent(event: UnsignedNostrEvent): SealedPrivateTask {
-  if (event.kind !== PACTAGENT_PRIVATE_TASK_KIND) {
-    transportError("invalid_sealed_envelope", "Private task event must use the PactAgent private task kind");
-  }
-  for (const tag of event.tags) {
-    if (!["d", "p", "a"].includes(tag[0]) || tag.length !== 2) {
-      transportError("invalid_sealed_envelope", "Private task event contains unsupported tags");
-    }
-  }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(event.content);
-  } catch {
-    transportError("invalid_sealed_envelope", "Private task event content must be valid JSON");
-  }
-  const sealed = validateSealedPrivateTask(raw);
-  if (sealed.sender !== event.pubkey) {
-    transportError("invalid_sealed_envelope", "Sealed private task sender must match the event author");
-  }
-  const dTags = event.tags.filter((tag) => tag[0] === "d");
-  if (dTags.length !== 1 || dTags[0][1] !== sealed.agreement_id) {
-    transportError("invalid_sealed_envelope", "Private task event d tag must match the agreement_id");
-  }
-  return sealed;
 }

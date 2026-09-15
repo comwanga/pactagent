@@ -1,13 +1,16 @@
-import { nip04 } from "nostr-tools";
+import { createHash } from "node:crypto";
+import { nip44 } from "nostr-tools";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
 import { InvalidDomainInputError } from "../domain/errors";
 import {
+  nostrPublicKey,
+  parseSignedNostrEvent,
+  verifySignedNostrEvent,
   type NostrPublicKey,
   type NostrSigner,
   type SignedNostrEvent,
   type UnsignedNostrEvent,
-  nostrPublicKey,
 } from "../domain/nostr";
 import {
   bytesToHex,
@@ -15,40 +18,45 @@ import {
   parseNostrPrivateKey,
 } from "./nostr-signer";
 import {
-  createPrivateTaskReference,
-  createPrivateResultReference,
-  PACTAGENT_PRIVATE_TASK_KIND,
-  parsePrivateTaskEvent,
-  validatePrivateTaskPayload,
+  NIP59_GIFT_WRAP_KIND,
+  NIP59_SEAL_KIND,
   validatePrivateResultPayload,
-  validateSealedPrivateTask,
-  PrivateTaskTransportError,
+  validatePrivateTaskPayload,
+  validateProvenance,
   type PrivateResultPayload,
   type PrivateTaskPayload,
-  type PrivateTaskReference,
-  type SealedPrivateTask,
+  type PrivateTaskProvenance,
 } from "../domain/private-task-transport";
 import type { NostrFilter, NostrRelayAdapter, NostrRelayPublishOptions } from "./nostr-relay";
-import { isTimeoutError, operationOptions, sameUnsignedEvent } from "./pontmore-publication-helpers";
+import { createPactResultReference, DOCUMENT_SUMMARY_PROFILE_ID } from "../domain/pact-service-agreement";
+import { isTimeoutError, operationOptions } from "./pontmore-publication-helpers";
 
 /*
- * NIP-04-based private task transport.
+ * NIP-59 Gift Wrap private task transport.
  *
- * The public Nostr lifecycle (kind 3921 agreement/transition events) carries
- * only safe references and hashes. The actual document, prompt, summary, and
- * evidence are sealed into an encrypted envelope addressed to the intended
- * recipient's Nostr public key and transported via a separate kind-30401
- * companion event. Encryption uses NIP-04 (ECDH + AES-256-CBC) so only the
- * holder of the recipient's private key can recover the private data.
+ * The private task payload is sealed inside a three-layer structure:
+ *
+ *   1. The private payload JSON (document, prompt, or summary).
+ *   2. A NIP-44 conversation key derived from the sender's private key and the
+ *      recipient's public key. The payload is encrypted with this key.
+ *   3. A kind 13 seal: a signed event whose content is the NIP-44 ciphertext,
+ *      signed by the real sender. This establishes authentic provenance.
+ *   4. A kind 1059 gift wrap: a signed event whose content is NIP-44-encrypted
+ *      JSON of the seal event, signed by a one-time key. Only the recipient's
+ *      public key appears in the p tag. The real sender, agreement ID, and
+ *      timestamps are hidden inside the encrypted layers.
+ *
+ * Only the gift wrap (kind 1059) is published to relays. The seal is never
+ * published directly — it is recovered by the recipient after unwrapping.
  *
  * The encrypter holds its private key only inside a closure, mirroring the
  * NostrSigner pattern. It is never attached as a property, returned from any
  * method, or placed onto any event output.
  */
 
-export const PACTAGENT_PRIVATE_TASK_RELAY_TIMEOUT_MS = 10_000;
+export const PRIVATE_TASK_RELAY_TIMEOUT_MS = 10_000;
 
-export type PrivateTaskTransportPublicationErrorCode =
+export type PrivateTaskPublicationErrorCode =
   | "signing_failure"
   | "publication_failure"
   | "retrieval_failure"
@@ -57,30 +65,36 @@ export type PrivateTaskTransportPublicationErrorCode =
   | "decryption_failure"
   | "invalid_envelope"
   | "recipient_mismatch"
-  | "hash_mismatch";
+  | "hash_mismatch"
+  | "sender_not_authorized"
+  | "invalid_wrap";
 
-export class PrivateTaskTransportPublicationError extends Error {
-  readonly code: PrivateTaskTransportPublicationErrorCode;
+export class PrivateTaskPublicationError extends Error {
+  readonly code: PrivateTaskPublicationErrorCode;
 
-  constructor(code: PrivateTaskTransportPublicationErrorCode, message: string) {
+  constructor(code: PrivateTaskPublicationErrorCode, message: string) {
     super(message);
-    this.name = "PrivateTaskTransportPublicationError";
+    this.name = "PrivateTaskPublicationError";
     this.code = code;
   }
 }
 
 /*
  * Encryption/decryption interface. Mirrors NostrSigner: the private key is held
- * only inside a closure and never exposed. An encrypter can both sign events
- * (as a NostrSigner) and encrypt/decrypt private task payloads.
+ * only inside a closure and never exposed. An encrypter can sign events
+ * (as a NostrSigner) and encrypt/decrypt private task payloads via NIP-44.
  */
 export interface NostrEncrypter extends NostrSigner {
-  encrypt(recipientPublicKey: NostrPublicKey, plaintext: string): string;
-  decrypt(senderPublicKey: NostrPublicKey, ciphertext: string): string;
+  encryptNip44(recipientPublicKey: NostrPublicKey, plaintext: string): string;
+  decryptNip44(senderPublicKey: NostrPublicKey, ciphertext: string): string;
 }
 
 export function generateNostrPrivateKeyForEncrypter(): string {
   return bytesToHex(generateSecretKey());
+}
+
+function copyTags(tags: readonly (readonly [string, ...string[]])[]): [string, ...string[]][] {
+  return tags.map((tag) => [...tag] as [string, ...string[]]);
 }
 
 export function createLocalNostrEncrypter(privateKeyHex: string): NostrEncrypter {
@@ -90,279 +104,393 @@ export function createLocalNostrEncrypter(privateKeyHex: string): NostrEncrypter
 
   return {
     publicKey,
-    sign(event: UnsignedNostrEvent): Promise<SignedNostrEvent> {
+    async sign(event: UnsignedNostrEvent): Promise<SignedNostrEvent> {
       if (event.pubkey !== publicKey) {
-        return Promise.reject(new InvalidDomainInputError("Encrypter identity does not match the event"));
+        throw new InvalidDomainInputError("Encrypter identity does not match the event");
       }
       const signed = finalizeEvent(
         {
           created_at: event.created_at,
           kind: event.kind,
-          tags: event.tags.map((tag) => [...tag]) as unknown as Parameters<typeof finalizeEvent>[0]["tags"],
+          tags: copyTags(event.tags),
           content: event.content,
         },
         privateKeyBytes,
       );
-      return Promise.resolve({
-        ...signed,
+      const result: SignedNostrEvent = {
         pubkey: nostrPublicKey(signed.pubkey),
-        tags: event.tags,
-      });
+        created_at: signed.created_at,
+        kind: signed.kind,
+        tags: copyTags(event.tags),
+        content: signed.content,
+        id: signed.id,
+        sig: signed.sig,
+      };
+      verifySignedNostrEvent(result);
+      return result;
     },
-    encrypt(recipientPublicKey: NostrPublicKey, plaintext: string): string {
-      return nip04.encrypt(privateKeyBytes, recipientPublicKey, plaintext);
+    encryptNip44(recipientPublicKey: NostrPublicKey, plaintext: string): string {
+      const conversationKey = nip44.getConversationKey(privateKeyBytes, recipientPublicKey);
+      return nip44.encrypt(plaintext, conversationKey);
     },
-    decrypt(senderPublicKey: NostrPublicKey, ciphertext: string): string {
+    decryptNip44(senderPublicKey: NostrPublicKey, ciphertext: string): string {
+      const conversationKey = nip44.getConversationKey(privateKeyBytes, senderPublicKey);
       try {
-        return nip04.decrypt(privateKeyBytes, senderPublicKey, ciphertext);
+        return nip44.decrypt(ciphertext, conversationKey);
       } catch {
-        throw new PrivateTaskTransportPublicationError("decryption_failure", "NIP-04 decryption failed");
+        throw new PrivateTaskPublicationError("decryption_failure", "NIP-44 decryption failed");
       }
     },
   };
 }
 
-function createPrivateTaskEvent(
-  sealed: SealedPrivateTask,
-  agreementRootAddress: string,
-  updatedAt: number,
-): UnsignedNostrEvent {
-  const validated = validateSealedPrivateTask(sealed);
-  const content = JSON.stringify({
-    version: validated.version,
-    recipient: validated.recipient,
-    sender: validated.sender,
-    ciphertext: validated.ciphertext,
-    payload_hash: validated.payload_hash,
-    agreement_id: validated.agreement_id,
-  });
-  return {
-    pubkey: validated.sender,
-    created_at: updatedAt,
-    kind: PACTAGENT_PRIVATE_TASK_KIND,
-    tags: [
-      ["d", validated.agreement_id],
-      ["p", validated.recipient],
-      ["a", agreementRootAddress],
-    ],
-    content,
+interface SealResult {
+  readonly sealEvent: SignedNostrEvent;
+  readonly wrapEvent: SignedNostrEvent;
+}
+
+/*
+ * Build a NIP-59 Gift Wrap for a private payload. The seal (kind 13) is signed
+ * by the real sender and its content is NIP-44-encrypted payload JSON. The
+ * gift wrap (kind 1059) is signed by a one-time key and its content is
+ * NIP-44-encrypted seal event JSON. Only the wrap is published.
+ *
+ * The wrap is signed by the one-time key inside this function — the one-time
+ * private key is never exposed outside the closure and is discarded after
+ * signing.
+ */
+async function buildGiftWrap(
+  payloadJson: string,
+  senderEncrypter: NostrEncrypter,
+  recipient: NostrPublicKey,
+  createdAt: number,
+): Promise<SealResult> {
+  const sealContent = senderEncrypter.encryptNip44(recipient, payloadJson);
+
+  const sealUnsigned: UnsignedNostrEvent = {
+    pubkey: senderEncrypter.publicKey,
+    created_at: createdAt,
+    kind: NIP59_SEAL_KIND,
+    tags: [],
+    content: sealContent,
   };
+  const sealEvent = await senderEncrypter.sign(sealUnsigned);
+
+  const oneTimeSk = generateSecretKey();
+  const oneTimePk = nostrPublicKey(getPublicKey(oneTimeSk));
+  const oneTimeConversationKey = nip44.getConversationKey(oneTimeSk, recipient);
+  const wrapContent = nip44.encrypt(JSON.stringify(sealEvent), oneTimeConversationKey);
+
+  const wrapUnsigned: UnsignedNostrEvent = {
+    pubkey: oneTimePk,
+    created_at: createdAt,
+    kind: NIP59_GIFT_WRAP_KIND,
+    tags: [["p", recipient]],
+    content: wrapContent,
+  };
+
+  const wrapSigned = finalizeEvent(
+    {
+      created_at: wrapUnsigned.created_at,
+      kind: wrapUnsigned.kind,
+      tags: copyTags(wrapUnsigned.tags),
+      content: wrapUnsigned.content,
+    },
+    oneTimeSk,
+  );
+  const wrapEvent: SignedNostrEvent = {
+    pubkey: nostrPublicKey(wrapSigned.pubkey),
+    created_at: wrapSigned.created_at,
+    kind: wrapSigned.kind,
+    tags: copyTags(wrapUnsigned.tags),
+    content: wrapSigned.content,
+    id: wrapSigned.id,
+    sig: wrapSigned.sig,
+  };
+
+  return { sealEvent, wrapEvent };
 }
 
 export interface SealedTaskResult {
-  readonly sealed: SealedPrivateTask;
-  readonly reference: PrivateTaskReference;
-  readonly event: UnsignedNostrEvent;
-}
-
-/*
- * Shared seal: encrypt a validated payload to the recipient and build the
- * companion event. Used by both sealPrivateTask and sealPrivateResult.
- */
-function sealPayload<TPayload>(
-  payload: TPayload,
-  reference: PrivateTaskReference,
-  recipientPublicKey: NostrPublicKey,
-  senderEncrypter: NostrEncrypter,
-  agreementRootAddress: string,
-  updatedAt: number,
-): SealedTaskResult {
-  const plaintext = JSON.stringify(payload);
-  const ciphertext = senderEncrypter.encrypt(recipientPublicKey, plaintext);
-
-  const sealed: SealedPrivateTask = {
-    version: 1,
-    recipient: recipientPublicKey,
-    sender: senderEncrypter.publicKey,
-    ciphertext,
-    payload_hash: reference.hash,
-    agreement_id: reference.agreement_id,
-  };
-
-  const event = createPrivateTaskEvent(sealed, agreementRootAddress, updatedAt);
-  return { sealed, reference, event };
-}
-
-/*
- * Seal a private task payload encrypted to the recipient. Returns the sealed
- * envelope, a safe public reference (sha256 hash), and the unsigned companion
- * event ready for signing and publication.
- */
-export function sealPrivateTask(
-  payload: PrivateTaskPayload,
-  recipientPublicKey: NostrPublicKey,
-  senderEncrypter: NostrEncrypter,
-  agreementRootAddress: string,
-  updatedAt: number,
-): SealedTaskResult {
-  const validatedPayload = validatePrivateTaskPayload(payload);
-  const reference = createPrivateTaskReference(validatedPayload);
-  return sealPayload(validatedPayload, reference, recipientPublicKey, senderEncrypter, agreementRootAddress, updatedAt);
+  readonly wrapEvent: SignedNostrEvent;
+  readonly payloadHash: string;
 }
 
 export interface SealedResultResult {
-  readonly sealed: SealedPrivateTask;
-  readonly reference: PrivateTaskReference;
-  readonly event: UnsignedNostrEvent;
+  readonly wrapEvent: SignedNostrEvent;
+  readonly resultReference: string;
 }
 
-export function sealPrivateResult(
-  result: PrivateResultPayload,
-  recipientPublicKey: NostrPublicKey,
+/*
+ * Seal a private task payload into a NIP-59 Gift Wrap.
+ * The payload is validated against the document-summary@1 profile before
+ * encryption. Returns the unsigned wrap event ready for publication.
+ */
+export async function sealPrivateTask(
+  payload: PrivateTaskPayload,
   senderEncrypter: NostrEncrypter,
-  agreementRootAddress: string,
-  updatedAt: number,
-): SealedResultResult {
-  const validatedResult = validatePrivateResultPayload(result);
-  const reference = createPrivateResultReference(validatedResult);
-  return sealPayload(validatedResult, reference, recipientPublicKey, senderEncrypter, agreementRootAddress, updatedAt);
+  recipient: NostrPublicKey,
+  createdAt: number,
+): Promise<SealedTaskResult> {
+  const validated = validatePrivateTaskPayload(payload);
+  const payloadJson = JSON.stringify(validated);
+  const { wrapEvent } = await buildGiftWrap(payloadJson, senderEncrypter, recipient, createdAt);
+  return { wrapEvent, payloadHash: computeHash(payloadJson) };
+}
+
+export async function sealPrivateResult(
+  result: PrivateResultPayload,
+  senderEncrypter: NostrEncrypter,
+  recipient: NostrPublicKey,
+  createdAt: number,
+  agreementRoot: string,
+): Promise<SealedResultResult> {
+  const validated = validatePrivateResultPayload(result);
+  const payloadJson = JSON.stringify(validated);
+  const { wrapEvent } = await buildGiftWrap(payloadJson, senderEncrypter, recipient, createdAt);
+  const resultReference = createPactResultReference(DOCUMENT_SUMMARY_PROFILE_ID, agreementRoot, validated);
+  return { wrapEvent, resultReference };
+}
+
+function computeHash(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
 }
 
 /*
- * Shared open: decrypt and validate a sealed envelope, verifying the payload
- * hash and agreement_id. Used by both openPrivateTask and openPrivateResult.
+ * Unwrap a NIP-59 Gift Wrap and recover the private payload. Verifies:
+ *   1. The wrap event is a valid signed kind 1059 with exactly one p tag.
+ *   2. The wrap signature is valid (proves the one-time key signed it).
+ *   3. The seal event inside is a valid signed kind 13.
+ *   4. The seal signature is valid (proves the real sender signed it).
+ *   5. The seal's sender matches the authorized sender from provenance.
+ *   6. The decrypted payload passes domain validation.
  */
-function openSealed<TPayload extends { readonly agreement_id: string }>(
-  sealed: SealedPrivateTask,
+function unwrapGiftWrap(
+  wrapEvent: SignedNostrEvent,
   recipientEncrypter: NostrEncrypter,
-  validate: (input: unknown) => TPayload,
-  computeReference: (payload: TPayload) => PrivateTaskReference,
-  label: string,
-): TPayload {
-  const validated = validateSealedPrivateTask(sealed);
-  if (validated.recipient !== recipientEncrypter.publicKey) {
-    throw new PrivateTaskTransportPublicationError(
-      "recipient_mismatch",
-      `Sealed private ${label} is not addressed to this encrypter`,
-    );
+  provenance: PrivateTaskProvenance,
+): string {
+  const wrap = parseSignedNostrEvent(wrapEvent);
+  verifySignedNostrEvent(wrap);
+
+  if (wrap.kind !== NIP59_GIFT_WRAP_KIND) {
+    throw new PrivateTaskPublicationError("invalid_wrap", "Gift wrap must use kind 1059");
   }
-  let plaintext: string;
+
+  const pTags = wrap.tags.filter((tag) => tag[0] === "p");
+  if (pTags.length !== 1 || pTags[0][1] !== recipientEncrypter.publicKey) {
+    throw new PrivateTaskPublicationError("recipient_mismatch", "Gift wrap p tag must match the recipient");
+  }
+
+  let sealJson: string;
   try {
-    plaintext = recipientEncrypter.decrypt(validated.sender, validated.ciphertext);
+    sealJson = recipientEncrypter.decryptNip44(nostrPublicKey(wrap.pubkey), wrap.content);
   } catch (error) {
-    if (error instanceof PrivateTaskTransportPublicationError) throw error;
-    throw new PrivateTaskTransportPublicationError("decryption_failure", "NIP-04 decryption failed");
+    if (error instanceof PrivateTaskPublicationError) throw error;
+    throw new PrivateTaskPublicationError("decryption_failure", "Failed to decrypt gift wrap content");
   }
-  let rawPayload: unknown;
+
+  let sealRaw: unknown;
   try {
-    rawPayload = JSON.parse(plaintext);
+    sealRaw = JSON.parse(sealJson);
   } catch {
-    throw new PrivateTaskTransportPublicationError("decryption_failure", `Decrypted ${label} is not valid JSON`);
+    throw new PrivateTaskPublicationError("invalid_wrap", "Decrypted gift wrap content is not valid JSON");
   }
-  const payload = validate(rawPayload);
-  const reference = computeReference(payload);
-  if (reference.hash !== validated.payload_hash) {
-    throw new PrivateTaskTransportPublicationError(
-      "hash_mismatch",
-      `Decrypted ${label} hash does not match the sealed payload_hash`,
+
+  let sealEvent: SignedNostrEvent;
+  try {
+    sealEvent = parseSignedNostrEvent(sealRaw);
+  } catch (error) {
+    if (error instanceof Error && error.name === "NostrEventValidationError") {
+      throw new PrivateTaskPublicationError("invalid_envelope", "Seal event failed NIP-01 validation");
+    }
+    throw new PrivateTaskPublicationError("invalid_envelope", "Seal event is malformed");
+  }
+
+  if (sealEvent.kind !== NIP59_SEAL_KIND) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Seal must use kind 13");
+  }
+
+  try {
+    verifySignedNostrEvent(sealEvent);
+  } catch {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Seal signature is invalid");
+  }
+
+  if (sealEvent.pubkey !== provenance.authorizedSender) {
+    throw new PrivateTaskPublicationError(
+      "sender_not_authorized",
+      "Seal sender is not the authorized sender for this agreement",
     );
   }
-  if (payload.agreement_id !== validated.agreement_id) {
-    throw new PrivateTaskTransportPublicationError(
-      "hash_mismatch",
-      `Decrypted ${label} agreement_id does not match the sealed agreement_id`,
-    );
+
+  let payloadJson: string;
+  try {
+    payloadJson = recipientEncrypter.decryptNip44(sealEvent.pubkey, sealEvent.content);
+  } catch (error) {
+    if (error instanceof PrivateTaskPublicationError) throw error;
+    throw new PrivateTaskPublicationError("decryption_failure", "Failed to decrypt seal content");
   }
-  return payload;
+
+  return payloadJson;
 }
 
-/*
- * Open a sealed private task by decrypting the ciphertext with the recipient's
- * private key. Verifies that the decrypted payload matches the sealed
- * payload_hash. Returns the recovered private task payload.
- */
 export function openPrivateTask(
-  sealed: SealedPrivateTask,
+  wrapEvent: SignedNostrEvent,
   recipientEncrypter: NostrEncrypter,
+  provenance: PrivateTaskProvenance,
 ): PrivateTaskPayload {
-  return openSealed(sealed, recipientEncrypter, validatePrivateTaskPayload, createPrivateTaskReference, "task");
+  const validatedProvenance = validateProvenance(provenance);
+  const payloadJson = unwrapGiftWrap(wrapEvent, recipientEncrypter, validatedProvenance);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(payloadJson);
+  } catch {
+    throw new PrivateTaskPublicationError("decryption_failure", "Decrypted payload is not valid JSON");
+  }
+  return validatePrivateTaskPayload(raw);
 }
 
 export function openPrivateResult(
-  sealed: SealedPrivateTask,
+  wrapEvent: SignedNostrEvent,
   recipientEncrypter: NostrEncrypter,
+  provenance: PrivateTaskProvenance,
 ): PrivateResultPayload {
-  return openSealed(sealed, recipientEncrypter, validatePrivateResultPayload, createPrivateResultReference, "result");
+  const validatedProvenance = validateProvenance(provenance);
+  const payloadJson = unwrapGiftWrap(wrapEvent, recipientEncrypter, validatedProvenance);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(payloadJson);
+  } catch {
+    throw new PrivateTaskPublicationError("decryption_failure", "Decrypted result is not valid JSON");
+  }
+  return validatePrivateResultPayload(raw);
 }
 
 /*
- * Sign and publish a sealed private task companion event.
+ * Publish a signed gift wrap event. The wrap must already be signed by the
+ * one-time key that built it (buildGiftWrap signs internally). This function
+ * verifies the signature and structure before relay publication.
  */
-export async function signAndPublishPrivateTaskEvent(
-  event: UnsignedNostrEvent,
-  signer: NostrSigner,
+export async function publishGiftWrap(
+  wrapEvent: SignedNostrEvent,
   relay: NostrRelayAdapter,
   options?: NostrRelayPublishOptions,
 ): Promise<SignedNostrEvent> {
-  if (event.pubkey !== signer.publicKey) {
-    throw new PrivateTaskTransportPublicationError("signing_failure", "Signer identity does not match the private task event");
-  }
-  let signed: SignedNostrEvent;
+  let parsed: SignedNostrEvent;
   try {
-    signed = await signer.sign(event);
+    parsed = parseSignedNostrEvent(wrapEvent);
+    verifySignedNostrEvent(parsed);
   } catch {
-    throw new PrivateTaskTransportPublicationError("signing_failure", "Private task event signing failed");
+    throw new PrivateTaskPublicationError("invalid_wrap", "Gift wrap event is invalid or signature verification failed");
   }
-  if (!sameUnsignedEvent(event, signed)) {
-    throw new PrivateTaskTransportPublicationError("signing_failure", "Signer returned a mismatched event");
+  if (parsed.kind !== NIP59_GIFT_WRAP_KIND) {
+    throw new PrivateTaskPublicationError("invalid_wrap", "Event must be a kind 1059 gift wrap");
   }
+  const pTags = parsed.tags.filter((tag) => tag[0] === "p");
+  if (pTags.length !== 1) {
+    throw new PrivateTaskPublicationError("invalid_wrap", "Gift wrap must have exactly one p tag");
+  }
+
   try {
-    await relay.publish(signed, operationOptions(PACTAGENT_PRIVATE_TASK_RELAY_TIMEOUT_MS, options));
+    await relay.publish(parsed, operationOptions(PRIVATE_TASK_RELAY_TIMEOUT_MS, options));
   } catch (error) {
     if (isTimeoutError(error)) {
-      throw new PrivateTaskTransportPublicationError("timeout", "Private task publication timed out");
+      throw new PrivateTaskPublicationError("timeout", "Gift wrap publication timed out");
     }
-    throw new PrivateTaskTransportPublicationError("publication_failure", "Private task publication failed");
+    throw new PrivateTaskPublicationError("publication_failure", "Gift wrap publication failed");
   }
-  return signed;
+  return parsed;
 }
 
-function privateTaskEventFilter(agreementId: string, recipient: NostrPublicKey): NostrFilter {
+function giftWrapFilter(recipient: NostrPublicKey): NostrFilter {
   return {
-    kinds: [PACTAGENT_PRIVATE_TASK_KIND],
-    tags: { d: [agreementId], p: [recipient] },
-    limit: 10,
+    kinds: [NIP59_GIFT_WRAP_KIND],
+    tags: { p: [recipient] },
+    limit: 50,
   };
 }
 
 /*
- * Retrieve the newest sealed private task companion event for a given
- * agreement and recipient. Only the newest event per address is selected
- * (replacement ordering), mirroring the offer/descriptor retrieval patterns.
+ * Retrieve gift wrap events addressed to the recipient. Returns all signed
+ * wrap events so the caller can iterate and try to unwrap each one. This
+ * avoids a single malformed or hostile wrap from blocking legitimate tasks.
+ * The caller filters by provenance (agreement ID, authorized sender) when
+ * unwrapping.
  */
-export async function retrievePrivateTaskEvent(
-  agreementId: string,
+export async function retrieveGiftWraps(
   recipient: NostrPublicKey,
   relay: NostrRelayAdapter,
   options?: NostrRelayPublishOptions,
-): Promise<SealedPrivateTask> {
-  const filter = privateTaskEventFilter(agreementId, recipient);
+): Promise<SignedNostrEvent[]> {
+  const filter = giftWrapFilter(recipient);
   let events: readonly SignedNostrEvent[];
   try {
-    events = await relay.queryEvents(filter, operationOptions(PACTAGENT_PRIVATE_TASK_RELAY_TIMEOUT_MS, options));
+    events = await relay.queryEvents(filter, operationOptions(PRIVATE_TASK_RELAY_TIMEOUT_MS, options));
   } catch (error) {
     if (isTimeoutError(error)) {
-      throw new PrivateTaskTransportPublicationError("timeout", "Private task retrieval timed out");
+      throw new PrivateTaskPublicationError("timeout", "Gift wrap retrieval timed out");
     }
-    throw new PrivateTaskTransportPublicationError("retrieval_failure", "Private task retrieval failed");
+    throw new PrivateTaskPublicationError("retrieval_failure", "Gift wrap retrieval failed");
   }
 
-  if (events.length === 0) {
-    throw new PrivateTaskTransportPublicationError("task_not_found", "Private task was not found");
-  }
-
-  const sorted = [...events].sort((left, right) => {
-    const order = right.created_at - left.created_at;
-    return order === 0 ? left.id.localeCompare(right.id) : order;
-  });
-
-  const newest = sorted[0];
-  try {
-    return parsePrivateTaskEvent(newest);
-  } catch (error) {
-    if (error instanceof PrivateTaskTransportError) {
-      throw new PrivateTaskTransportPublicationError("invalid_envelope", error.message);
+  const verified: SignedNostrEvent[] = [];
+  for (const raw of events) {
+    try {
+      const parsed = parseSignedNostrEvent(raw);
+      verifySignedNostrEvent(parsed);
+      if (parsed.kind === NIP59_GIFT_WRAP_KIND) {
+        verified.push(parsed);
+      }
+    } catch {
+      continue;
     }
-    throw new PrivateTaskTransportPublicationError("invalid_envelope", "Private task event is malformed");
   }
+
+  if (verified.length === 0) {
+    throw new PrivateTaskPublicationError("task_not_found", "No valid gift wraps were found");
+  }
+
+  return verified.sort((left, right) => right.created_at - left.created_at);
+}
+
+/*
+ * Retrieve and unwrap the most recent valid gift wrap for a given provenance.
+ * Iterates wraps in newest-first order, skipping ones that fail to unwrap or
+ * don't match the provenance. Returns the first successfully unwrapped payload.
+ */
+export async function retrieveAndOpenPrivateTask(
+  recipient: NostrPublicKey,
+  recipientEncrypter: NostrEncrypter,
+  provenance: PrivateTaskProvenance,
+  relay: NostrRelayAdapter,
+  options?: NostrRelayPublishOptions,
+): Promise<PrivateTaskPayload> {
+  const wraps = await retrieveGiftWraps(recipient, relay, options);
+  for (const wrap of wraps) {
+    try {
+      return openPrivateTask(wrap, recipientEncrypter, provenance);
+    } catch {
+      continue;
+    }
+  }
+  throw new PrivateTaskPublicationError("task_not_found", "No gift wrap matched the provenance and decrypted successfully");
+}
+
+export async function retrieveAndOpenPrivateResult(
+  recipient: NostrPublicKey,
+  recipientEncrypter: NostrEncrypter,
+  provenance: PrivateTaskProvenance,
+  relay: NostrRelayAdapter,
+  options?: NostrRelayPublishOptions,
+): Promise<PrivateResultPayload> {
+  const wraps = await retrieveGiftWraps(recipient, relay, options);
+  for (const wrap of wraps) {
+    try {
+      return openPrivateResult(wrap, recipientEncrypter, provenance);
+    } catch {
+      continue;
+    }
+  }
+  throw new PrivateTaskPublicationError("task_not_found", "No gift wrap matched the provenance and decrypted successfully");
 }

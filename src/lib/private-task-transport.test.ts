@@ -1,45 +1,37 @@
-import { describe, expect, it } from "vitest";
+﻿import { describe, expect, it } from "vitest";
 
-import {
-  type SignedNostrEvent,
-} from "../domain/nostr";
-import { InvalidDomainInputError } from "../domain/errors";
-import { PrivateTaskTransportError } from "../domain/private-task-transport";
+import { type SignedNostrEvent } from "../domain/nostr";
+import { NIP59_GIFT_WRAP_KIND, PrivateTaskTransportError } from "../domain/private-task-transport";
 import type { NostrFilter, NostrRelayAdapter, NostrRelayPublishOptions } from "./nostr-relay";
 import {
   createLocalNostrEncrypter,
   generateNostrPrivateKeyForEncrypter,
   openPrivateResult,
   openPrivateTask,
-  PrivateTaskTransportPublicationError,
-  PACTAGENT_PRIVATE_TASK_RELAY_TIMEOUT_MS,
-  retrievePrivateTaskEvent,
+  PrivateTaskPublicationError,
+  publishGiftWrap,
+  retrieveGiftWraps,
+  retrieveAndOpenPrivateTask,
   sealPrivateResult,
   sealPrivateTask,
-  signAndPublishPrivateTaskEvent,
   type NostrEncrypter,
 } from "./private-task-transport";
 
 const TEST_TIMESTAMP = 1_700_000_000;
 const VALID_AGREEMENT_ID = "pact-demo-agreement-001";
-const AGREEMENT_ROOT = "3921:11abcdef:demo-root";
+const AGREEMENT_ROOT = "a".repeat(64);
 
 function createValidPayload() {
   return {
-    version: 1 as const,
-    agreement_id: VALID_AGREEMENT_ID,
     source_document: "This is a confidential document that must not appear in public events.",
-    input_media_type: "text/plain",
+    input_media_type: "text/plain" as const,
     private_prompt: "Summarize this document in 200 words.",
   };
 }
 
 function createValidResult() {
   return {
-    version: 1 as const,
-    agreement_id: VALID_AGREEMENT_ID,
     summary: "The document discusses private matters.",
-    evidence: "Evidence chain proving derivation.",
   };
 }
 
@@ -60,13 +52,12 @@ class MemoryNostrRelay implements NostrRelayAdapter {
     this.lastOptions = options;
     return this.published.filter((event) => {
       const kindMatches = !filter.kinds || filter.kinds.includes(event.kind);
-      const authorMatches = !filter.authors || filter.authors.includes(event.pubkey);
       const tagMatches =
         !filter.tags ||
         Object.entries(filter.tags).every(([name, values]) =>
           event.tags.some((tag) => tag[0] === name && values.includes(tag[1])),
         );
-      return kindMatches && authorMatches && tagMatches;
+      return kindMatches && tagMatches;
     });
   }
 }
@@ -80,27 +71,23 @@ function createEncrypterPair(): { readonly requester: NostrEncrypter; readonly p
   };
 }
 
-describe("Private task transport (lib)", () => {
+describe("Private task transport (NIP-59 Gift Wrap)", () => {
   describe("createLocalNostrEncrypter", () => {
     it("creates an encrypter that can sign and encrypt", () => {
       const sk = generateNostrPrivateKeyForEncrypter();
       const encrypter = createLocalNostrEncrypter(sk);
       expect(encrypter.publicKey).toMatch(/^[0-9a-f]{64}$/);
-      expect(typeof encrypter.encrypt).toBe("function");
-      expect(typeof encrypter.decrypt).toBe("function");
+      expect(typeof encrypter.encryptNip44).toBe("function");
+      expect(typeof encrypter.decryptNip44).toBe("function");
     });
 
-    it("rejects an invalid private key", () => {
-      expect(() => createLocalNostrEncrypter("invalid")).toThrow(InvalidDomainInputError);
-    });
-
-    it("encrypt and decrypt round-trips between two encrypters", () => {
+    it("encrypt and decrypt round-trips between two encrypters via NIP-44", () => {
       const skA = generateNostrPrivateKeyForEncrypter();
       const skB = generateNostrPrivateKeyForEncrypter();
       const a = createLocalNostrEncrypter(skA);
       const b = createLocalNostrEncrypter(skB);
-      const ciphertext = a.encrypt(b.publicKey, "hello secret world");
-      const plaintext = b.decrypt(a.publicKey, ciphertext);
+      const ciphertext = a.encryptNip44(b.publicKey, "hello secret world");
+      const plaintext = b.decryptNip44(a.publicKey, ciphertext);
       expect(plaintext).toBe("hello secret world");
     });
 
@@ -112,280 +99,243 @@ describe("Private task transport (lib)", () => {
       expect(serialized).not.toContain("privateKey");
       expect(serialized).not.toContain("nsec");
     });
+
+    it("copies tags (no aliasing) and verifies the signature after signing", async () => {
+      const sk = generateNostrPrivateKeyForEncrypter();
+      const encrypter = createLocalNostrEncrypter(sk);
+      const mutableTags: [string, ...string[]][] = [["p", "ab".repeat(32)]];
+      const event = {
+        pubkey: encrypter.publicKey,
+        created_at: TEST_TIMESTAMP,
+        kind: 1,
+        tags: mutableTags,
+        content: "test",
+      };
+      const signed = await encrypter.sign(event);
+      mutableTags[0][1] = "modified";
+      expect(signed.tags[0][1]).toBe("ab".repeat(32));
+    });
   });
 
   describe("sealPrivateTask / openPrivateTask", () => {
-    it("seals a task encrypted to the provider and recovers it with the provider key", () => {
+    it("seals a task and recovers it with the recipient key", async () => {
       const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: requester.publicKey,
+        recipient: provider.publicKey,
+      };
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
 
-      expect(result.reference.hash).toMatch(/^[0-9a-f]{64}$/);
-      expect(result.reference.kind).toBe("task");
-      expect(result.event.kind).toBe(30401);
-      expect(result.event.pubkey).toBe(requester.publicKey);
+      expect(result.wrapEvent.kind).toBe(NIP59_GIFT_WRAP_KIND);
+      expect(result.wrapEvent.pubkey).not.toBe(requester.publicKey);
+      expect(result.payloadHash).toMatch(/^[0-9a-f]{64}$/);
 
-      const recovered = openPrivateTask(result.sealed, provider);
+      const recovered = openPrivateTask(result.wrapEvent, provider, provenance);
       expect(recovered.source_document).toBe(createValidPayload().source_document);
       expect(recovered.private_prompt).toBe(createValidPayload().private_prompt);
     });
 
-    it("rejects decryption by an unrelated identity", () => {
+    it("the wrap does not expose the real sender", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+      expect(result.wrapEvent.pubkey).not.toBe(requester.publicKey);
+      const wrapJson = JSON.stringify(result.wrapEvent);
+      expect(wrapJson).not.toContain(requester.publicKey);
+      expect(wrapJson).not.toContain("confidential document");
+      expect(wrapJson).not.toContain("Summarize this document");
+    });
+
+    it("rejects decryption by an unrelated identity", async () => {
       const { requester, provider } = createEncrypterPair();
       const unrelatedSk = generateNostrPrivateKeyForEncrypter();
       const unrelated = createLocalNostrEncrypter(unrelatedSk);
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: requester.publicKey,
+        recipient: provider.publicKey,
+      };
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+      expect(() => openPrivateTask(result.wrapEvent, unrelated, provenance)).toThrow(
+        PrivateTaskPublicationError,
       );
-      expect(() => openPrivateTask(result.sealed, unrelated)).toThrow(PrivateTaskTransportPublicationError);
     });
 
-    it("rejects when the encrypter is not the intended recipient", () => {
+    it("rejects when the seal sender is not the authorized sender", async () => {
       const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
+      const thirdPartySk = generateNostrPrivateKeyForEncrypter();
+      const thirdParty = createLocalNostrEncrypter(thirdPartySk);
+      const result = await sealPrivateTask(createValidPayload(), thirdParty, provider.publicKey, TEST_TIMESTAMP);
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: requester.publicKey,
+        recipient: provider.publicKey,
+      };
+      expect(() => openPrivateTask(result.wrapEvent, provider, provenance)).toThrow(
+        PrivateTaskPublicationError,
       );
-      expect(() => openPrivateTask(result.sealed, requester)).toThrow(PrivateTaskTransportPublicationError);
-    });
-
-    it("the public reference hash is stable and does not reveal the document", () => {
-      const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      const ref1 = result.reference.hash;
-      const ref2 = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      ).reference.hash;
-      expect(ref1).toBe(ref2);
-      const serialized = JSON.stringify(result.reference);
-      expect(serialized).not.toContain("confidential document");
-    });
-
-    it("the sealed envelope ciphertext does not contain the plaintext document", () => {
-      const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      const serialized = JSON.stringify(result.sealed);
-      expect(serialized).not.toContain("confidential document");
-      expect(serialized).not.toContain("Summarize this document");
     });
   });
 
   describe("sealPrivateResult / openPrivateResult", () => {
-    it("seals a result encrypted to the requester and recovers it", () => {
+    it("seals a result and recovers it", async () => {
       const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateResult(
-        createValidResult(),
-        requester.publicKey,
-        provider,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-
-      expect(result.reference.kind).toBe("result");
-      const recovered = openPrivateResult(result.sealed, requester);
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: provider.publicKey,
+        recipient: requester.publicKey,
+      };
+      const result = await sealPrivateResult(createValidResult(), provider, requester.publicKey, TEST_TIMESTAMP, AGREEMENT_ROOT);
+      expect(result.resultReference).toMatch(/^sha256:[0-9a-f]{64}$/);
+      const recovered = openPrivateResult(result.wrapEvent, requester, provenance);
       expect(recovered.summary).toBe("The document discusses private matters.");
-      expect(recovered.evidence).toBe("Evidence chain proving derivation.");
     });
 
-    it("rejects decryption by a non-recipient", () => {
+    it("rejects decryption by a non-recipient", async () => {
       const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateResult(
-        createValidResult(),
-        requester.publicKey,
-        provider,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
+      const result = await sealPrivateResult(createValidResult(), provider, requester.publicKey, TEST_TIMESTAMP, AGREEMENT_ROOT);
+      const unrelatedSk = generateNostrPrivateKeyForEncrypter();
+      const unrelated = createLocalNostrEncrypter(unrelatedSk);
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: provider.publicKey,
+        recipient: requester.publicKey,
+      };
+      expect(() => openPrivateResult(result.wrapEvent, unrelated, provenance)).toThrow(
+        PrivateTaskPublicationError,
       );
-      expect(() => openPrivateResult(result.sealed, provider)).toThrow(PrivateTaskTransportPublicationError);
     });
   });
 
   describe("public/private separation", () => {
-    it("the public event contains only safe fields, not the document or prompt", () => {
+    it("the wrap event contains only the recipient p tag, not private data", async () => {
       const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      const eventContent = JSON.parse(result.event.content) as Record<string, unknown>;
-      expect(eventContent).not.toHaveProperty("source_document");
-      expect(eventContent).not.toHaveProperty("private_prompt");
-      expect(eventContent).toHaveProperty("ciphertext");
-      expect(eventContent).toHaveProperty("payload_hash");
-      expect(eventContent).toHaveProperty("agreement_id");
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+      const pTags = result.wrapEvent.tags.filter((t) => t[0] === "p");
+      expect(pTags).toHaveLength(1);
+      expect(pTags[0][1]).toBe(provider.publicKey);
+      expect(result.wrapEvent.tags.some((t) => t[0] === "a")).toBe(false);
+      expect(result.wrapEvent.tags.some((t) => t[0] === "d")).toBe(false);
     });
 
-    it("the result can be associated with the corresponding agreement", () => {
+    it("no Cashu tokens leak into the wrap event", async () => {
       const { requester, provider } = createEncrypterPair();
-      const taskResult = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
+      const payload = { ...createValidPayload(), private_prompt: "process this: cashuAtoken-abc123" };
+      await expect(sealPrivateTask(payload, requester, provider.publicKey, TEST_TIMESTAMP)).rejects.toThrow(
+        PrivateTaskTransportError,
       );
-      const resultResult = sealPrivateResult(
-        createValidResult(),
-        requester.publicKey,
-        provider,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP + 1,
-      );
-      expect(taskResult.sealed.agreement_id).toBe(VALID_AGREEMENT_ID);
-      expect(resultResult.sealed.agreement_id).toBe(VALID_AGREEMENT_ID);
-      expect(resultResult.event.tags.some((t) => t[0] === "a" && t[1] === AGREEMENT_ROOT)).toBe(true);
-    });
-
-    it("no Cashu tokens leak into public events", () => {
-      const { requester, provider } = createEncrypterPair();
-      const payload = {
-        ...createValidPayload(),
-        private_prompt: "process this: cashuAtoken-abc123",
-      };
-      expect(() =>
-        sealPrivateTask(payload, provider.publicKey, requester, AGREEMENT_ROOT, TEST_TIMESTAMP),
-      ).toThrow(PrivateTaskTransportError);
     });
   });
 
-  describe("signAndPublishPrivateTaskEvent", () => {
-    it("signs and publishes the private task companion event", async () => {
+  describe("publishGiftWrap", () => {
+    it("verifies and publishes a signed gift wrap", async () => {
       const { requester, provider } = createEncrypterPair();
       const relay = new MemoryNostrRelay();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      const signed = await signAndPublishPrivateTaskEvent(result.event, requester, relay);
-      expect(relay.published).toEqual([signed]);
-      expect(relay.lastOptions?.timeoutMs).toBe(PACTAGENT_PRIVATE_TASK_RELAY_TIMEOUT_MS);
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      const published = await publishGiftWrap(result.wrapEvent, relay);
+      expect(relay.published).toEqual([published]);
     });
 
-    it("rejects a signer that does not match the event pubkey", async () => {
+    it("rejects an invalid signature", async () => {
       const { requester, provider } = createEncrypterPair();
       const relay = new MemoryNostrRelay();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      await expect(signAndPublishPrivateTaskEvent(result.event, provider, relay)).rejects.toMatchObject({
-        code: "signing_failure",
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      const tampered = { ...result.wrapEvent, sig: "0".repeat(128) } as SignedNostrEvent;
+      await expect(publishGiftWrap(tampered, relay)).rejects.toMatchObject({
+        code: "invalid_wrap",
       });
+      expect(relay.published).toHaveLength(0);
+    });
+
+    it("rejects a non-1059 kind", async () => {
+      const relay = new MemoryNostrRelay();
+      const sk = generateNostrPrivateKeyForEncrypter();
+      const signer = createLocalNostrEncrypter(sk);
+      const wrongEvent = await signer.sign({
+        pubkey: signer.publicKey,
+        created_at: TEST_TIMESTAMP,
+        kind: 1,
+        tags: [["p", "ab".repeat(32)] as [string, ...string[]]],
+        content: "plaintext leak",
+      });
+      await expect(publishGiftWrap(wrongEvent, relay)).rejects.toMatchObject({
+        code: "invalid_wrap",
+      });
+      expect(relay.published).toHaveLength(0);
     });
   });
 
-  describe("retrievePrivateTaskEvent", () => {
-    it("retrieves and parses the newest sealed task by agreement and recipient", async () => {
+  describe("retrieveGiftWraps", () => {
+    it("retrieves valid gift wraps addressed to the recipient", async () => {
       const { requester, provider } = createEncrypterPair();
       const relay = new MemoryNostrRelay();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      await signAndPublishPrivateTaskEvent(result.event, requester, relay);
-      const sealed = await retrievePrivateTaskEvent(VALID_AGREEMENT_ID, provider.publicKey, relay);
-      expect(sealed.agreement_id).toBe(VALID_AGREEMENT_ID);
-      expect(sealed.recipient).toBe(provider.publicKey);
-      expect(sealed.payload_hash).toBe(result.reference.hash);
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      await publishGiftWrap(result.wrapEvent, relay);
+
+      const wraps = await retrieveGiftWraps(provider.publicKey, relay);
+      expect(wraps).toHaveLength(1);
+      expect(wraps[0].kind).toBe(NIP59_GIFT_WRAP_KIND);
     });
 
-    it("rejects not-found", async () => {
-      const { provider } = createEncrypterPair();
-      const relay = new MemoryNostrRelay();
-      await expect(
-        retrievePrivateTaskEvent(VALID_AGREEMENT_ID, provider.publicKey, relay),
-      ).rejects.toMatchObject({ code: "task_not_found" });
-    });
-
-    it("the intended recipient can open the retrieved task end-to-end", async () => {
+    it("skips malformed wraps without aborting all retrieval", async () => {
       const { requester, provider } = createEncrypterPair();
       const relay = new MemoryNostrRelay();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      await signAndPublishPrivateTaskEvent(result.event, requester, relay);
-      const sealed = await retrievePrivateTaskEvent(VALID_AGREEMENT_ID, provider.publicKey, relay);
-      const recovered = openPrivateTask(sealed, provider);
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      const signed = await publishGiftWrap(result.wrapEvent, relay);
+
+      const malformed = { ...signed, sig: "0".repeat(128) } as SignedNostrEvent;
+      relay.published.push(malformed);
+
+      const wraps = await retrieveGiftWraps(provider.publicKey, relay);
+      expect(wraps).toHaveLength(1);
+    });
+  });
+
+  describe("retrieveAndOpenPrivateTask", () => {
+    it("end-to-end: seal, publish, retrieve, and open", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const relay = new MemoryNostrRelay();
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: requester.publicKey,
+        recipient: provider.publicKey,
+      };
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      await publishGiftWrap(result.wrapEvent, relay);
+
+      const recovered = await retrieveAndOpenPrivateTask(provider.publicKey, provider, provenance, relay);
       expect(recovered.source_document).toBe(createValidPayload().source_document);
     });
 
-    it("an unrelated identity retrieves the event but cannot decrypt it", async () => {
+    it("an unrelated identity retrieves wraps but cannot open the task", async () => {
       const { requester, provider } = createEncrypterPair();
+      const relay = new MemoryNostrRelay();
       const unrelatedSk = generateNostrPrivateKeyForEncrypter();
       const unrelated = createLocalNostrEncrypter(unrelatedSk);
-      const relay = new MemoryNostrRelay();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      await signAndPublishPrivateTaskEvent(result.event, requester, relay);
-      const sealed = await retrievePrivateTaskEvent(VALID_AGREEMENT_ID, provider.publicKey, relay);
-      expect(() => openPrivateTask(sealed, unrelated)).toThrow(PrivateTaskTransportPublicationError);
-    });
-  });
-
-  describe("hash verification", () => {
-    it("rejects a tampered ciphertext that produces a hash mismatch", () => {
-      const { requester, provider } = createEncrypterPair();
-      const result = sealPrivateTask(
-        createValidPayload(),
-        provider.publicKey,
-        requester,
-        AGREEMENT_ROOT,
-        TEST_TIMESTAMP,
-      );
-      const tampered = {
-        ...result.sealed,
-        ciphertext: result.sealed.ciphertext + "x",
+      const provenance = {
+        agreementId: VALID_AGREEMENT_ID,
+        agreementRoot: AGREEMENT_ROOT,
+        authorizedSender: requester.publicKey,
+        recipient: provider.publicKey,
       };
-      expect(() => openPrivateTask(tampered, provider)).toThrow(PrivateTaskTransportPublicationError);
+      const result = await sealPrivateTask(createValidPayload(), requester, provider.publicKey, TEST_TIMESTAMP);
+
+      await publishGiftWrap(result.wrapEvent, relay);
+
+      await expect(retrieveAndOpenPrivateTask(provider.publicKey, unrelated, provenance, relay)).rejects.toThrow(
+        PrivateTaskPublicationError,
+      );
     });
   });
 });
