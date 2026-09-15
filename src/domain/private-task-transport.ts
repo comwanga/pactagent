@@ -27,6 +27,8 @@ import type { NostrPublicKey } from "./nostr";
  */
 export const NIP59_SEAL_KIND = 13;
 export const NIP59_GIFT_WRAP_KIND = 1059;
+export const NIP17_PRIVATE_DIRECT_MESSAGE_KIND = 14;
+export const PRIVATE_TASK_MESSAGE_VERSION = 1;
 
 export type PrivateTaskTransportErrorCode =
   | "invalid_payload"
@@ -34,7 +36,9 @@ export type PrivateTaskTransportErrorCode =
   | "forbidden_material_in_cleartext"
   | "payload_too_large"
   | "recipient_mismatch"
-  | "sender_not_authorized";
+  | "sender_not_authorized"
+  | "agreement_mismatch"
+  | "invalid_rumor";
 
 import { InvalidDomainInputError } from "./errors";
 
@@ -75,6 +79,24 @@ export interface PrivateTaskPayload {
  */
 export interface PrivateResultPayload {
   readonly summary: string;
+}
+
+interface PrivateMessageBinding {
+  readonly version: 1;
+  readonly agreement_id: string;
+  readonly agreement_root: string;
+  readonly sender: NostrPublicKey;
+  readonly recipient: NostrPublicKey;
+}
+
+export interface PrivateTaskMessage extends PrivateMessageBinding {
+  readonly message_type: "task";
+  readonly payload: PrivateTaskPayload;
+}
+
+export interface PrivateResultMessage extends PrivateMessageBinding {
+  readonly message_type: "result";
+  readonly payload: PrivateResultPayload;
 }
 
 const ALLOWED_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
@@ -173,6 +195,9 @@ export function validateProvenance(input: unknown): PrivateTaskProvenance {
   }
   const agreementId = requireNonEmptyString(candidate.agreementId, "agreementId");
   const agreementRoot = requireNonEmptyString(candidate.agreementRoot, "agreementRoot");
+  if (!/^[0-9a-f]{64}$/.test(agreementRoot)) {
+    transportError("invalid_payload", "Private task agreementRoot must be a Nostr event id");
+  }
   if (typeof candidate.authorizedSender !== "string" || !/^[0-9a-f]{64}$/.test(candidate.authorizedSender)) {
     transportError("invalid_payload", "Private task authorizedSender must be a valid Nostr public key");
   }
@@ -189,5 +214,113 @@ export function validateProvenance(input: unknown): PrivateTaskProvenance {
     agreementRoot,
     authorizedSender: candidate.authorizedSender as NostrPublicKey,
     recipient: candidate.recipient as NostrPublicKey,
+  };
+}
+
+const PRIVATE_MESSAGE_KEYS = [
+  "version",
+  "message_type",
+  "agreement_id",
+  "agreement_root",
+  "sender",
+  "recipient",
+  "payload",
+] as const;
+
+function parsePrivateMessageBinding(
+  input: unknown,
+  expectedType: "task" | "result",
+  provenance: PrivateTaskProvenance,
+): Record<string, unknown> {
+  if (typeof input !== "object" || input === null) {
+    transportError("invalid_rumor", "Private message must be an object");
+  }
+  const candidate = input as Record<string, unknown>;
+  if (
+    Object.keys(candidate).some(
+      (key) => !PRIVATE_MESSAGE_KEYS.includes(key as (typeof PRIVATE_MESSAGE_KEYS)[number]),
+    ) ||
+    PRIVATE_MESSAGE_KEYS.some((key) => !(key in candidate))
+  ) {
+    transportError("invalid_rumor", "Private message fields are invalid");
+  }
+  if (
+    candidate.version !== PRIVATE_TASK_MESSAGE_VERSION ||
+    candidate.message_type !== expectedType
+  ) {
+    transportError("invalid_rumor", "Private message type or version is invalid");
+  }
+  if (
+    candidate.agreement_id !== provenance.agreementId ||
+    candidate.agreement_root !== provenance.agreementRoot
+  ) {
+    transportError("agreement_mismatch", "Private message does not match the agreement");
+  }
+  if (candidate.sender !== provenance.authorizedSender) {
+    transportError("sender_not_authorized", "Private message sender is not authorized");
+  }
+  if (candidate.recipient !== provenance.recipient) {
+    transportError("recipient_mismatch", "Private message recipient does not match the agreement");
+  }
+  return candidate;
+}
+
+function privateMessageBinding(provenance: PrivateTaskProvenance): PrivateMessageBinding {
+  return {
+    version: PRIVATE_TASK_MESSAGE_VERSION,
+    agreement_id: provenance.agreementId,
+    agreement_root: provenance.agreementRoot,
+    sender: provenance.authorizedSender,
+    recipient: provenance.recipient,
+  };
+}
+
+export function createPrivateTaskMessage(
+  payload: PrivateTaskPayload,
+  provenance: PrivateTaskProvenance,
+): PrivateTaskMessage {
+  const binding = validateProvenance(provenance);
+  return {
+    ...privateMessageBinding(binding),
+    message_type: "task",
+    payload: validatePrivateTaskPayload(payload),
+  };
+}
+
+export function createPrivateResultMessage(
+  payload: PrivateResultPayload,
+  provenance: PrivateTaskProvenance,
+): PrivateResultMessage {
+  const binding = validateProvenance(provenance);
+  return {
+    ...privateMessageBinding(binding),
+    message_type: "result",
+    payload: validatePrivateResultPayload(payload),
+  };
+}
+
+export function parsePrivateTaskMessage(
+  input: unknown,
+  provenance: PrivateTaskProvenance,
+): PrivateTaskMessage {
+  const binding = validateProvenance(provenance);
+  const candidate = parsePrivateMessageBinding(input, "task", binding);
+  return {
+    ...privateMessageBinding(binding),
+    message_type: "task",
+    payload: validatePrivateTaskPayload(candidate.payload),
+  };
+}
+
+export function parsePrivateResultMessage(
+  input: unknown,
+  provenance: PrivateTaskProvenance,
+): PrivateResultMessage {
+  const binding = validateProvenance(provenance);
+  const candidate = parsePrivateMessageBinding(input, "result", binding);
+  return {
+    ...privateMessageBinding(binding),
+    message_type: "result",
+    payload: validatePrivateResultPayload(candidate.payload),
   };
 }

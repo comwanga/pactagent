@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto";
 import { nip44 } from "nostr-tools";
-import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import {
+  finalizeEvent,
+  generateSecretKey,
+  getEventHash,
+  getPublicKey,
+} from "nostr-tools/pure";
 
 import { InvalidDomainInputError } from "../domain/errors";
 import {
   nostrPublicKey,
   parseSignedNostrEvent,
+  parseUnsignedNostrEvent,
   verifySignedNostrEvent,
   type NostrPublicKey,
   type NostrSigner,
@@ -18,8 +24,13 @@ import {
   parseNostrPrivateKey,
 } from "./nostr-signer";
 import {
+  createPrivateResultMessage,
+  createPrivateTaskMessage,
+  NIP17_PRIVATE_DIRECT_MESSAGE_KIND,
   NIP59_GIFT_WRAP_KIND,
   NIP59_SEAL_KIND,
+  parsePrivateResultMessage,
+  parsePrivateTaskMessage,
   validatePrivateResultPayload,
   validatePrivateTaskPayload,
   validateProvenance,
@@ -34,12 +45,11 @@ import { isTimeoutError, operationOptions } from "./pontmore-publication-helpers
 /*
  * NIP-59 Gift Wrap private task transport.
  *
- * The private task payload is sealed inside a three-layer structure:
+ * The private task payload is sealed inside a four-layer structure:
  *
- *   1. The private payload JSON (document, prompt, or summary).
- *   2. A NIP-44 conversation key derived from the sender's private key and the
- *      recipient's public key. The payload is encrypted with this key.
- *   3. A kind 13 seal: a signed event whose content is the NIP-44 ciphertext,
+ *   1. A versioned private message binds the payload to its exact agreement.
+ *   2. An unsigned kind-14 rumor carries that message and recipient privately.
+ *   3. A kind 13 seal: a signed event whose content is the NIP-44 rumor ciphertext,
  *      signed by the real sender. This establishes authentic provenance.
  *   4. A kind 1059 gift wrap: a signed event whose content is NIP-44-encrypted
  *      JSON of the seal event, signed by a one-time key. Only the recipient's
@@ -145,27 +155,59 @@ export function createLocalNostrEncrypter(privateKeyHex: string): NostrEncrypter
 }
 
 interface SealResult {
+  readonly rumorEvent: NostrRumorEvent;
   readonly sealEvent: SignedNostrEvent;
   readonly wrapEvent: SignedNostrEvent;
 }
 
+interface NostrRumorEvent extends UnsignedNostrEvent {
+  readonly id: string;
+}
+
 /*
- * Build a NIP-59 Gift Wrap for a private payload. The seal (kind 13) is signed
- * by the real sender and its content is NIP-44-encrypted payload JSON. The
- * gift wrap (kind 1059) is signed by a one-time key and its content is
- * NIP-44-encrypted seal event JSON. Only the wrap is published.
+ * Build a NIP-59 Gift Wrap for a private message. The message is placed in an
+ * unsigned kind-14 rumor. The seal (kind 13) is signed by the real sender and
+ * contains the NIP-44-encrypted rumor. The gift wrap (kind 1059) is signed by
+ * a one-time key and contains the NIP-44-encrypted seal. Only the wrap is
+ * published.
  *
  * The wrap is signed by the one-time key inside this function — the one-time
  * private key is never exposed outside the closure and is discarded after
  * signing.
  */
 async function buildGiftWrap(
-  payloadJson: string,
+  messageJson: string,
   senderEncrypter: NostrEncrypter,
-  recipient: NostrPublicKey,
+  provenance: PrivateTaskProvenance,
   createdAt: number,
 ): Promise<SealResult> {
-  const sealContent = senderEncrypter.encryptNip44(recipient, payloadJson);
+  if (senderEncrypter.publicKey !== provenance.authorizedSender) {
+    throw new PrivateTaskPublicationError(
+      "sender_not_authorized",
+      "Private message signer is not authorized for the agreement",
+    );
+  }
+
+  const rumorUnsigned: UnsignedNostrEvent = {
+    pubkey: senderEncrypter.publicKey,
+    created_at: createdAt,
+    kind: NIP17_PRIVATE_DIRECT_MESSAGE_KIND,
+    tags: [["p", provenance.recipient]],
+    content: messageJson,
+  };
+  const rumorEvent: NostrRumorEvent = {
+    ...rumorUnsigned,
+    tags: copyTags(rumorUnsigned.tags),
+    id: getEventHash({
+      ...rumorUnsigned,
+      tags: copyTags(rumorUnsigned.tags),
+    }),
+  };
+
+  const sealContent = senderEncrypter.encryptNip44(
+    provenance.recipient,
+    JSON.stringify(rumorEvent),
+  );
 
   const sealUnsigned: UnsignedNostrEvent = {
     pubkey: senderEncrypter.publicKey,
@@ -178,14 +220,14 @@ async function buildGiftWrap(
 
   const oneTimeSk = generateSecretKey();
   const oneTimePk = nostrPublicKey(getPublicKey(oneTimeSk));
-  const oneTimeConversationKey = nip44.getConversationKey(oneTimeSk, recipient);
+  const oneTimeConversationKey = nip44.getConversationKey(oneTimeSk, provenance.recipient);
   const wrapContent = nip44.encrypt(JSON.stringify(sealEvent), oneTimeConversationKey);
 
   const wrapUnsigned: UnsignedNostrEvent = {
     pubkey: oneTimePk,
     created_at: createdAt,
     kind: NIP59_GIFT_WRAP_KIND,
-    tags: [["p", recipient]],
+    tags: [["p", provenance.recipient]],
     content: wrapContent,
   };
 
@@ -208,7 +250,7 @@ async function buildGiftWrap(
     sig: wrapSigned.sig,
   };
 
-  return { sealEvent, wrapEvent };
+  return { rumorEvent, sealEvent, wrapEvent };
 }
 
 export interface SealedTaskResult {
@@ -229,26 +271,44 @@ export interface SealedResultResult {
 export async function sealPrivateTask(
   payload: PrivateTaskPayload,
   senderEncrypter: NostrEncrypter,
-  recipient: NostrPublicKey,
+  provenance: PrivateTaskProvenance,
   createdAt: number,
 ): Promise<SealedTaskResult> {
-  const validated = validatePrivateTaskPayload(payload);
-  const payloadJson = JSON.stringify(validated);
-  const { wrapEvent } = await buildGiftWrap(payloadJson, senderEncrypter, recipient, createdAt);
-  return { wrapEvent, payloadHash: computeHash(payloadJson) };
+  const validatedProvenance = validateProvenance(provenance);
+  const message = createPrivateTaskMessage(
+    validatePrivateTaskPayload(payload),
+    validatedProvenance,
+  );
+  const messageJson = JSON.stringify(message);
+  const { wrapEvent } = await buildGiftWrap(
+    messageJson,
+    senderEncrypter,
+    validatedProvenance,
+    createdAt,
+  );
+  return { wrapEvent, payloadHash: computeHash(messageJson) };
 }
 
 export async function sealPrivateResult(
   result: PrivateResultPayload,
   senderEncrypter: NostrEncrypter,
-  recipient: NostrPublicKey,
+  provenance: PrivateTaskProvenance,
   createdAt: number,
-  agreementRoot: string,
 ): Promise<SealedResultResult> {
+  const validatedProvenance = validateProvenance(provenance);
   const validated = validatePrivateResultPayload(result);
-  const payloadJson = JSON.stringify(validated);
-  const { wrapEvent } = await buildGiftWrap(payloadJson, senderEncrypter, recipient, createdAt);
-  const resultReference = createPactResultReference(DOCUMENT_SUMMARY_PROFILE_ID, agreementRoot, validated);
+  const message = createPrivateResultMessage(validated, validatedProvenance);
+  const { wrapEvent } = await buildGiftWrap(
+    JSON.stringify(message),
+    senderEncrypter,
+    validatedProvenance,
+    createdAt,
+  );
+  const resultReference = createPactResultReference(
+    DOCUMENT_SUMMARY_PROFILE_ID,
+    validatedProvenance.agreementRoot,
+    validated,
+  );
   return { wrapEvent, resultReference };
 }
 
@@ -262,14 +322,21 @@ function computeHash(input: string): string {
  *   2. The wrap signature is valid (proves the one-time key signed it).
  *   3. The seal event inside is a valid signed kind 13.
  *   4. The seal signature is valid (proves the real sender signed it).
- *   5. The seal's sender matches the authorized sender from provenance.
- *   6. The decrypted payload passes domain validation.
+ *   5. The encrypted rumor id, kind, author, and recipient are valid.
+ *   6. The rumor author matches both the seal and the agreement authority.
+ *   7. The encrypted message binds the exact agreement and participants.
  */
 function unwrapGiftWrap(
   wrapEvent: SignedNostrEvent,
   recipientEncrypter: NostrEncrypter,
   provenance: PrivateTaskProvenance,
 ): string {
+  if (recipientEncrypter.publicKey !== provenance.recipient) {
+    throw new PrivateTaskPublicationError(
+      "recipient_mismatch",
+      "Private message is not addressed to the agreement recipient",
+    );
+  }
   const wrap = parseSignedNostrEvent(wrapEvent);
   verifySignedNostrEvent(wrap);
 
@@ -278,7 +345,7 @@ function unwrapGiftWrap(
   }
 
   const pTags = wrap.tags.filter((tag) => tag[0] === "p");
-  if (pTags.length !== 1 || pTags[0][1] !== recipientEncrypter.publicKey) {
+  if (pTags.length !== 1 || pTags[0][1] !== provenance.recipient) {
     throw new PrivateTaskPublicationError("recipient_mismatch", "Gift wrap p tag must match the recipient");
   }
 
@@ -311,6 +378,10 @@ function unwrapGiftWrap(
     throw new PrivateTaskPublicationError("invalid_envelope", "Seal must use kind 13");
   }
 
+  if (sealEvent.tags.length !== 0) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Seal tags must be empty");
+  }
+
   try {
     verifySignedNostrEvent(sealEvent);
   } catch {
@@ -324,15 +395,82 @@ function unwrapGiftWrap(
     );
   }
 
-  let payloadJson: string;
+  let rumorJson: string;
   try {
-    payloadJson = recipientEncrypter.decryptNip44(sealEvent.pubkey, sealEvent.content);
+    rumorJson = recipientEncrypter.decryptNip44(sealEvent.pubkey, sealEvent.content);
   } catch (error) {
     if (error instanceof PrivateTaskPublicationError) throw error;
     throw new PrivateTaskPublicationError("decryption_failure", "Failed to decrypt seal content");
   }
 
-  return payloadJson;
+  return parseRumor(rumorJson, sealEvent.pubkey, provenance).content;
+}
+
+function parseRumor(
+  rumorJson: string,
+  sealAuthor: NostrPublicKey,
+  provenance: PrivateTaskProvenance,
+): NostrRumorEvent {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rumorJson);
+  } catch {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Seal does not contain a valid rumor");
+  }
+  if (typeof raw !== "object" || raw === null) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Rumor must be an object");
+  }
+  const candidate = raw as Record<string, unknown>;
+  const keys = ["id", "pubkey", "created_at", "kind", "tags", "content"];
+  if (
+    Object.keys(candidate).some((key) => !keys.includes(key)) ||
+    keys.some((key) => !(key in candidate))
+  ) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Rumor fields are invalid");
+  }
+
+  let unsigned: UnsignedNostrEvent;
+  try {
+    unsigned = parseUnsignedNostrEvent(
+      JSON.stringify({
+        pubkey: candidate.pubkey,
+        created_at: candidate.created_at,
+        kind: candidate.kind,
+        tags: candidate.tags,
+        content: candidate.content,
+      }),
+    );
+  } catch {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Rumor event is malformed");
+  }
+  if (
+    typeof candidate.id !== "string" ||
+    !/^[0-9a-f]{64}$/.test(candidate.id) ||
+    candidate.id !== getEventHash({ ...unsigned, tags: copyTags(unsigned.tags) })
+  ) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Rumor id is invalid");
+  }
+  if (unsigned.kind !== NIP17_PRIVATE_DIRECT_MESSAGE_KIND) {
+    throw new PrivateTaskPublicationError("invalid_envelope", "Rumor must use kind 14");
+  }
+  if (unsigned.pubkey !== sealAuthor || unsigned.pubkey !== provenance.authorizedSender) {
+    throw new PrivateTaskPublicationError(
+      "sender_not_authorized",
+      "Rumor author does not match the seal and agreement authority",
+    );
+  }
+  if (
+    unsigned.tags.length !== 1 ||
+    unsigned.tags[0][0] !== "p" ||
+    unsigned.tags[0].length !== 2 ||
+    unsigned.tags[0][1] !== provenance.recipient
+  ) {
+    throw new PrivateTaskPublicationError(
+      "recipient_mismatch",
+      "Rumor recipient does not match the agreement recipient",
+    );
+  }
+  return { ...unsigned, tags: copyTags(unsigned.tags), id: candidate.id };
 }
 
 export function openPrivateTask(
@@ -348,7 +486,7 @@ export function openPrivateTask(
   } catch {
     throw new PrivateTaskPublicationError("decryption_failure", "Decrypted payload is not valid JSON");
   }
-  return validatePrivateTaskPayload(raw);
+  return parsePrivateTaskMessage(raw, validatedProvenance).payload;
 }
 
 export function openPrivateResult(
@@ -364,7 +502,7 @@ export function openPrivateResult(
   } catch {
     throw new PrivateTaskPublicationError("decryption_failure", "Decrypted result is not valid JSON");
   }
-  return validatePrivateResultPayload(raw);
+  return parsePrivateResultMessage(raw, validatedProvenance).payload;
 }
 
 /*
