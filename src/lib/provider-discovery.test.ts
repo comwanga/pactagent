@@ -32,6 +32,7 @@ import {
 import {
   signAndPublishCashuEscrowDescriptor,
 } from "./pontmore-escrow-publication";
+import { runRequesterDecision, type RequesterDecisionModel } from "./requester-decision";
 
 const FIXTURE_TIME = 1_788_853_200;
 const RELAYS = ["wss://relay.example"] as const;
@@ -194,6 +195,59 @@ describe("relay-backed provider discovery", () => {
       expect(result.selected?.selected.providerDefinitionReference).toBe(p002.definition.address);
       expect(result.selected?.selected.escrowDescriptorReference).toBe(p002.escrowDescriptor.address);
       expect(result.rejections).toEqual([]);
+    });
+
+    it("passes the actual Issue #9 selection and stable references into the bounded Issue #15 gate", async () => {
+      const relay = new MemoryNostrRelay();
+      const p002 = createProviderBundle(2);
+      await publishBundle(p002, relay);
+      const discovery = await discoverProviders({
+        requesterPolicy: REQUESTER_POLICY,
+        capability: "document-summary",
+        relay,
+        now: FIXTURE_TIME + 60,
+      });
+      const model: RequesterDecisionModel = {
+        async recommend(input) {
+          const candidate = input.candidates[0];
+          if (!candidate) return { action: "decline" };
+          return {
+            action: "recommend",
+            providerPublicKey: candidate.providerPublicKey,
+            providerDefinitionReference: candidate.providerDefinitionReference,
+            offerReference: candidate.offerReference,
+            escrowDescriptorReference: candidate.escrowDescriptorReference,
+            proposedAmountSats: candidate.amountSats,
+          };
+        },
+      };
+
+      const decision = await runRequesterDecision({
+        intent: {
+          capabilityProfile: "document-summary@1",
+          maximumBudgetSats: REQUESTER_POLICY.maxBudgetSats,
+          instruction: "Summarize the private document within the trusted budget.",
+        },
+        requesterPolicy: REQUESTER_POLICY,
+        discovery,
+        model,
+        bounds: {
+          maximumInstructionCharacters: 500,
+          maximumRationaleCharacters: 500,
+          modelTimeoutMilliseconds: 100,
+        },
+      });
+
+      expect(decision).toEqual({
+        status: "approved",
+        reason: "approved",
+        capabilityProfile: "document-summary@1",
+        selection: discovery.selected!.selected,
+        amountSats: "350",
+      });
+      expect(decision.status === "approved" && decision.selection.offerReference).toBe(p002.offer.address);
+      expect(decision.status === "approved" && decision.selection.providerDefinitionReference).toBe(p002.definition.address);
+      expect(decision.status === "approved" && decision.selection.escrowDescriptorReference).toBe(p002.escrowDescriptor.address);
     });
 
     it("validates retrieved PIP-00 definitions before policy evaluation", async () => {

@@ -77,3 +77,32 @@ At each step it cross-validates bindings: the PIP-00 event author equals the can
 Discovery keeps three decisions distinct: (1) is this a valid signed Pontmore agent definition, (2) does it describe a provider compatible with the requested capability, and (3) does the requester's deterministic economic policy authorize the provider's current signed offer. Malformed candidates are rejected independently with structured rejection categories without aborting the whole query. Query sizes and follow-up resolutions are bounded. Profiles are grouped by their stable replaceable address (`<kind>:<pubkey>:<d>`), and replacement ordering is applied only among address-matching events with valid NIP-01 identities and signatures. Forged or unrelated events never supersede authentic events. Once the newest authentic profile, offer, or descriptor is selected, invalid application or PIP content rejects that address without falling back to an older authentic version. The deterministic ordering is: authorized offers only, lowest price, shortest declared maximum execution time, provider pubkey ascending, then definition address ascending when one provider publishes multiple equally acceptable definitions. AI is not involved in authorization or final provider selection; no advisory input is accepted into the authoritative ordering.
 
 Successful discovery returns stable `SelectedProviderReferences` (provider definition, escrow descriptor, and offer addresses) suitable for the PactAgent service-agreement event integration (#10). Discovery does not create a service agreement, imply bilateral consent, advance lifecycle state, authorize settlement, or let AI output perform an economic action. PactAgent `document-summary@1` agreement/profile fields are not misrepresented as PIP-00/PIP-01 protocol fields.
+
+## Bounded requester decision (#15)
+
+`runRequesterDecision` consumes an already validated Issue #9 `DiscoveryResult`; it
+does not query relays, reimplement discovery, or change the selected-provider
+ordering. A narrow injected `RequesterDecisionModel` receives the private bounded
+human instruction plus a frozen safe projection containing only public identity,
+stable definition/offer/escrow references, amount, Cashu network, and execution
+duration. Raw Nostr events and private document, result, key, Cashu, commitment,
+and settlement material are excluded. The instruction is deliberately
+non-enumerable to prevent accidental exposure through PactAgent's ordinary
+enumeration and JSON serialization. The configured adapter must read the
+`instruction` property explicitly, treat it as sensitive, and must not log,
+persist, or expose it. Because the adapter intentionally receives the value,
+non-enumerability is not a secrecy boundary against arbitrary injected code.
+
+Model output is untrusted and strictly allowlisted. A recommendation must bind to
+the current Issue #9 selection, its exact references, and the signed offer amount.
+The deterministic gate reuses P001's existing requester policy, applies the lower
+human budget, checks `document-summary@1` and Cashu compatibility, and returns a
+safe approval or one stable rejection reason. Model rationale is discarded before
+the application result is returned. Timeouts, unavailable models, exceptions,
+malformed output, and contradictory recommendations fail closed.
+
+This decision is advisory application data, not a Nostr event, Pontmore PIP,
+agreement authorization, lifecycle transition, completion decision, or Cashu
+settlement authorization. No signer, relay, publication, lifecycle, Cashu, tool,
+or arbitrary runtime capability crosses the model interface. CI uses deterministic
+fakes; deployment-specific model wiring remains outside this domain boundary.
