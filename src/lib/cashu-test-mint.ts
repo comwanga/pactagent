@@ -270,6 +270,11 @@ interface PrivateFundingMaterial {
 const privateFundingMaterial = new WeakMap<PrivateCashuFunding, PrivateFundingMaterial>();
 const privateSpendingKeys = new WeakMap<PrivateCashuSpendingKey, string>();
 
+/** @internal Confirms that a key was created by the private NUT-11 key factory. */
+export function isPrivateCashuSpendingKey(value: unknown): value is PrivateCashuSpendingKey {
+  return value instanceof PrivateCashuSpendingKey && privateSpendingKeys.has(value);
+}
+
 function randomPrivateReference(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
