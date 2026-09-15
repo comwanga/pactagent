@@ -19,6 +19,7 @@ import {
   parseCashuEscrowDescriptorEvent,
   type PontmoreEscrowDescriptor,
 } from "./pontmore-escrow";
+import { findForbiddenPublicMaterial } from "./forbidden-material";
 
 /** PactAgent-owned provisional/unregistered regular kind; not a Pontmore PIP or Nostr standard. */
 export const PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND = 3921;
@@ -737,6 +738,9 @@ function parseJsonObject(content: string, model: string): Record<string, unknown
 
 function parseRootContent(value: Record<string, unknown>): PactServiceAgreementContent {
   assertExactKeys(value, ROOT_CONTENT_KEYS, "privacy_boundary_violation");
+  if (findForbiddenPublicMaterial(value) !== undefined) {
+    agreementError("privacy_boundary_violation", "PactAgent agreement root contains forbidden private material");
+  }
   if (ROOT_CONTENT_KEYS.some((key) => !(key in value))) {
     agreementError("malformed_agreement", "PactAgent agreement root is missing required content");
   }
@@ -957,6 +961,9 @@ function parseTransitionContent(
   profile: PactCapabilityProfile<unknown, unknown>,
 ): PactAgreementTransitionContent {
   assertExactKeys(value, TRANSITION_BASE_KEYS, "privacy_boundary_violation");
+  if (findForbiddenPublicMaterial(value) !== undefined) {
+    agreementError("privacy_boundary_violation", "PactAgent transition contains forbidden private material");
+  }
   for (const key of [
     "version",
     "agreement_id",
