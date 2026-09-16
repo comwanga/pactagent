@@ -101,7 +101,7 @@ interface RawStream {
 }
 
 interface ParsedDictionary {
-  readonly length: number | null;
+  readonly length: number;
   readonly flate: boolean;
 }
 
@@ -134,10 +134,10 @@ function findStreamDictionaryBounds(buffer: Buffer, streamAt: number): { readonl
   return null;
 }
 
-/** Parse /Length and /Filter from the stream's own dictionary. Fail closed on indirect /Length. */
-function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictionary {
+/** Parse /Length and /Filter from the stream's own dictionary. Fail closed on unsupported lengths. */
+function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictionary | null {
   const bounds = findStreamDictionaryBounds(buffer, streamAt);
-  if (bounds === null) return { length: null, flate: false };
+  if (bounds === null) return null;
   const dictText = buffer.subarray(bounds.start, bounds.end).toString("latin1");
 
   if (LENGTH_INDIRECT_PATTERN.test(dictText)) {
@@ -145,9 +145,15 @@ function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictiona
   }
 
   const directMatch = LENGTH_DIRECT_PATTERN.exec(dictText);
-  const length = directMatch !== null ? parseInt(directMatch[1], 10) : null;
+  if (directMatch === null) {
+    extractError("unsupported_pdf_structure", "PDF stream does not declare a supported direct /Length");
+  }
+  const length = parseInt(directMatch[1], 10);
+  if (!Number.isSafeInteger(length) || length < 0) {
+    extractError("unsupported_pdf_structure", "PDF stream declares an invalid /Length");
+  }
   const flate = FLATE_PATTERN.test(dictText);
-  return { length: Number.isFinite(length) ? length : null, flate };
+  return { length, flate };
 }
 
 function findStreams(buffer: Buffer): RawStream[] {
@@ -158,28 +164,42 @@ function findStreams(buffer: Buffer): RawStream[] {
     if (streamAt === -1) break;
 
     const dictionary = parseStreamDictionary(buffer, streamAt);
+    if (dictionary === null) {
+      cursor = streamAt + STREAM_KEYWORD.length;
+      continue;
+    }
 
     let bodyStart = streamAt + STREAM_KEYWORD.length;
-    if (buffer[bodyStart] === 0x0d) bodyStart += 1;
-    if (buffer[bodyStart] === 0x0a) bodyStart += 1;
-
-    let bodyEnd: number;
-    if (dictionary.length !== null && bodyStart + dictionary.length <= buffer.length) {
-      bodyEnd = bodyStart + dictionary.length;
+    if (buffer[bodyStart] === 0x0d) {
+      bodyStart += 1;
+      if (buffer[bodyStart] === 0x0a) bodyStart += 1;
+    } else if (buffer[bodyStart] === 0x0a) {
+      bodyStart += 1;
     } else {
-      const endAt = buffer.indexOf(ENDSTREAM_KEYWORD, bodyStart);
-      if (endAt === -1) break;
-      bodyEnd = endAt;
-      if (buffer[bodyEnd - 1] === 0x0a) bodyEnd -= 1;
-      if (buffer[bodyEnd - 1] === 0x0d) bodyEnd -= 1;
+      extractError("unsupported_pdf_structure", "PDF stream keyword is not followed by an end-of-line marker");
     }
-    if (bodyEnd < bodyStart) bodyEnd = bodyStart;
+
+    const bodyEnd = bodyStart + dictionary.length;
+    if (bodyEnd > buffer.length) {
+      extractError("unsupported_pdf_structure", "PDF stream /Length exceeds the available document bytes");
+    }
 
     streams.push({ bytes: buffer.subarray(bodyStart, bodyEnd), flate: dictionary.flate });
 
-    const nextSearch = Math.max(bodyEnd, bodyStart + 1);
-    const nextEndstream = buffer.indexOf(ENDSTREAM_KEYWORD, nextSearch);
-    cursor = nextEndstream === -1 ? buffer.length : nextEndstream + ENDSTREAM_KEYWORD.length;
+    let endstreamAt = bodyEnd;
+    if (buffer[endstreamAt] === 0x0d) {
+      endstreamAt += 1;
+      if (buffer[endstreamAt] === 0x0a) endstreamAt += 1;
+    } else if (buffer[endstreamAt] === 0x0a) {
+      endstreamAt += 1;
+    }
+    if (
+      endstreamAt + ENDSTREAM_KEYWORD.length > buffer.length ||
+      buffer.subarray(endstreamAt, endstreamAt + ENDSTREAM_KEYWORD.length).equals(ENDSTREAM_KEYWORD) === false
+    ) {
+      extractError("unsupported_pdf_structure", "PDF stream /Length does not align with endstream");
+    }
+    cursor = endstreamAt + ENDSTREAM_KEYWORD.length;
   }
   return streams;
 }

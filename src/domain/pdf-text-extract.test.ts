@@ -140,6 +140,43 @@ describe("pdf-text-extract", () => {
     expect(result.text).toContain("Uncompressed stream");
   });
 
+  it("ignores a raw stream token that is not attached to a stream dictionary", () => {
+    const contentText = "BT /F1 12 Tf 72 720 Td (Actual content stream) Tj ET";
+    const contentBytes = Buffer.from(contentText, "latin1");
+    const objects: string[] = [];
+    objects.push("<< /Type /Catalog /Pages 2 0 R /Title (A stream processing example) >>");
+    objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>");
+    objects.push(`<< /Length ${contentBytes.length} >>\nstream\n${contentText}\nendstream`);
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let pdf = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (let i = 0; i < objects.length; i++) {
+      offsets.push(Buffer.byteLength(pdf, "latin1"));
+      pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+    const xrefOffset = Buffer.byteLength(pdf, "latin1");
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) pdf += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    const result = extractPdfText(Buffer.from(pdf, "latin1"));
+    expect(result.text).toContain("Actual content stream");
+  });
+
+  it("rejects a stream dictionary without a supported direct /Length", () => {
+    const contentText = "BT /F1 12 Tf 72 720 Td (Missing length test) Tj ET";
+    const pdf = Buffer.from(
+      `%PDF-1.4\n1 0 obj\n<< >>\nstream\n${contentText}\nendstream\nendobj\n%%EOF`,
+      "latin1",
+    );
+    expect(() => extractPdfText(pdf)).toThrow(PdfTextExtractError);
+    try {
+      extractPdfText(pdf);
+    } catch (error) {
+      expect((error as PdfTextExtractError).code).toBe("unsupported_pdf_structure");
+    }
+  });
+
   it("rejects a stream with an indirect /Length reference", () => {
     const contentText = "BT /F1 12 Tf 72 720 Td (Indirect length test) Tj ET";
     const contentBytes = Buffer.from(contentText, "latin1");
@@ -147,8 +184,9 @@ describe("pdf-text-extract", () => {
     objects.push("<< /Type /Catalog /Pages 2 0 R >>");
     objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>");
-    objects.push(`<< /Length ${contentBytes.length} 0 R >>\nstream\n${contentText}\nendstream`);
+    objects.push(`<< /Length 6 0 R >>\nstream\n${contentText}\nendstream`);
     objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    objects.push(String(contentBytes.length));
     let pdf = "%PDF-1.4\n";
     const offsets: number[] = [];
     for (let i = 0; i < objects.length; i++) {
