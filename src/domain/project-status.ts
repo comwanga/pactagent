@@ -5,5 +5,5 @@ export interface ProjectStatus {
   readonly phase: "open_protocol_foundation";
   readonly nostr: "modeled_not_connected";
   readonly cashu: "modeled_not_connected";
-  readonly ai: "document_summary_implemented";
+  readonly ai: "not_implemented";
 }

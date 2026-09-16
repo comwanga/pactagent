@@ -7,6 +7,6 @@ export function getProjectStatus(): ProjectStatus {
     phase: "open_protocol_foundation",
     nostr: "modeled_not_connected",
     cashu: "modeled_not_connected",
-    ai: "document_summary_implemented",
+    ai: "not_implemented",
   };
 }

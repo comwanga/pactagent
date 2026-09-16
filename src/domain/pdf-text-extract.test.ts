@@ -1,6 +1,7 @@
 import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
+import { DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES } from "./pact-service-agreement";
 import { extractPdfText, PdfTextExtractError } from "./pdf-text-extract";
 
 /*
@@ -103,5 +104,66 @@ describe("pdf-text-extract", () => {
   it("rejects a PDF with no extractable text", () => {
     const pdf = buildPdf({ lines: ["   "] });
     expect(() => extractPdfText(pdf)).toThrow(PdfTextExtractError);
+  });
+
+  it("does not truncate content when endstream appears inside a string literal", () => {
+    const lines = ["The word endstream appears in this document."];
+    const pdf = buildPdf({ lines });
+    const result = extractPdfText(pdf);
+    expect(result.text).toContain("endstream appears in this document");
+  });
+
+  it("does not misattribute an unrelated /FlateDecode to an uncompressed stream", () => {
+    const lines = ["Uncompressed stream with unrelated flate reference nearby."];
+    const contentText = lines
+      .map((line) => `BT /F1 12 Tf 72 720 Td (${escapePdfString(line)}) Tj ET`)
+      .join("\n");
+    const contentBytes = Buffer.from(contentText, "latin1");
+    const objects: string[] = [];
+    objects.push("<< /Type /Catalog /Pages 2 0 R >>");
+    objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>");
+    objects.push(`<< /Length ${contentBytes.length} /Filter /FlateDecode >>\nstream\n${contentText}\nendstream`);
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let pdf = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (let i = 0; i < objects.length; i++) {
+      offsets.push(Buffer.byteLength(pdf, "latin1"));
+      pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+    const xrefOffset = Buffer.byteLength(pdf, "latin1");
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) pdf += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    const buffer = Buffer.from(pdf, "latin1");
+    expect(() => extractPdfText(buffer)).toThrow(PdfTextExtractError);
+  });
+
+  it("rejects inflated content exceeding the processing bound", () => {
+    const largeText = "A".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1000);
+    const compressed = deflateSync(Buffer.from(largeText, "latin1"));
+    const objects: string[] = [];
+    objects.push("<< /Type /Catalog /Pages 2 0 R >>");
+    objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>");
+    objects.push(`<< /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n${compressed.toString("binary")}\nendstream`);
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let pdf = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (let i = 0; i < objects.length; i++) {
+      offsets.push(Buffer.byteLength(pdf, "latin1"));
+      pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+    const xrefOffset = Buffer.byteLength(pdf, "latin1");
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) pdf += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    const buffer = Buffer.from(pdf, "latin1");
+    expect(() => extractPdfText(buffer)).toThrow(PdfTextExtractError);
+    try {
+      extractPdfText(buffer);
+    } catch (error) {
+      expect((error as PdfTextExtractError).code).toBe("output_too_large");
+    }
   });
 });

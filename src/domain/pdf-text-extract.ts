@@ -1,10 +1,15 @@
 import { inflateSync } from "node:zlib";
 
 import { InvalidDomainInputError } from "./errors";
+import { DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES } from "./pact-service-agreement";
 
 /** Minimal, dependency-free PDF text extractor supporting raw and FlateDecode streams. */
 
-export type PdfTextExtractErrorCode = "invalid_pdf" | "no_text" | "inflate_failed";
+export type PdfTextExtractErrorCode =
+  | "invalid_pdf"
+  | "no_text"
+  | "inflate_failed"
+  | "output_too_large";
 
 export class PdfTextExtractError extends InvalidDomainInputError {
   readonly code: PdfTextExtractErrorCode;
@@ -28,7 +33,9 @@ export interface PdfExtractResult {
 const PDF_HEADER = Buffer.from("%PDF-");
 const STREAM_KEYWORD = Buffer.from("stream");
 const ENDSTREAM_KEYWORD = Buffer.from("endstream");
-const FLATE_FILTER = Buffer.from("/FlateDecode");
+const DICT_OPEN = Buffer.from("<<");
+const LENGTH_PATTERN = /\/Length\s+(\d+)/;
+const FLATE_PATTERN = /\/FlateDecode/;
 const TYPE_PAGE = Buffer.from("/Type /Page");
 const TYPE_PAGES = Buffer.from("/Type /Pages");
 
@@ -90,29 +97,53 @@ interface RawStream {
   readonly flate: boolean;
 }
 
+interface ParsedDictionary {
+  readonly length: number | null;
+  readonly flate: boolean;
+}
+
+/** Extract /Length and /Filter from the dictionary preceding a `stream` keyword. */
+function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictionary {
+  const dictEnd = streamAt;
+  const dictStart = buffer.lastIndexOf(DICT_OPEN, dictEnd);
+  if (dictStart === -1) return { length: null, flate: false };
+  const dictText = buffer.subarray(dictStart, dictEnd).toString("latin1");
+  const lengthMatch = LENGTH_PATTERN.exec(dictText);
+  const length = lengthMatch !== null ? parseInt(lengthMatch[1], 10) : null;
+  const flate = FLATE_PATTERN.test(dictText);
+  return { length: Number.isFinite(length) ? length : null, flate };
+}
+
 function findStreams(buffer: Buffer): RawStream[] {
   const streams: RawStream[] = [];
   let cursor = 0;
   while (cursor < buffer.length) {
     const streamAt = buffer.indexOf(STREAM_KEYWORD, cursor);
     if (streamAt === -1) break;
-    const filterScanStart = Math.max(0, streamAt - 256);
-    const dictionaryWindow = buffer.subarray(filterScanStart, streamAt);
-    const flate = dictionaryWindow.lastIndexOf(FLATE_FILTER) !== -1;
+
+    const dictionary = parseStreamDictionary(buffer, streamAt);
 
     let bodyStart = streamAt + STREAM_KEYWORD.length;
     if (buffer[bodyStart] === 0x0d) bodyStart += 1;
     if (buffer[bodyStart] === 0x0a) bodyStart += 1;
 
-    const endAt = buffer.indexOf(ENDSTREAM_KEYWORD, bodyStart);
-    if (endAt === -1) break;
-    let bodyEnd = endAt;
-    if (buffer[bodyEnd - 1] === 0x0a) bodyEnd -= 1;
-    if (buffer[bodyEnd - 1] === 0x0d) bodyEnd -= 1;
+    let bodyEnd: number;
+    if (dictionary.length !== null && bodyStart + dictionary.length <= buffer.length) {
+      bodyEnd = bodyStart + dictionary.length;
+    } else {
+      const endAt = buffer.indexOf(ENDSTREAM_KEYWORD, bodyStart);
+      if (endAt === -1) break;
+      bodyEnd = endAt;
+      if (buffer[bodyEnd - 1] === 0x0a) bodyEnd -= 1;
+      if (buffer[bodyEnd - 1] === 0x0d) bodyEnd -= 1;
+    }
     if (bodyEnd < bodyStart) bodyEnd = bodyStart;
 
-    streams.push({ bytes: buffer.subarray(bodyStart, bodyEnd), flate });
-    cursor = endAt + ENDSTREAM_KEYWORD.length;
+    streams.push({ bytes: buffer.subarray(bodyStart, bodyEnd), flate: dictionary.flate });
+
+    const nextSearch = Math.max(bodyEnd, bodyStart + 1);
+    const nextEndstream = buffer.indexOf(ENDSTREAM_KEYWORD, nextSearch);
+    cursor = nextEndstream === -1 ? buffer.length : nextEndstream + ENDSTREAM_KEYWORD.length;
   }
   return streams;
 }
@@ -335,8 +366,11 @@ function decompressStream(stream: RawStream): Buffer {
   if (!stream.flate) return stream.bytes;
   if (stream.bytes.length === 0) return stream.bytes;
   try {
-    return inflateSync(stream.bytes);
-  } catch {
+    return inflateSync(stream.bytes, { maxOutputLength: DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES });
+  } catch (error) {
+    if (error instanceof RangeError) {
+      extractError("output_too_large", "Inflated PDF stream exceeds the maximum processing size");
+    }
     extractError("inflate_failed", "PDF FlateDecode stream could not be inflated");
   }
 }
@@ -347,8 +381,13 @@ export function extractPdfText(input: Buffer): PdfExtractResult {
   }
   const streams = findStreams(input);
   let text = "";
+  let cumulativeInflated = 0;
   for (const stream of streams) {
     const decompressed = decompressStream(stream);
+    cumulativeInflated += decompressed.length;
+    if (cumulativeInflated > DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES) {
+      extractError("output_too_large", "Cumulative inflated PDF content exceeds the maximum processing size");
+    }
     if (decompressed.length === 0) continue;
     text += extractTextFromStream(decompressed);
   }

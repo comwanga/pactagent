@@ -3,6 +3,7 @@ import { deflateSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS,
   DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES,
   DOCUMENT_SUMMARY_PROFILE_ID,
   canonicalizePactJson,
@@ -223,11 +224,7 @@ describe("document-summary service", () => {
     });
 
     it("completes when execution stays within the configured deadline", () => {
-      const fixedClock = (() => {
-        const value = 5_000_000;
-        return () => value;
-      })();
-      __setDocumentSummaryClockForTesting(fixedClock);
+      __setDocumentSummaryClockForTesting(() => 5_000_000);
       const outcome = summarizeDocument({
         source_document: "A bounded deadline must be respected when execution is fast.",
         input_media_type: "text/plain",
@@ -236,23 +233,53 @@ describe("document-summary service", () => {
       expect(outcome.status).toBe("completed");
     });
 
-    it("uses the configured deadline rather than the profile maximum", () => {
-      const steppingClock = (() => {
-        let step = 0;
-        return () => {
-          const value = 9_000_000 + step;
-          step += 3_000;
-          return value;
-        };
-      })();
-      __setDocumentSummaryClockForTesting(steppingClock);
+    it("completes exactly one millisecond before the deadline boundary", () => {
+      const start = 2_000_000;
+      let ticks = 0;
+      __setDocumentSummaryClockForTesting(() => start + ticks++);
       const outcome = summarizeDocument({
-        source_document: "A two-second deadline must elapse before the five-minute profile maximum.",
+        source_document: "Execution finishing just before the deadline succeeds.",
         input_media_type: "text/plain",
-        deadlineSeconds: 2,
+        deadlineSeconds: 1,
+      });
+      expect(outcome.status).toBe("completed");
+    });
+
+    it("fails exactly at the deadline boundary (expiry is inclusive)", () => {
+      let ticks = 0;
+      const start = 3_000_000;
+      __setDocumentSummaryClockForTesting(() => {
+        const value = start + ticks * 1_000;
+        ticks += 1;
+        return value;
+      });
+      const outcome = summarizeDocument({
+        source_document: "Execution reaching the exact deadline fails.",
+        input_media_type: "text/plain",
+        deadlineSeconds: 1,
       });
       expect(outcome.status).toBe("failed");
       expect((outcome as { errorCode: string }).errorCode).toBe("execution_deadline_exceeded");
+    });
+
+    it("rejects deadlineSeconds exceeding the profile maximum", () => {
+      expect(() =>
+        summarizeDocument({
+          source_document: "x",
+          input_media_type: "text/plain",
+          deadlineSeconds: DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS + 1,
+        }),
+      ).toThrow(/capability profile maximum/);
+    });
+
+    it("accepts deadlineSeconds exactly at the profile maximum", () => {
+      __setDocumentSummaryClockForTesting(() => 7_000_000);
+      const outcome = summarizeDocument({
+        source_document: "The profile maximum deadline is acceptable.",
+        input_media_type: "text/plain",
+        deadlineSeconds: DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS,
+      });
+      expect(outcome.status).toBe("completed");
     });
   });
 
@@ -280,6 +307,19 @@ describe("document-summary service", () => {
       });
       expect(outcome.status).toBe("failed");
       expect((outcome as { errorCode: string }).errorCode).toBe("empty_document");
+    });
+  });
+
+  describe("private_prompt", () => {
+    it("accepts a private_prompt without altering the deterministic output", () => {
+      const document = "PactAgent provides a bounded document-summary service.";
+      const withoutPrompt = summarizeDocument({ source_document: document, input_media_type: "text/plain" });
+      const withPrompt = summarizeDocument({
+        source_document: document,
+        input_media_type: "text/plain",
+        private_prompt: "Summarize this in 200 words.",
+      });
+      expect(withPrompt).toEqual(withoutPrompt);
     });
   });
 

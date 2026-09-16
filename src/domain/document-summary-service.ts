@@ -38,6 +38,7 @@ export class DocumentSummaryServiceError extends InvalidDomainInputError {
 export interface DocumentSummaryRequest {
   readonly source_document: string;
   readonly input_media_type: DocumentSummaryMediaType;
+  /** Accepted for contract compatibility with #10/#11; this deterministic executor does not alter output based on it. */
   readonly private_prompt?: string;
   readonly agreementRoot?: string;
   readonly deadlineSeconds?: number;
@@ -71,7 +72,7 @@ function createDeadline(startedAt: number, deadlineMs: number): ExecutionDeadlin
     startedAt,
     deadlineMs,
     exhausted(now) {
-      return now() - startedAt > deadlineMs;
+      return now() - startedAt >= deadlineMs;
     },
   };
 }
@@ -128,11 +129,16 @@ function validateRequestShape(input: unknown): DocumentSummaryRequest {
   ) {
     throw new DocumentSummaryServiceError("provider_error", "Document-summary agreementRoot must be a Nostr event id");
   }
-  if (
-    candidate.deadlineSeconds !== undefined &&
-    (!Number.isInteger(candidate.deadlineSeconds) || (candidate.deadlineSeconds as number) < 1)
-  ) {
-    throw new DocumentSummaryServiceError("provider_error", "Document-summary deadlineSeconds must be a positive integer");
+  if (candidate.deadlineSeconds !== undefined) {
+    if (!Number.isInteger(candidate.deadlineSeconds) || (candidate.deadlineSeconds as number) < 1) {
+      throw new DocumentSummaryServiceError("provider_error", "Document-summary deadlineSeconds must be a positive integer");
+    }
+    if ((candidate.deadlineSeconds as number) > DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS) {
+      throw new DocumentSummaryServiceError(
+        "provider_error",
+        "Document-summary deadlineSeconds must not exceed the capability profile maximum",
+      );
+    }
   }
   return candidate as unknown as DocumentSummaryRequest;
 }
