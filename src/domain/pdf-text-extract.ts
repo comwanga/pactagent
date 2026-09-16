@@ -9,7 +9,8 @@ export type PdfTextExtractErrorCode =
   | "invalid_pdf"
   | "no_text"
   | "inflate_failed"
-  | "output_too_large";
+  | "output_too_large"
+  | "unsupported_pdf_structure";
 
 export class PdfTextExtractError extends InvalidDomainInputError {
   readonly code: PdfTextExtractErrorCode;
@@ -34,7 +35,9 @@ const PDF_HEADER = Buffer.from("%PDF-");
 const STREAM_KEYWORD = Buffer.from("stream");
 const ENDSTREAM_KEYWORD = Buffer.from("endstream");
 const DICT_OPEN = Buffer.from("<<");
-const LENGTH_PATTERN = /\/Length\s+(\d+)/;
+const DICT_CLOSE = Buffer.from(">>");
+const LENGTH_DIRECT_PATTERN = /\/Length\s+(\d+)\s*(?![\d\s]*\d+\s+R)/;
+const LENGTH_INDIRECT_PATTERN = /\/Length\s+\d+\s+\d+\s+R/;
 const FLATE_PATTERN = /\/FlateDecode/;
 const TYPE_PAGE = Buffer.from("/Type /Page");
 const TYPE_PAGES = Buffer.from("/Type /Pages");
@@ -102,14 +105,47 @@ interface ParsedDictionary {
   readonly flate: boolean;
 }
 
-/** Extract /Length and /Filter from the dictionary preceding a `stream` keyword. */
+/** Find the matching `<<` for the `>>` that closes just before the `stream` keyword. */
+function findStreamDictionaryBounds(buffer: Buffer, streamAt: number): { readonly start: number; readonly end: number } | null {
+  let scan = streamAt;
+  while (scan > 0 && (buffer[scan - 1] === 0x20 || buffer[scan - 1] === 0x0d || buffer[scan - 1] === 0x0a || buffer[scan - 1] === 0x09)) {
+    scan -= 1;
+  }
+  if (scan < DICT_CLOSE.length) return null;
+  const closeEnd = scan;
+  if (buffer.subarray(closeEnd - DICT_CLOSE.length, closeEnd).equals(DICT_CLOSE) === false) return null;
+
+  let depth = 1;
+  let pos = closeEnd - DICT_CLOSE.length;
+  while (pos > 0) {
+    if (pos >= DICT_CLOSE.length && buffer.subarray(pos - DICT_CLOSE.length, pos).equals(DICT_CLOSE)) {
+      depth += 1;
+      pos -= DICT_CLOSE.length;
+      continue;
+    }
+    if (pos >= DICT_OPEN.length && buffer.subarray(pos - DICT_OPEN.length, pos).equals(DICT_OPEN)) {
+      depth -= 1;
+      if (depth === 0) return { start: pos - DICT_OPEN.length, end: closeEnd };
+      pos -= DICT_OPEN.length;
+      continue;
+    }
+    pos -= 1;
+  }
+  return null;
+}
+
+/** Parse /Length and /Filter from the stream's own dictionary. Fail closed on indirect /Length. */
 function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictionary {
-  const dictEnd = streamAt;
-  const dictStart = buffer.lastIndexOf(DICT_OPEN, dictEnd);
-  if (dictStart === -1) return { length: null, flate: false };
-  const dictText = buffer.subarray(dictStart, dictEnd).toString("latin1");
-  const lengthMatch = LENGTH_PATTERN.exec(dictText);
-  const length = lengthMatch !== null ? parseInt(lengthMatch[1], 10) : null;
+  const bounds = findStreamDictionaryBounds(buffer, streamAt);
+  if (bounds === null) return { length: null, flate: false };
+  const dictText = buffer.subarray(bounds.start, bounds.end).toString("latin1");
+
+  if (LENGTH_INDIRECT_PATTERN.test(dictText)) {
+    extractError("unsupported_pdf_structure", "PDF stream uses an indirect /Length reference which is not supported");
+  }
+
+  const directMatch = LENGTH_DIRECT_PATTERN.exec(dictText);
+  const length = directMatch !== null ? parseInt(directMatch[1], 10) : null;
   const flate = FLATE_PATTERN.test(dictText);
   return { length: Number.isFinite(length) ? length : null, flate };
 }

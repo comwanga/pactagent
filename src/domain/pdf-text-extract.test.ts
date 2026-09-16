@@ -113,8 +113,8 @@ describe("pdf-text-extract", () => {
     expect(result.text).toContain("endstream appears in this document");
   });
 
-  it("does not misattribute an unrelated /FlateDecode to an uncompressed stream", () => {
-    const lines = ["Uncompressed stream with unrelated flate reference nearby."];
+  it("does not misattribute an unrelated /FlateDecode from a nested resource dictionary", () => {
+    const lines = ["Uncompressed stream whose resource sub-dictionary mentions FlateDecode."];
     const contentText = lines
       .map((line) => `BT /F1 12 Tf 72 720 Td (${escapePdfString(line)}) Tj ET`)
       .join("\n");
@@ -122,8 +122,32 @@ describe("pdf-text-extract", () => {
     const objects: string[] = [];
     objects.push("<< /Type /Catalog /Pages 2 0 R >>");
     objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /Filter /FlateDecode >> >> >>");
+    objects.push(`<< /Length ${contentBytes.length} >>\nstream\n${contentText}\nendstream`);
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    let pdf = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (let i = 0; i < objects.length; i++) {
+      offsets.push(Buffer.byteLength(pdf, "latin1"));
+      pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+    const xrefOffset = Buffer.byteLength(pdf, "latin1");
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) pdf += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    const buffer = Buffer.from(pdf, "latin1");
+    const result = extractPdfText(buffer);
+    expect(result.text).toContain("Uncompressed stream");
+  });
+
+  it("rejects a stream with an indirect /Length reference", () => {
+    const contentText = "BT /F1 12 Tf 72 720 Td (Indirect length test) Tj ET";
+    const contentBytes = Buffer.from(contentText, "latin1");
+    const objects: string[] = [];
+    objects.push("<< /Type /Catalog /Pages 2 0 R >>");
+    objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>");
-    objects.push(`<< /Length ${contentBytes.length} /Filter /FlateDecode >>\nstream\n${contentText}\nendstream`);
+    objects.push(`<< /Length ${contentBytes.length} 0 R >>\nstream\n${contentText}\nendstream`);
     objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
     let pdf = "%PDF-1.4\n";
     const offsets: number[] = [];
@@ -137,6 +161,11 @@ describe("pdf-text-extract", () => {
     pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
     const buffer = Buffer.from(pdf, "latin1");
     expect(() => extractPdfText(buffer)).toThrow(PdfTextExtractError);
+    try {
+      extractPdfText(buffer);
+    } catch (error) {
+      expect((error as PdfTextExtractError).code).toBe("unsupported_pdf_structure");
+    }
   });
 
   it("rejects inflated content exceeding the processing bound", () => {
