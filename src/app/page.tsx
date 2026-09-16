@@ -48,7 +48,7 @@ export default function Home() {
           <div><dt>Application</dt><dd><span className="dot active" />{status.application}</dd></div>
           <div><dt>Nostr</dt><dd><span className="dot modeled" />Adapters ready</dd></div>
           <div><dt>Cashu</dt><dd><span className="dot modeled" />Descriptor only</dd></div>
-          <div><dt>AI execution</dt><dd><span className="dot neutral" />Not implemented</dd></div>
+          <div><dt>AI execution</dt><dd><span className="dot active" />document-summary</dd></div>
         </dl>
       </section>
 
