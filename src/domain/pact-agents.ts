@@ -58,6 +58,56 @@ export interface OfferEvaluation {
   readonly reasons: readonly string[];
 }
 
+export interface RequesterOfferPolicyInput {
+  readonly policy: RequesterPolicy;
+  readonly capability: ServiceCapability;
+  readonly priceSats: Sats;
+  readonly settlementNetwork: "cashu";
+  readonly estimatedExecutionSeconds: number;
+}
+
+export function validateRequesterPolicy(policy: RequesterPolicy): void {
+  sats(policy.maxBudgetSats);
+  sats(policy.maximumProviderPriceSats);
+  if (policy.maximumProviderPriceSats > policy.maxBudgetSats) {
+    throw new InvalidDomainInputError("P001 maximum provider price cannot exceed its budget");
+  }
+  if (
+    policy.maxBudgetSats === 0n ||
+    !policy.allowedCapabilities.includes("document-summary") ||
+    !Number.isInteger(policy.maximumEscrowDurationSeconds) ||
+    policy.maximumEscrowDurationSeconds < 1
+  ) {
+    throw new InvalidDomainInputError("P001 policy constraints are invalid");
+  }
+}
+
+/** Requester-owned checks shared by local offer evaluation and the bounded AI gate. */
+export function evaluateRequesterOfferPolicy(input: RequesterOfferPolicyInput): OfferEvaluation {
+  validateRequesterPolicy(input.policy);
+  sats(input.priceSats);
+  const reasons: string[] = [];
+
+  if (!Number.isInteger(input.estimatedExecutionSeconds) || input.estimatedExecutionSeconds < 1) {
+    reasons.push("invalid_execution_duration");
+  }
+  if (!input.policy.allowedCapabilities.includes(input.capability)) {
+    reasons.push("capability_not_allowed");
+  }
+  if (input.priceSats > input.policy.maxBudgetSats) reasons.push("budget_exceeded");
+  if (input.priceSats > input.policy.maximumProviderPriceSats) {
+    reasons.push("provider_price_limit_exceeded");
+  }
+  if (!input.policy.allowedSettlementNetworks.includes(input.settlementNetwork)) {
+    reasons.push("settlement_network_not_allowed");
+  }
+  if (input.estimatedExecutionSeconds > input.policy.maximumEscrowDurationSeconds) {
+    reasons.push("requester_escrow_duration_exceeded");
+  }
+
+  return { authorized: reasons.length === 0, reasons };
+}
+
 export function validateRequesterAgent(agent: RequesterAgent): void {
   if (agent.id !== "P001" || agent.role !== "requester") {
     throw new InvalidDomainInputError("Requester must use PactAgent application identifier P001");
@@ -66,19 +116,7 @@ export function validateRequesterAgent(agent: RequesterAgent): void {
     throw new InvalidDomainInputError("P001 definition must use its independent Nostr identity");
   }
   parsePontmoreAgentDefinition(serializeUnsignedNostrEvent(agent.definition.event));
-  sats(agent.policy.maxBudgetSats);
-  sats(agent.policy.maximumProviderPriceSats);
-  if (agent.policy.maximumProviderPriceSats > agent.policy.maxBudgetSats) {
-    throw new InvalidDomainInputError("P001 maximum provider price cannot exceed its budget");
-  }
-  if (
-    agent.policy.maxBudgetSats === 0n ||
-    !agent.policy.allowedCapabilities.includes("document-summary") ||
-    !Number.isInteger(agent.policy.maximumEscrowDurationSeconds) ||
-    agent.policy.maximumEscrowDurationSeconds < 1
-  ) {
-    throw new InvalidDomainInputError("P001 policy constraints are invalid");
-  }
+  validateRequesterPolicy(agent.policy);
 }
 
 export function validateProviderAgent(agent: ProviderAgent): void {
@@ -139,14 +177,20 @@ export function evaluateServiceOffer(input: {
 }): OfferEvaluation {
   validateRequesterAgent(input.requester);
   validateProviderAgent(input.provider);
-  sats(input.offer.priceSats);
+  const requesterReasons = new Set(evaluateRequesterOfferPolicy({
+    policy: input.requester.policy,
+    capability: input.offer.capability,
+    priceSats: input.offer.priceSats,
+    settlementNetwork: input.offer.settlementNetwork,
+    estimatedExecutionSeconds: input.offer.estimatedExecutionSeconds,
+  }).reasons);
   const reasons: string[] = [];
 
-  if (!Number.isInteger(input.offer.estimatedExecutionSeconds) || input.offer.estimatedExecutionSeconds < 1) {
+  if (requesterReasons.has("invalid_execution_duration")) {
     reasons.push("invalid_execution_duration");
   }
 
-  if (!input.requester.policy.allowedCapabilities.includes(input.offer.capability)) {
+  if (requesterReasons.has("capability_not_allowed")) {
     reasons.push("capability_not_allowed");
   }
   if (!input.provider.policy.serviceCapabilities.includes(input.offer.capability)) {
@@ -155,14 +199,14 @@ export function evaluateServiceOffer(input: {
   if (input.offer.providerPublicKey !== input.provider.identity.publicKey) {
     reasons.push("provider_identity_mismatch");
   }
-  if (input.offer.priceSats > input.requester.policy.maxBudgetSats) reasons.push("budget_exceeded");
-  if (input.offer.priceSats > input.requester.policy.maximumProviderPriceSats) {
+  if (requesterReasons.has("budget_exceeded")) reasons.push("budget_exceeded");
+  if (requesterReasons.has("provider_price_limit_exceeded")) {
     reasons.push("provider_price_limit_exceeded");
   }
   if (input.offer.priceSats < input.provider.policy.minimumPriceSats) {
     reasons.push("below_provider_minimum");
   }
-  if (!input.requester.policy.allowedSettlementNetworks.includes(input.offer.settlementNetwork)) {
+  if (requesterReasons.has("settlement_network_not_allowed")) {
     reasons.push("settlement_network_not_allowed");
   }
   if (
@@ -174,7 +218,7 @@ export function evaluateServiceOffer(input: {
   if (input.offer.estimatedExecutionSeconds > input.provider.policy.maximumExecutionDurationSeconds) {
     reasons.push("provider_execution_limit_exceeded");
   }
-  if (input.offer.estimatedExecutionSeconds > input.requester.policy.maximumEscrowDurationSeconds) {
+  if (requesterReasons.has("requester_escrow_duration_exceeded")) {
     reasons.push("requester_escrow_duration_exceeded");
   }
 
