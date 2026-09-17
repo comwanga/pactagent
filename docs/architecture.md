@@ -13,7 +13,7 @@ P001 Requester ---------------- P002 Provider
                        v
                 unsigned action
                        |
-                 NostrSigner port           #6 IMPLEMENTATION PENDING
+                 NostrSigner port           #6 IMPLEMENTED BOUNDARY
                        |
               +--------+--------+
               |                 |
@@ -52,7 +52,8 @@ sensitive evidence, raw Cashu tokens and proofs, witnesses, blinded outputs,
 mint credentials, preimages, payout instructions, commitment salts, Cashu
 spending keys, and Nostr private keys. None are accepted by the public agreement
 serializers. The issue #12 adapter confines Cashu material to private wrappers
-and an injected private store; private task transport remains outside issue #10.
+and an injected durable private store. NIP-59 Gift Wrap task/result transport is
+implemented as its own private boundary and remains outside issue #10.
 
 ## Authority separation
 
@@ -64,9 +65,9 @@ PIP-01 event construction stops at an unsigned draft and hands that draft to
 `NostrSigner`; the descriptor layer never accepts or retrieves a private key. A
 signed event is checked against the original draft and its NIP-01 id and Schnorr
 signature are verified before publication. Retrieval repeats signature and
-descriptor validation before returning domain data. `NostrSigner` still has no
-production private-key implementation on this branch, and the LLM has no signing
-or wallet authority.
+descriptor validation before returning domain data. The repository provides an
+isolated local signer for development and tests; deployment-specific key custody
+is not claimed. The requester model has no signing or wallet authority.
 
 The PIP-01 workflow uses issue #4's `NostrRelayAdapter` and its typed
 `publish(event)` and `queryEvents(filter)` operations directly. Connection
@@ -89,11 +90,17 @@ verification in its predecessor chain. No dispute transition is available
 because this repository has neither a service-schema dispute authority nor an
 application dispute-authority record.
 
-## Local demo boundary
+## Implemented components and composition boundary
 
-Fixtures demonstrate one decision: P001 may select P002's `document-summary` offer at 350 sats because it is below P001's 500-sat budget and 450-sat provider-price ceiling, above P002's 200-sat minimum, within both duration limits, and compatible with the declared Cashu escrow.
+Relay-backed publication/discovery, bounded requester decision policy, PactAgent
+agreements, NIP-59 private transport, deterministic document-summary execution,
+and durable Cashu settlement coordination are implemented as separate reusable
+components. The Cashu layer can inspect and swap against one configured HTTPS
+test mint and can privately import already-acquired proofs and deliver confirmed
+outputs. Required tests remain deterministic and offline.
 
-No generic marketplace, live discovery, reputation, bidding, task execution,
-agreement-level settlement orchestration, or dispute adjudication is implemented.
-The private Cashu adapter reports mint facts only and cannot authorize, sign,
-publish, or advance an agreement transition.
+Issue #16 application composition, requester/provider runtime hosting, a hosted
+model adapter, and a live transaction frontend/API remain pending. This is not a
+production wallet: Lightning mint-quote acquisition, generic accounts,
+multi-mint routing, and production custody operations remain out of scope. No
+generic marketplace, reputation, bidding, or dispute adjudication is provided.

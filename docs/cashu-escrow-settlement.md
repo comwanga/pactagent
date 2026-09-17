@@ -12,7 +12,7 @@ advertise `service.schema`. Advertisement is deferred until such a URL exists.
 
 ## Boundary and API
 
-`PactCashuEscrowSettlementCoordinator` exposes seven operations:
+`PactCashuEscrowSettlementCoordinator` exposes nine operations:
 
 - prepare an escrow;
 - fund it through the private Cashu port;
@@ -20,7 +20,11 @@ advertise `service.schema`. Advertisement is deferred until such a URL exists.
 - consume a release authorization;
 - execute release;
 - consume a refund authorization; and
-- execute refund.
+- execute refund;
+- privately deliver a confirmed release payout to the bound provider and its
+  retained change to the requester; and
+- privately deliver a confirmed refund and retained change to the bound
+  requester.
 
 The coordinator never accepts an `actor_role` as authority. It reconstructs the
 signed #10 history for each action. The existing requester-signed
@@ -52,8 +56,20 @@ pending signed publication events across process restarts. Its database path
 must point to private application storage. The in-memory implementation remains
 deterministic test support and is not durable storage. The store retains the #12 opaque Cashu handle, operation
 fingerprints, confirmation facts, and any signed transition awaiting relay
-publication. It must be deployed as private encrypted application storage and
+publication. It must be deployed as private access-controlled application storage and
 must never be exposed through a public serializer.
+
+The #12 private store is a separate custody boundary. Its SQLite implementation
+persists proofs, prepared restoration context, payer change, and aggregate mint
+exposure across process restarts. The coordinator record durably retains the
+opaque funding-change handle and the confirmed release/refund output handle;
+none is added to `PactCashuEscrowStatus` or a public lifecycle event. Private
+delivery resolves the beneficiary from the durable agreement record, not from
+`actor_role` or caller-supplied identity. The #12 delivery boundary then opens
+the handle only for a matching private destination capability. Provider payout,
+requester refund, funding change, and spend change remain distinct deliveries
+with stable ids. Repeats resume the same delivery rather than exporting another
+economic output.
 
 Every mutation has an 8–64 character application idempotency key. The stored
 SHA-256 fingerprint binds the escrow and agreement references, operation type,
@@ -93,8 +109,10 @@ accounting: input equals output plus change plus mint fee, the locked output is
 the 350-sat amount plus the reported reserved spend fee, and release/refund nets
 exactly 350 sats. Before funding, proofs are held by the private funding source;
 while funded they remain behind the #12 opaque handle; after release/refund the
-new private handle remains in #12 storage. No bearer material becomes lifecycle
-evidence.
+new private handle remains in #12 storage and its opaque reference is retained
+in private coordinator state until authorized private delivery. Any payer or
+spend change is stored and delivered under its own private handle rather than
+discarded. No bearer material becomes lifecycle evidence.
 
 ## Authorization, recovery, and publication
 

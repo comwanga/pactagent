@@ -30,9 +30,12 @@ import {
   CashuTestMintError,
   PrivateCashuSpendingKey,
   createPrivateCashuFunding,
+  createPrivateCashuBeneficiaryDestination,
   createPrivateCashuSpendingKey,
+  type CashuPrivateDeliveryResult,
   type CashuMutationResult,
   type CashuPrivateHandle,
+  type CashuPrivateValueDeliveryPort,
   type CashuTestMintPort,
   type PrepareLockedValueInput,
   type ProofStateSummary,
@@ -126,6 +129,7 @@ class FakeCashuPort implements CashuTestMintPort {
         nut11P2pk: true,
       },
       activeKeyset: { id: "00aabb", inputFeePpk: 1 },
+      acceptedKeysetIds: ["00aabb"],
     };
   }
 
@@ -148,6 +152,7 @@ class FakeCashuPort implements CashuTestMintPort {
       status: "succeeded",
       operationId: input.operationId,
       handle: { reference: "cashu_private_11111111-1111-4111-8111-111111111111" },
+      changeHandle: { reference: "cashu_private_33333333-3333-4333-8333-333333333333" },
       facts: {
         mintUrl: this.mintUrl,
         unit: "sat",
@@ -197,19 +202,49 @@ class FakeCashuPort implements CashuTestMintPort {
       status: "succeeded",
       operationId: input.operationId,
       handle: { reference: "cashu_private_22222222-2222-4222-8222-222222222222" },
+      changeHandle: { reference: "cashu_private_44444444-4444-4444-8444-444444444444" },
       facts: {
         mintUrl: this.mintUrl,
         unit: "sat",
         amountSats: sats(350n),
         inputAmountSats: sats(351n),
         outputAmountSats: sats(350n),
-        changeAmountSats: sats(0n),
-        mintFeeSats: sats(1n),
+        changeAmountSats: sats(1n),
+        mintFeeSats: sats(0n),
         reservedSpendFeeSats: sats(0n),
       },
     };
     this.outcomes.set(input.operationId, successful);
     return successful;
+  }
+}
+
+class FakePrivateDelivery implements CashuPrivateValueDeliveryPort {
+  readonly calls: Array<{
+    deliveryId: string;
+    handle: CashuPrivateHandle;
+    expectedBeneficiary: string;
+  }> = [];
+
+  async deliver(input: Parameters<CashuPrivateValueDeliveryPort["deliver"]>[0]): Promise<CashuPrivateDeliveryResult> {
+    if (input.destination.beneficiary !== input.expectedBeneficiary) {
+      throw new CashuTestMintError(
+        "operation_rejected",
+        "Private Cashu beneficiary is not authorized for this delivery",
+      );
+    }
+    if (!this.calls.some((call) => call.deliveryId === input.deliveryId)) {
+      this.calls.push({
+        deliveryId: input.deliveryId,
+        handle: input.handle,
+        expectedBeneficiary: input.expectedBeneficiary,
+      });
+    }
+    return {
+      status: "delivered",
+      deliveryId: input.deliveryId,
+      beneficiary: input.expectedBeneficiary,
+    };
   }
 }
 
@@ -341,7 +376,7 @@ function privateFunding(mintUrl = MINT_URL) {
   });
 }
 
-function setup(options: { fixture?: ReturnType<typeof fixture>; cashu?: FakeCashuPort; store?: PactCashuEscrowSettlementStore } = {}) {
+function setup(options: { fixture?: ReturnType<typeof fixture>; cashu?: FakeCashuPort; store?: PactCashuEscrowSettlementStore; privateDelivery?: FakePrivateDelivery } = {}) {
   const data = options.fixture ?? fixture();
   const cashu = options.cashu ?? new FakeCashuPort();
   const store = options.store ?? createInMemoryPactCashuEscrowSettlementStore();
@@ -349,10 +384,12 @@ function setup(options: { fixture?: ReturnType<typeof fixture>; cashu?: FakeCash
   const clock = new TestClock(ROOT_TIME + 30);
   const normalSpendKey = createPrivateCashuSpendingKey({ purpose: "cashu-nut11", secretKeyHex: hex(key(21)) });
   const refundSpendKey = createPrivateCashuSpendingKey({ purpose: "cashu-nut11", secretKeyHex: hex(key(22)) });
+  const privateDelivery = options.privateDelivery ?? new FakePrivateDelivery();
   const escrowAuthoritySigner = createLocalNostrSigner(hex(data.authorityKey));
   const coordinator = createPactCashuEscrowSettlementCoordinator({
     mintUrl: MINT_URL,
     cashu,
+    privateDelivery,
     store,
     escrowAuthoritySigner,
     normalSpendKey,
@@ -363,6 +400,7 @@ function setup(options: { fixture?: ReturnType<typeof fixture>; cashu?: FakeCash
   return {
     ...data,
     cashu,
+    privateDelivery,
     store,
     relay,
     clock,
@@ -462,6 +500,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     expect(data.cashu.prepareCalls).toBe(1);
     expect(data.cashu.spendSubmissions).toBe(1);
     expect(reconstructPactAgreementHistory(release.context, data.history)).toMatchObject({ currentState: "settled" });
+    await expect(data.store.read(`escrow:${settled.escrow.escrowReference}`)).resolves.toMatchObject({
+      fundingChangeHandle: {
+        reference: "cashu_private_33333333-3333-4333-8333-333333333333",
+      },
+      settlementHandle: {
+        reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+      },
+    });
+    expect(JSON.stringify(settled)).not.toContain("cashu_private_");
     await expect(
       data.coordinator.refundEscrow({
         idempotencyKey: "refund-after-release",
@@ -500,7 +547,152 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     expect(refunded.escrow.refundReference).toMatch(/^pactrefund_/);
     expect(reconstructPactAgreementHistory(data.context, data.history)).toMatchObject({ currentState: "refunded" });
     expect(data.cashu.spendPublicKeys.at(-1)).toBe(data.refundSpendKey.publicKey);
+    await expect(data.store.read(`escrow:${refunded.escrow.escrowReference}`)).resolves.toMatchObject({
+      refundHandle: {
+        reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+      },
+    });
+    expect(JSON.stringify(refunded)).not.toContain("cashu_private_");
   });
+
+  it("recovers and idempotently delivers provider payout plus requester change after restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-provider-delivery-"));
+    const databasePath = join(directory, "settlement.sqlite");
+    let store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+    try {
+      const data = setup({ store });
+      const { funded } = await prepareAndFund(data);
+      const release = advanceReleaseHistory(data);
+      const authorized = await data.coordinator.submitReleaseAuthorization({
+        idempotencyKey: "delivery-release-auth",
+        escrowReference: funded.escrow.escrowReference,
+        expectedVersion: funded.escrow.version,
+        context: release.context,
+        history: data.history,
+        resultReference: release.resultReference,
+      });
+      const settled = await data.coordinator.releaseEscrow({
+        idempotencyKey: "delivery-release-run",
+        escrowReference: funded.escrow.escrowReference,
+        expectedVersion: authorized.escrow.version,
+        context: release.context,
+        history: data.history,
+      });
+      store.close();
+
+      store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      const privateDelivery = new FakePrivateDelivery();
+      const restarted = createPactCashuEscrowSettlementCoordinator({
+        mintUrl: MINT_URL,
+        cashu: data.cashu,
+        privateDelivery,
+        store,
+        escrowAuthoritySigner: data.escrowAuthoritySigner,
+        normalSpendKey: data.normalSpendKey,
+        refundSpendKey: data.refundSpendKey,
+        relay: data.relay,
+        clock: data.clock,
+      });
+      const providerDestination = createPrivateCashuBeneficiaryDestination({
+        beneficiary: data.provider.publicKey,
+        async deliver() {},
+      });
+      const requesterDestination = createPrivateCashuBeneficiaryDestination({
+        beneficiary: data.requester.publicKey,
+        async deliver() {},
+      });
+      const request = {
+        idempotencyKey: "deliver-provider-01",
+        escrowReference: settled.escrow.escrowReference,
+        expectedVersion: settled.escrow.version,
+        providerDestination,
+        requesterChangeDestination: requesterDestination,
+      };
+      const delivered = await restarted.deliverProviderPayout(request);
+      await expect(restarted.deliverProviderPayout(request)).resolves.toEqual(delivered);
+      expect(privateDelivery.calls).toHaveLength(3);
+      expect(privateDelivery.calls.map((call) => call.expectedBeneficiary)).toEqual([
+        data.provider.publicKey,
+        data.requester.publicKey,
+        data.requester.publicKey,
+      ]);
+      expect(privateDelivery.calls[0].handle.reference).not.toBe(
+        privateDelivery.calls[1].handle.reference,
+      );
+      expect(new Set(privateDelivery.calls.map((call) => call.handle.reference)).size).toBe(3);
+      expect(JSON.stringify(delivered)).not.toContain("cashu_private_");
+      expect(JSON.stringify(delivered)).not.toContain("PRIVATE-");
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("recovers and idempotently delivers requester refund plus change after restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-refund-delivery-"));
+    const databasePath = join(directory, "settlement.sqlite");
+    let store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+    try {
+      const data = setup({ store });
+      const { funded } = await prepareAndFund(data);
+      data.clock.value = data.locktime;
+      append(data.context, data.history, "refund_authorized", "requester", data.requesterKey, data.locktime, {
+        reasonCode: "timeout",
+      });
+      const authorized = await data.coordinator.submitRefundAuthorization({
+        idempotencyKey: "delivery-refund-auth",
+        escrowReference: funded.escrow.escrowReference,
+        expectedVersion: funded.escrow.version,
+        context: data.context,
+        history: data.history,
+        basis: "timeout",
+      });
+      const refunded = await data.coordinator.refundEscrow({
+        idempotencyKey: "delivery-refund-run",
+        escrowReference: funded.escrow.escrowReference,
+        expectedVersion: authorized.escrow.version,
+        context: data.context,
+        history: data.history,
+      });
+      store.close();
+
+      store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      const privateDelivery = new FakePrivateDelivery();
+      const restarted = createPactCashuEscrowSettlementCoordinator({
+        mintUrl: MINT_URL,
+        cashu: data.cashu,
+        privateDelivery,
+        store,
+        escrowAuthoritySigner: data.escrowAuthoritySigner,
+        normalSpendKey: data.normalSpendKey,
+        refundSpendKey: data.refundSpendKey,
+        relay: data.relay,
+        clock: data.clock,
+      });
+      const requesterDestination = createPrivateCashuBeneficiaryDestination({
+        beneficiary: data.requester.publicKey,
+        async deliver() {},
+      });
+      const request = {
+        idempotencyKey: "deliver-refund-001",
+        escrowReference: refunded.escrow.escrowReference,
+        expectedVersion: refunded.escrow.version,
+        requesterDestination,
+      };
+      const delivered = await restarted.deliverRequesterRefund(request);
+      await expect(restarted.deliverRequesterRefund(request)).resolves.toEqual(delivered);
+      expect(privateDelivery.calls).toHaveLength(3);
+      expect(privateDelivery.calls.every((call) => call.expectedBeneficiary === data.requester.publicKey)).toBe(true);
+      expect(privateDelivery.calls[0].handle.reference).not.toBe(
+        privateDelivery.calls[1].handle.reference,
+      );
+      expect(new Set(privateDelivery.calls.map((call) => call.handle.reference)).size).toBe(3);
+      expect(JSON.stringify(delivered)).not.toContain("cashu_private_");
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("uses the normal path for a requester-authorized rejected-result refund", async () => {
     const data = setup();
@@ -840,9 +1032,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        settlementHandle: {
+          reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
+        privateDelivery: data.privateDelivery,
         store,
         escrowAuthoritySigner: data.escrowAuthoritySigner,
         normalSpendKey: data.normalSpendKey,
@@ -886,9 +1084,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${prepared.escrow.escrowReference}`)).resolves.toMatchObject({
+        fundingChangeHandle: {
+          reference: "cashu_private_33333333-3333-4333-8333-333333333333",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
+        privateDelivery: data.privateDelivery,
         store,
         escrowAuthoritySigner: data.escrowAuthoritySigner,
         normalSpendKey: data.normalSpendKey,
@@ -942,9 +1146,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        refundHandle: {
+          reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
+        privateDelivery: data.privateDelivery,
         store,
         escrowAuthoritySigner: data.escrowAuthoritySigner,
         normalSpendKey: data.normalSpendKey,
@@ -1020,6 +1230,7 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
+        privateDelivery: data.privateDelivery,
         store: data.store,
         escrowAuthoritySigner: createLocalNostrSigner(hex(data.authorityKey)),
         normalSpendKey: data.normalSpendKey,
@@ -1032,6 +1243,7 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
+        privateDelivery: data.privateDelivery,
         store: data.store,
         escrowAuthoritySigner: data.escrowAuthoritySigner,
         normalSpendKey: new PrivateCashuSpendingKey(CURVE_POINT),

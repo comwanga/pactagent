@@ -39,16 +39,16 @@ export default function Home() {
         <div className="sectionHeading">
           <div>
             <p className="eyebrow dark">Application status</p>
-            <h2 id="status-heading">Implemented foundation. Offline demo.</h2>
+            <h2 id="status-heading">Components implemented. Runtime composition pending.</h2>
           </div>
-          <p>The repository includes relay and isolated-signer integrations. This page renders deterministic fixtures without connecting to a relay, mint, AI model, signer, or funds.</p>
+          <p>The relay, isolated signer, private Cashu adapter, and settlement coordinator are network-capable components. This page remains a deterministic presentation and does not start a transaction or connect to a relay, mint, model, signer, or funds.</p>
         </div>
 
         <dl className="statusGrid">
-          <div><dt>Application</dt><dd><span className="dot active" />{status.application}</dd></div>
-          <div><dt>Nostr</dt><dd><span className="dot modeled" />Adapters ready</dd></div>
-          <div><dt>Cashu</dt><dd><span className="dot modeled" />Descriptor only</dd></div>
-          <div><dt>AI execution</dt><dd><span className="dot neutral" />Not implemented</dd></div>
+          <div><dt>Application</dt><dd><span className="dot active" aria-hidden="true" />{status.application}</dd></div>
+          <div><dt>Nostr</dt><dd><span className="dot modeled" aria-hidden="true" />Network-capable adapters</dd></div>
+          <div><dt>Cashu</dt><dd><span className="dot modeled" aria-hidden="true" />Test-mint boundary ready</dd></div>
+          <div><dt>Requester AI</dt><dd><span className="dot neutral" aria-hidden="true" />Boundary only; no hosted model</dd></div>
         </dl>
       </section>
 
