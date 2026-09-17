@@ -39,8 +39,17 @@ blindly.
 
 Successful mutations return an opaque private handle and safe settlement facts:
 configured mint, `sat` amount, input/output/change amounts, mint input fee, and
-the fee reserved while constructing a locked value. All accounting remains
-`bigint`/`Sats`; unsafe, negative, or inconsistent amounts fail closed.
+the fee reserved while constructing a locked value. When a swap returns payer
+change, it is retained under a separate optional `changeHandle`; bearer material
+is never embedded in either result. All accounting remains `bigint`/`Sats`;
+unsafe, negative, or inconsistent amounts fail closed.
+
+`maximumExposureSats` is enforced both per request and across all unreleased
+locked values recorded for the configured mint. A reservation is made before a
+swap can be submitted. Ambiguous submissions keep that reservation until
+reconciliation, and a confirmed spend releases it. Two adapter processes using
+the same durable private store share the same exposure ledger and cannot each
+consume the full limit independently.
 
 NUT-11 lock and refund public keys must be compressed, on-curve secp256k1 keys.
 Refund keys require a locktime. Spending keys are created with the explicit
@@ -64,9 +73,19 @@ returns or reconciles the stored operation; using it for different parameters
 is rejected. When proof-state inspection and restoration cannot prove the
 outcome, the adapter returns `reconciliation_required` for Issue #13 to handle.
 
-The included in-memory store is for deterministic tests only. Issue #13 must
-provide a durable private implementation for interruption-safe orchestration;
-that storage/orchestration is deliberately outside Issue #12.
+The included in-memory store is for deterministic tests only.
+`createSqliteCashuPrivateStore(...)` is the durable process-safe implementation
+for prepared swaps, proof custody, restored outputs, change handles, and the
+aggregate exposure ledger. It uses a private SQLite file with WAL, synchronous
+writes, process leases, and owner-only file permissions. The database still
+contains bearer material and must be placed in access-controlled private
+application storage; it must never be served, logged, backed up to a public
+location, or reused as public settlement state.
+
+Funding enters through the existing private `createPrivateCashuFunding(...)`
+boundary. It intentionally accepts already acquired proof material and refuses
+serialization. The adapter does not buy ecash, pay mint quotes, or become a
+wallet. Acquisition of test ecash remains an explicit external runtime concern.
 
 ## Tests
 

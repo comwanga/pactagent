@@ -52,8 +52,16 @@ pending signed publication events across process restarts. Its database path
 must point to private application storage. The in-memory implementation remains
 deterministic test support and is not durable storage. The store retains the #12 opaque Cashu handle, operation
 fingerprints, confirmation facts, and any signed transition awaiting relay
-publication. It must be deployed as private encrypted application storage and
+publication. It must be deployed as private access-controlled application storage and
 must never be exposed through a public serializer.
+
+The #12 private store is a separate custody boundary. Its SQLite implementation
+persists proofs, prepared restoration context, payer change, and aggregate mint
+exposure across process restarts. The coordinator record durably retains the
+opaque funding-change handle and the confirmed release/refund output handle;
+none is added to `PactCashuEscrowStatus` or a public lifecycle event. A later
+runtime may route those handles through a private participant channel, but this
+coordinator does not invent payout authentication or expose bearer material.
 
 Every mutation has an 8–64 character application idempotency key. The stored
 SHA-256 fingerprint binds the escrow and agreement references, operation type,
@@ -93,8 +101,9 @@ accounting: input equals output plus change plus mint fee, the locked output is
 the 350-sat amount plus the reported reserved spend fee, and release/refund nets
 exactly 350 sats. Before funding, proofs are held by the private funding source;
 while funded they remain behind the #12 opaque handle; after release/refund the
-new private handle remains in #12 storage. No bearer material becomes lifecycle
-evidence.
+new private handle remains in #12 storage and its opaque reference is retained
+in private coordinator state. Any payer change is stored under its own private
+handle rather than discarded. No bearer material becomes lifecycle evidence.
 
 ## Authorization, recovery, and publication
 

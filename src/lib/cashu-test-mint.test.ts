@@ -4,6 +4,9 @@ import {
   type P2PKOptions,
   type Proof,
 } from "@cashu/cashu-ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { sats } from "../domain/money";
@@ -14,6 +17,7 @@ import {
   createInMemoryCashuPrivateStore,
   createPrivateCashuFunding,
   createPrivateCashuSpendingKey,
+  createSqliteCashuPrivateStore,
   normalizeCashuTestMintConfiguration,
   normalizeCashuPrivateProofState,
   type CashuMintCapabilitySnapshot,
@@ -319,6 +323,11 @@ describe("Cashu test-mint private operations", () => {
       reservedSpendFeeSats: 1n,
     });
     expect(result.handle.reference).toMatch(/^cashu_private_[0-9a-f-]{36}$/);
+    expect(result.changeHandle?.reference).toMatch(/^cashu_private_[0-9a-f-]{36}$/);
+    await expect(adapter.inspectProofState(result.changeHandle!)).resolves.toMatchObject({
+      state: "unspent",
+      proofCount: 1,
+    });
   });
 
   it("spends locked value only with the matching private Cashu key", async () => {
@@ -482,6 +491,134 @@ describe("Cashu test-mint private operations", () => {
 });
 
 describe("Cashu test-mint retry and reconciliation", () => {
+  it("enforces the configured cap across concurrently locked value", async () => {
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore,
+    });
+    const first = await prepare(adapter, "aggregate-0001");
+    const secondKey = spendingKey(REFUND_SECRET);
+
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "aggregate-0002",
+        funding: funding(),
+        amountSats: sats(200n),
+        spendingCondition: { lockPublicKey: secondKey.publicKey },
+      }),
+    ).rejects.toMatchObject({ code: "insufficient_value", operationStatus: "not_submitted" });
+
+    await expect(
+      adapter.spendLockedValue({
+        operationId: "aggregate-spend-01",
+        handle: first.result.handle,
+        spendingKey: first.lockKey,
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "aggregate-0002",
+        funding: funding(),
+        amountSats: sats(200n),
+        spendingCondition: { lockPublicKey: secondKey.publicKey },
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("keeps ambiguous locked value inside the aggregate exposure cap", async () => {
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(
+      new CashuPrivateBackendError("timeout", "submitted_unknown"),
+    );
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore: createInMemoryCashuPrivateStore(),
+    });
+    const firstKey = spendingKey();
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "ambiguous-cap-01",
+        funding: funding(),
+        amountSats: sats(350n),
+        spendingCondition: { lockPublicKey: firstKey.publicKey },
+      }),
+    ).resolves.toMatchObject({ outcome: "reconciliation_required" });
+
+    const secondKey = spendingKey(REFUND_SECRET);
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "ambiguous-cap-02",
+        funding: funding(),
+        amountSats: sats(200n),
+        spendingCondition: { lockPublicKey: secondKey.publicKey },
+      }),
+    ).rejects.toMatchObject({ code: "insufficient_value" });
+    expect(backend.submitCalls).toBe(1);
+  });
+
+  it("enforces aggregate exposure across durable concurrent adapter instances", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-exposure-"));
+    const databasePath = join(directory, "cashu-private.sqlite");
+    const firstStore = createSqliteCashuPrivateStore(databasePath);
+    const secondStore = createSqliteCashuPrivateStore(databasePath);
+    try {
+      const configuration = {
+        testMintUrl: MINT_URL,
+        unit: "sat" as const,
+        maximumExposureSats: sats(500n),
+      };
+      const first = createCashuTestMintAdapterWithBackend({
+        configuration,
+        backend: new FakeCashuBackend(),
+        privateStore: firstStore,
+      });
+      const second = createCashuTestMintAdapterWithBackend({
+        configuration,
+        backend: new FakeCashuBackend(),
+        privateStore: secondStore,
+      });
+      const lock = spendingKey();
+      const refund = spendingKey(REFUND_SECRET);
+      const attempts = await Promise.allSettled([
+        first.prepareLockedValue({
+          operationId: "durable-cap-0001",
+          funding: funding(),
+          amountSats: sats(350n),
+          spendingCondition: { lockPublicKey: lock.publicKey },
+        }),
+        second.prepareLockedValue({
+          operationId: "durable-cap-0002",
+          funding: funding(),
+          amountSats: sats(200n),
+          spendingCondition: { lockPublicKey: refund.publicKey },
+        }),
+      ]);
+      expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+      const rejected = attempts.find((attempt) => attempt.status === "rejected");
+      expect(rejected).toMatchObject({
+        status: "rejected",
+        reason: { code: "insufficient_value", operationStatus: "not_submitted" },
+      });
+    } finally {
+      firstStore.close();
+      secondStore.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("retries safely when preparation timed out before submission", async () => {
     const backend = new FakeCashuBackend();
     backend.prepareFailures.push(new CashuPrivateBackendError("timeout", "not_submitted"));
@@ -601,6 +738,74 @@ describe("Cashu test-mint retry and reconciliation", () => {
     expect(secondBackend.inspectCalls).toBe(1);
     expect(secondBackend.restoreCalls).toBe(1);
   });
+
+  it("reconciles and retains payout/change handles after a durable-store restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-private-"));
+    const databasePath = join(directory, "cashu-private.sqlite");
+    try {
+      const configuration = {
+        testMintUrl: MINT_URL,
+        unit: "sat" as const,
+        maximumExposureSats: sats(1_000n),
+      };
+      const firstStore = createSqliteCashuPrivateStore(databasePath);
+      const firstBackend = new FakeCashuBackend();
+      firstBackend.submitFailures.push(
+        new CashuPrivateBackendError("timeout", "submitted_unknown"),
+      );
+      const firstAdapter = createCashuTestMintAdapterWithBackend({
+        configuration,
+        backend: firstBackend,
+        privateStore: firstStore,
+      });
+      const lockKey = spendingKey();
+      const request = {
+        operationId: "durable-reconcile-01",
+        funding: funding(),
+        amountSats: sats(350n),
+        spendingCondition: { lockPublicKey: lockKey.publicKey },
+      };
+      await expect(firstAdapter.prepareLockedValue(request)).resolves.toMatchObject({
+        outcome: "reconciliation_required",
+      });
+      firstStore.close();
+
+      const secondStore = createSqliteCashuPrivateStore(databasePath);
+      const secondBackend = new FakeCashuBackend();
+      secondBackend.states = [{ state: "spent" }];
+      secondBackend.restoreSucceeds = true;
+      const secondAdapter = createCashuTestMintAdapterWithBackend({
+        configuration,
+        backend: secondBackend,
+        privateStore: secondStore,
+      });
+      const reconciled = await secondAdapter.prepareLockedValue({
+        ...request,
+        funding: funding(),
+      });
+      expect(reconciled).toMatchObject({ status: "succeeded" });
+      if (reconciled.status !== "succeeded") throw new Error("expected reconciled success");
+      expect(reconciled.changeHandle).toBeDefined();
+      secondStore.close();
+
+      const thirdStore = createSqliteCashuPrivateStore(databasePath);
+      const thirdBackend = new FakeCashuBackend();
+      const thirdAdapter = createCashuTestMintAdapterWithBackend({
+        configuration,
+        backend: thirdBackend,
+        privateStore: thirdStore,
+      });
+      await expect(thirdAdapter.inspectProofState(reconciled.handle)).resolves.toMatchObject({
+        state: "unspent",
+      });
+      await expect(
+        thirdAdapter.inspectProofState(reconciled.changeHandle!),
+      ).resolves.toMatchObject({ state: "unspent" });
+      thirdStore.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it("returns reconciliation_required for malformed post-submit accounting", async () => {
     const backend = new FakeCashuBackend();

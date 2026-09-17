@@ -148,6 +148,7 @@ class FakeCashuPort implements CashuTestMintPort {
       status: "succeeded",
       operationId: input.operationId,
       handle: { reference: "cashu_private_11111111-1111-4111-8111-111111111111" },
+      changeHandle: { reference: "cashu_private_33333333-3333-4333-8333-333333333333" },
       facts: {
         mintUrl: this.mintUrl,
         unit: "sat",
@@ -462,6 +463,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     expect(data.cashu.prepareCalls).toBe(1);
     expect(data.cashu.spendSubmissions).toBe(1);
     expect(reconstructPactAgreementHistory(release.context, data.history)).toMatchObject({ currentState: "settled" });
+    await expect(data.store.read(`escrow:${settled.escrow.escrowReference}`)).resolves.toMatchObject({
+      fundingChangeHandle: {
+        reference: "cashu_private_33333333-3333-4333-8333-333333333333",
+      },
+      settlementHandle: {
+        reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+      },
+    });
+    expect(JSON.stringify(settled)).not.toContain("cashu_private_");
     await expect(
       data.coordinator.refundEscrow({
         idempotencyKey: "refund-after-release",
@@ -500,6 +510,12 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     expect(refunded.escrow.refundReference).toMatch(/^pactrefund_/);
     expect(reconstructPactAgreementHistory(data.context, data.history)).toMatchObject({ currentState: "refunded" });
     expect(data.cashu.spendPublicKeys.at(-1)).toBe(data.refundSpendKey.publicKey);
+    await expect(data.store.read(`escrow:${refunded.escrow.escrowReference}`)).resolves.toMatchObject({
+      refundHandle: {
+        reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+      },
+    });
+    expect(JSON.stringify(refunded)).not.toContain("cashu_private_");
   });
 
   it("uses the normal path for a requester-authorized rejected-result refund", async () => {
@@ -840,6 +856,11 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        settlementHandle: {
+          reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
@@ -886,6 +907,11 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${prepared.escrow.escrowReference}`)).resolves.toMatchObject({
+        fundingChangeHandle: {
+          reference: "cashu_private_33333333-3333-4333-8333-333333333333",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,
@@ -942,6 +968,11 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 
       store.close();
       store = createSqlitePactCashuEscrowSettlementStore(databasePath);
+      await expect(store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        refundHandle: {
+          reference: "cashu_private_22222222-2222-4222-8222-222222222222",
+        },
+      });
       const restarted = createPactCashuEscrowSettlementCoordinator({
         mintUrl: MINT_URL,
         cashu: data.cashu,

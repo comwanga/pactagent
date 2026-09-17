@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   Amount,
@@ -208,6 +211,7 @@ export interface CashuOperationSucceeded {
   readonly status: "succeeded";
   readonly operationId: string;
   readonly handle: CashuPrivateHandle;
+  readonly changeHandle?: CashuPrivateHandle;
   readonly facts: CashuSettlementFacts;
 }
 
@@ -283,10 +287,12 @@ function bytesToHex(value: Uint8Array): string {
   return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function parseProofs(value: readonly ProofLike[]): readonly Proof[] {
+function parseProofs(value: readonly ProofLike[] | readonly string[]): readonly Proof[] {
   let proofs: Proof[];
   try {
-    proofs = deserializeProofs([...value]);
+    proofs = value.every((item) => typeof item === "string")
+      ? deserializeProofs([...value] as string[])
+      : deserializeProofs([...value] as ProofLike[]);
   } catch {
     cashuError("operation_rejected", "Private Cashu proof material is malformed");
   }
@@ -440,16 +446,244 @@ export interface CashuTestMintPort {
 export interface CashuPrivateStore {
   read(scope: string, key: string): Promise<unknown | undefined>;
   write(scope: string, key: string, value: unknown): Promise<void>;
+  withExclusiveLock<T>(scope: string, key: string, operation: () => Promise<T>): Promise<T>;
 }
 
 export function createInMemoryCashuPrivateStore(): CashuPrivateStore {
   const records = new Map<string, unknown>();
+  const tails = new Map<string, Promise<void>>();
   return Object.freeze({
     async read(scope: string, key: string): Promise<unknown | undefined> {
       return records.get(`${scope}:${key}`);
     },
     async write(scope: string, key: string, value: unknown): Promise<void> {
       records.set(`${scope}:${key}`, value);
+    },
+    async withExclusiveLock<T>(
+      scope: string,
+      key: string,
+      operation: () => Promise<T>,
+    ): Promise<T> {
+      const lockKey = `${scope}:${key}`;
+      const prior = tails.get(lockKey) ?? Promise.resolve();
+      let release!: () => void;
+      const gate = new Promise<void>((resolveGate) => {
+        release = resolveGate;
+      });
+      const tail = prior.then(() => gate);
+      tails.set(lockKey, tail);
+      await prior;
+      try {
+        return await operation();
+      } finally {
+        release();
+        if (tails.get(lockKey) === tail) tails.delete(lockKey);
+      }
+    },
+    toJSON(): never {
+      cashuError(
+        "privacy_boundary_violation",
+        "Private Cashu store cannot be serialized",
+      );
+    },
+  });
+}
+
+export interface SqliteCashuPrivateStore extends CashuPrivateStore {
+  close(): void;
+}
+
+const PRIVATE_STORE_LOCK_LEASE_MILLISECONDS = 30_000;
+const PRIVATE_STORE_LOCK_HEARTBEAT_MILLISECONDS = 5_000;
+const PRIVATE_STORE_LOCK_RETRY_MILLISECONDS = 20;
+const PRIVATE_STORE_LOCK_WAIT_MILLISECONDS = 60_000;
+
+function privateStoreFailure(): never {
+  cashuError("operation_rejected", "Private Cashu storage is unavailable");
+}
+
+function privateStoreIdentifier(value: string): string {
+  if (!/^[A-Za-z0-9:/._-]{1,512}$/.test(value)) privateStoreFailure();
+  return value;
+}
+
+function serializePrivateStoreValue(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return privateStoreFailure();
+  }
+}
+
+function parsePrivateStoreValue(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return privateStoreFailure();
+  }
+}
+
+function waitForPrivateStore(milliseconds: number): Promise<void> {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+/**
+ * Durable process-safe storage for private Cashu material. The database file is
+ * private application state and must never be served, logged, or copied into a
+ * public event.
+ */
+export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashuPrivateStore {
+  if (typeof databasePath !== "string" || databasePath.length < 1 || databasePath === ":memory:") {
+    cashuError("invalid_mint_configuration", "Durable private Cashu database path is invalid");
+  }
+  const resolvedPath = resolve(databasePath);
+  let database: DatabaseSync;
+  try {
+    mkdirSync(dirname(resolvedPath), { recursive: true });
+    database = new DatabaseSync(resolvedPath);
+    database.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = FULL;
+      PRAGMA busy_timeout = 1000;
+      CREATE TABLE IF NOT EXISTS pact_cashu_private_values (
+        scope TEXT NOT NULL,
+        store_key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        PRIMARY KEY (scope, store_key)
+      );
+      CREATE TABLE IF NOT EXISTS pact_cashu_private_locks (
+        lock_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        expires_at_ms INTEGER NOT NULL
+      );
+    `);
+    chmodSync(resolvedPath, 0o600);
+  } catch {
+    return privateStoreFailure();
+  }
+
+  const readStatement = database.prepare(
+    "SELECT value_json FROM pact_cashu_private_values WHERE scope = ? AND store_key = ?",
+  );
+  const writeStatement = database.prepare(`
+    INSERT INTO pact_cashu_private_values (scope, store_key, value_json)
+    VALUES (?, ?, ?)
+    ON CONFLICT(scope, store_key) DO UPDATE SET value_json = excluded.value_json
+  `);
+  const acquireStatement = database.prepare(`
+    INSERT INTO pact_cashu_private_locks (lock_key, owner, expires_at_ms)
+    VALUES (?, ?, ?)
+    ON CONFLICT(lock_key) DO UPDATE SET
+      owner = excluded.owner,
+      expires_at_ms = excluded.expires_at_ms
+    WHERE pact_cashu_private_locks.expires_at_ms <= ?
+  `);
+  const heartbeatStatement = database.prepare(
+    "UPDATE pact_cashu_private_locks SET expires_at_ms = ? WHERE lock_key = ? AND owner = ?",
+  );
+  const releaseStatement = database.prepare(
+    "DELETE FROM pact_cashu_private_locks WHERE lock_key = ? AND owner = ?",
+  );
+  let closed = false;
+
+  function ensureOpen(): void {
+    if (closed) privateStoreFailure();
+  }
+
+  async function acquire(lockKey: string): Promise<() => void> {
+    const owner = randomUUID();
+    const deadline = Date.now() + PRIVATE_STORE_LOCK_WAIT_MILLISECONDS;
+    while (Date.now() <= deadline) {
+      ensureOpen();
+      const now = Date.now();
+      try {
+        const result = acquireStatement.run(
+          lockKey,
+          owner,
+          now + PRIVATE_STORE_LOCK_LEASE_MILLISECONDS,
+          now,
+        );
+        if (result.changes === 1) {
+          const heartbeat = setInterval(() => {
+            try {
+              heartbeatStatement.run(
+                Date.now() + PRIVATE_STORE_LOCK_LEASE_MILLISECONDS,
+                lockKey,
+                owner,
+              );
+            } catch {
+              // The following private-store operation still fails closed.
+            }
+          }, PRIVATE_STORE_LOCK_HEARTBEAT_MILLISECONDS);
+          heartbeat.unref();
+          return () => {
+            clearInterval(heartbeat);
+            try {
+              releaseStatement.run(lockKey, owner);
+            } catch {
+              // The bounded lease releases an abandoned lock.
+            }
+          };
+        }
+      } catch {
+        return privateStoreFailure();
+      }
+      await waitForPrivateStore(PRIVATE_STORE_LOCK_RETRY_MILLISECONDS);
+    }
+    return privateStoreFailure();
+  }
+
+  return Object.freeze({
+    async read(scope: string, key: string): Promise<unknown | undefined> {
+      ensureOpen();
+      try {
+        const row = readStatement.get(
+          privateStoreIdentifier(scope),
+          privateStoreIdentifier(key),
+        ) as { value_json: string } | undefined;
+        return row === undefined ? undefined : parsePrivateStoreValue(row.value_json);
+      } catch (error) {
+        if (error instanceof CashuTestMintError) throw error;
+        return privateStoreFailure();
+      }
+    },
+    async write(scope: string, key: string, value: unknown): Promise<void> {
+      ensureOpen();
+      const serialized = serializePrivateStoreValue(value);
+      try {
+        writeStatement.run(
+          privateStoreIdentifier(scope),
+          privateStoreIdentifier(key),
+          serialized,
+        );
+      } catch (error) {
+        if (error instanceof CashuTestMintError) throw error;
+        return privateStoreFailure();
+      }
+    },
+    async withExclusiveLock<T>(
+      scope: string,
+      key: string,
+      operation: () => Promise<T>,
+    ): Promise<T> {
+      ensureOpen();
+      const release = await acquire(
+        privateStoreIdentifier(`${scope}:${key}`),
+      );
+      try {
+        return await operation();
+      } finally {
+        release();
+      }
+    },
+    close(): void {
+      if (closed) return;
+      closed = true;
+      try {
+        database.close();
+      } catch {
+        return privateStoreFailure();
+      }
     },
     toJSON(): never {
       cashuError(
@@ -543,6 +777,7 @@ interface PrivateValueRecord {
   readonly proofs: readonly Proof[];
   readonly amountSats: bigint;
   readonly allowedPublicKeys: readonly string[];
+  readonly exposureOperationId?: string;
 }
 
 interface StoredOperation {
@@ -553,14 +788,254 @@ interface StoredOperation {
   readonly result?: CashuOperationSucceeded;
   readonly errorCode?: CashuTestMintErrorCode;
   readonly allowedPublicKeys: readonly string[];
+  readonly spentExposureOperationId?: string;
 }
 
-function isStoredOperation(value: unknown): value is StoredOperation {
-  return typeof value === "object" && value !== null && "fingerprint" in value && "status" in value;
+interface StoredExposureLedger {
+  readonly version: 1;
+  readonly reservations: Readonly<
+    Record<
+      string,
+      Readonly<{
+        amountSats: string;
+        status: "reserved" | "locked" | "released";
+      }>
+    >
+  >;
 }
 
-function isPrivateValueRecord(value: unknown): value is PrivateValueRecord {
-  return typeof value === "object" && value !== null && "proofs" in value && "amountSats" in value;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parsePrivateValueRecord(value: unknown): PrivateValueRecord {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    !Array.isArray(value.proofs) ||
+    typeof value.amountSats !== "string" ||
+    !Array.isArray(value.allowedPublicKeys) ||
+    !value.allowedPublicKeys.every((item) => typeof item === "string") ||
+    (value.exposureOperationId !== undefined &&
+      typeof value.exposureOperationId !== "string")
+  ) {
+    cashuError("operation_rejected", "Private Cashu value storage is malformed");
+  }
+  const proofs = parseProofs(value.proofs as string[]);
+  const amountSats = amountToBigInt(value.amountSats);
+  if (amountSats < 1n || sumProofAmounts(proofs) < amountSats) {
+    cashuError("operation_rejected", "Private Cashu value storage is malformed");
+  }
+  return Object.freeze({
+    proofs,
+    amountSats,
+    allowedPublicKeys: Object.freeze([...(value.allowedPublicKeys as string[])]),
+    ...(value.exposureOperationId === undefined
+      ? {}
+      : { exposureOperationId: validateOperationId(value.exposureOperationId as string) }),
+  });
+}
+
+function serializePrivateValueRecord(value: PrivateValueRecord): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    version: 1,
+    proofs: serializeProofs([...value.proofs]),
+    amountSats: value.amountSats.toString(),
+    allowedPublicKeys: [...value.allowedPublicKeys],
+    ...(value.exposureOperationId === undefined
+      ? {}
+      : { exposureOperationId: value.exposureOperationId }),
+  });
+}
+
+function parsePreparedSwap(value: unknown): CashuPrivatePreparedSwap | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    (value.kind !== "lock" && value.kind !== "spend") ||
+    !Array.isArray(value.inputProofs) ||
+    typeof value.requestedAmountSats !== "string" ||
+    !("opaque" in value)
+  ) {
+    cashuError("operation_rejected", "Private Cashu operation storage is malformed");
+  }
+  return Object.freeze({
+    kind: value.kind,
+    inputProofs: parseProofs(value.inputProofs as string[]),
+    requestedAmountSats: amountToBigInt(value.requestedAmountSats),
+    opaque: value.opaque,
+  });
+}
+
+function serializePreparedSwap(
+  value: CashuPrivatePreparedSwap | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  if (value === undefined) return undefined;
+  return Object.freeze({
+    kind: value.kind,
+    inputProofs: serializeProofs([...value.inputProofs]),
+    requestedAmountSats: value.requestedAmountSats.toString(),
+    opaque: value.opaque,
+  });
+}
+
+function parseSucceededOperation(value: unknown): CashuOperationSucceeded | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    value.status !== "succeeded" ||
+    typeof value.operationId !== "string" ||
+    !isRecord(value.handle) ||
+    typeof value.handle.reference !== "string" ||
+    (value.changeHandle !== undefined &&
+      (!isRecord(value.changeHandle) || typeof value.changeHandle.reference !== "string")) ||
+    !isRecord(value.facts) ||
+    typeof value.facts.mintUrl !== "string" ||
+    value.facts.unit !== "sat"
+  ) {
+    cashuError("operation_rejected", "Private Cashu operation storage is malformed");
+  }
+  const facts = value.facts;
+  const amountFields = [
+    "amountSats",
+    "inputAmountSats",
+    "outputAmountSats",
+    "changeAmountSats",
+    "mintFeeSats",
+    "reservedSpendFeeSats",
+  ] as const;
+  if (amountFields.some((field) => typeof facts[field] !== "string")) {
+    cashuError("operation_rejected", "Private Cashu operation storage is malformed");
+  }
+  return Object.freeze({
+    status: "succeeded",
+    operationId: validateOperationId(value.operationId),
+    handle: safeHandle(value.handle.reference),
+    ...(value.changeHandle === undefined
+      ? {}
+      : { changeHandle: safeHandle((value.changeHandle as Record<string, string>).reference) }),
+    facts: Object.freeze({
+      mintUrl: normalizeCashuTestMintUrl(facts.mintUrl as string),
+      unit: CASHU_TEST_MINT_UNIT,
+      amountSats: safeSats(amountToBigInt(facts.amountSats as string)),
+      inputAmountSats: safeSats(amountToBigInt(facts.inputAmountSats as string)),
+      outputAmountSats: safeSats(amountToBigInt(facts.outputAmountSats as string)),
+      changeAmountSats: safeSats(amountToBigInt(facts.changeAmountSats as string)),
+      mintFeeSats: safeSats(amountToBigInt(facts.mintFeeSats as string)),
+      reservedSpendFeeSats: safeSats(
+        amountToBigInt(facts.reservedSpendFeeSats as string),
+      ),
+    }),
+  });
+}
+
+function serializeSucceededOperation(
+  value: CashuOperationSucceeded | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  if (value === undefined) return undefined;
+  return Object.freeze({
+    status: value.status,
+    operationId: value.operationId,
+    handle: value.handle,
+    ...(value.changeHandle === undefined ? {} : { changeHandle: value.changeHandle }),
+    facts: Object.freeze({
+      mintUrl: value.facts.mintUrl,
+      unit: value.facts.unit,
+      amountSats: value.facts.amountSats.toString(),
+      inputAmountSats: value.facts.inputAmountSats.toString(),
+      outputAmountSats: value.facts.outputAmountSats.toString(),
+      changeAmountSats: value.facts.changeAmountSats.toString(),
+      mintFeeSats: value.facts.mintFeeSats.toString(),
+      reservedSpendFeeSats: value.facts.reservedSpendFeeSats.toString(),
+    }),
+  });
+}
+
+function parseStoredOperation(value: unknown): StoredOperation {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    typeof value.fingerprint !== "string" ||
+    (value.kind !== "lock" && value.kind !== "spend") ||
+    !["not_submitted", "submitted_unknown", "succeeded", "failed_definitively"].includes(
+      value.status as string,
+    ) ||
+    !Array.isArray(value.allowedPublicKeys) ||
+    !value.allowedPublicKeys.every((item) => typeof item === "string") ||
+    (value.errorCode !== undefined && typeof value.errorCode !== "string") ||
+    (value.spentExposureOperationId !== undefined &&
+      typeof value.spentExposureOperationId !== "string")
+  ) {
+    cashuError("operation_rejected", "Private Cashu operation storage is malformed");
+  }
+  return Object.freeze({
+    fingerprint: value.fingerprint,
+    kind: value.kind,
+    status: value.status as CashuOperationStatus,
+    ...(value.prepared === undefined ? {} : { prepared: parsePreparedSwap(value.prepared) }),
+    ...(value.result === undefined ? {} : { result: parseSucceededOperation(value.result) }),
+    ...(value.errorCode === undefined
+      ? {}
+      : { errorCode: value.errorCode as CashuTestMintErrorCode }),
+    allowedPublicKeys: Object.freeze([...(value.allowedPublicKeys as string[])]),
+    ...(value.spentExposureOperationId === undefined
+      ? {}
+      : {
+          spentExposureOperationId: validateOperationId(
+            value.spentExposureOperationId as string,
+          ),
+        }),
+  });
+}
+
+function serializeStoredOperation(value: StoredOperation): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    version: 1,
+    fingerprint: value.fingerprint,
+    kind: value.kind,
+    status: value.status,
+    ...(value.prepared === undefined
+      ? {}
+      : { prepared: serializePreparedSwap(value.prepared) }),
+    ...(value.result === undefined
+      ? {}
+      : { result: serializeSucceededOperation(value.result) }),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    allowedPublicKeys: [...value.allowedPublicKeys],
+    ...(value.spentExposureOperationId === undefined
+      ? {}
+      : { spentExposureOperationId: value.spentExposureOperationId }),
+  });
+}
+
+function parseExposureLedger(value: unknown): StoredExposureLedger {
+  if (value === undefined) return Object.freeze({ version: 1, reservations: Object.freeze({}) });
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.reservations)) {
+    cashuError("operation_rejected", "Private Cashu exposure storage is malformed");
+  }
+  const reservations: Record<
+    string,
+    Readonly<{ amountSats: string; status: "reserved" | "locked" | "released" }>
+  > = {};
+  for (const [operationId, reservation] of Object.entries(value.reservations)) {
+    if (
+      !isRecord(reservation) ||
+      typeof reservation.amountSats !== "string" ||
+      !["reserved", "locked", "released"].includes(reservation.status as string)
+    ) {
+      cashuError("operation_rejected", "Private Cashu exposure storage is malformed");
+    }
+    validateOperationId(operationId);
+    const amount = amountToBigInt(reservation.amountSats);
+    if (amount < 1n) {
+      cashuError("operation_rejected", "Private Cashu exposure storage is malformed");
+    }
+    reservations[operationId] = Object.freeze({
+      amountSats: amount.toString(),
+      status: reservation.status as "reserved" | "locked" | "released",
+    });
+  }
+  return Object.freeze({ version: 1, reservations: Object.freeze(reservations) });
 }
 
 function amountToBigInt(value: { toString(): string } | bigint | number | string): bigint {
@@ -593,6 +1068,9 @@ function validateOperationId(value: string): string {
 }
 
 function safeHandle(reference: string): CashuPrivateHandle {
+  if (!/^cashu_private_[0-9a-f-]{36}$/.test(reference)) {
+    cashuError("operation_rejected", "Private Cashu handle is invalid");
+  }
   return Object.freeze({ reference });
 }
 
@@ -742,10 +1220,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       cashuError("operation_rejected", "Private Cashu operation storage is unavailable");
     }
     if (value === undefined) return undefined;
-    if (!isStoredOperation(value)) {
-      cashuError("operation_rejected", "Private Cashu operation storage is malformed");
-    }
-    return value;
+    return parseStoredOperation(value);
   }
 
   private async writeOperation(operationId: string, value: StoredOperation): Promise<void> {
@@ -753,7 +1228,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       await this.store.write(
         this.configuration.testMintUrl,
         `operation:${operationId}`,
-        Object.freeze(value),
+        serializeStoredOperation(value),
       );
     } catch {
       cashuError("operation_rejected", "Private Cashu operation storage is unavailable");
@@ -770,10 +1245,10 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     } catch {
       cashuError("operation_rejected", "Private Cashu value storage is unavailable");
     }
-    if (!isPrivateValueRecord(value)) {
+    if (value === undefined) {
       cashuError("operation_rejected", "Private Cashu handle was not found");
     }
-    return value;
+    return parsePrivateValueRecord(value);
   }
 
   private async writeValue(reference: string, value: PrivateValueRecord): Promise<void> {
@@ -781,11 +1256,76 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       await this.store.write(
         this.configuration.testMintUrl,
         `value:${reference}`,
-        Object.freeze(value),
+        serializePrivateValueRecord(value),
       );
     } catch {
       cashuError("operation_rejected", "Private Cashu value storage is unavailable");
     }
+  }
+
+  private async updateExposure(
+    operationId: string,
+    amountSats: bigint,
+    nextStatus: "reserved" | "locked" | "released",
+  ): Promise<void> {
+    await this.store.withExclusiveLock(
+      this.configuration.testMintUrl,
+      "exposure-ledger",
+      async () => {
+        let stored: unknown;
+        try {
+          stored = await this.store.read(this.configuration.testMintUrl, "exposure-ledger");
+        } catch {
+          cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
+        }
+        const ledger = parseExposureLedger(stored);
+        const existing = ledger.reservations[operationId];
+        if (existing && amountToBigInt(existing.amountSats) !== amountSats) {
+          cashuError("operation_rejected", "Cashu exposure operation was reused");
+        }
+        if (
+          nextStatus === "reserved" &&
+          existing?.status !== "reserved" &&
+          existing?.status !== "locked"
+        ) {
+          const activeExposure = Object.values(ledger.reservations).reduce(
+            (total, reservation) =>
+              reservation.status === "released"
+                ? total
+                : total + amountToBigInt(reservation.amountSats),
+            0n,
+          );
+          if (activeExposure + amountSats > this.configuration.maximumExposureSats) {
+            cashuError(
+              "insufficient_value",
+              "Requested Cashu value exceeds the configured aggregate exposure cap",
+              "not_submitted",
+              operationId,
+            );
+          }
+        }
+        const nextReservations = { ...ledger.reservations };
+        if (nextStatus === "released") {
+          delete nextReservations[operationId];
+        } else {
+          nextReservations[operationId] = Object.freeze({
+            amountSats: amountSats.toString(),
+            status: nextStatus,
+          });
+        }
+        const reservations = Object.freeze(nextReservations);
+        try {
+          await this.store.write(
+            this.configuration.testMintUrl,
+            "exposure-ledger",
+            Object.freeze({ version: 1, reservations }),
+          );
+        } catch (error) {
+          if (error instanceof CashuTestMintError) throw error;
+          cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
+        }
+      },
+    );
   }
 
   private runIdempotent(
@@ -805,7 +1345,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       }
       return active.promise;
     }
-    const promise = operation().finally(() => this.inFlight.delete(operationId));
+    const promise = this.store
+      .withExclusiveLock(
+        this.configuration.testMintUrl,
+        `operation:${operationId}`,
+        operation,
+      )
+      .finally(() => this.inFlight.delete(operationId));
     this.inFlight.set(operationId, { fingerprint, promise });
     return promise;
   }
@@ -885,6 +1431,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         });
         throw error;
       }
+      await this.updateExposure(operationId, input.amountSats, "reserved");
       let prepared: CashuPrivatePreparedSwap;
       try {
         prepared = await this.backend.prepareLock({
@@ -893,6 +1440,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           options: condition.options,
         });
       } catch (error) {
+        await this.updateExposure(operationId, input.amountSats, "released");
         const normalized =
           error instanceof CashuPrivateBackendError
             ? mapBackendError(error, operationId)
@@ -911,13 +1459,18 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         });
         throw normalized;
       }
-      await this.writeOperation(operationId, {
-        fingerprint,
-        kind: "lock",
-        status: "not_submitted",
-        prepared,
-        allowedPublicKeys: condition.allowedPublicKeys,
-      });
+      try {
+        await this.writeOperation(operationId, {
+          fingerprint,
+          kind: "lock",
+          status: "not_submitted",
+          prepared,
+          allowedPublicKeys: condition.allowedPublicKeys,
+        });
+      } catch (error) {
+        await this.updateExposure(operationId, input.amountSats, "released");
+        throw error;
+      }
       return this.submitPrepared(
         operationId,
         fingerprint,
@@ -990,6 +1543,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           status: "not_submitted",
           errorCode: normalized.code,
           allowedPublicKeys: [],
+          spentExposureOperationId: value.exposureOperationId,
         });
         throw normalized;
       }
@@ -999,8 +1553,16 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         status: "not_submitted",
         prepared,
         allowedPublicKeys: [],
+        spentExposureOperationId: value.exposureOperationId,
       });
-      return this.submitPrepared(operationId, fingerprint, "spend", prepared, []);
+      return this.submitPrepared(
+        operationId,
+        fingerprint,
+        "spend",
+        prepared,
+        [],
+        value.exposureOperationId,
+      );
     });
   }
 
@@ -1017,7 +1579,20 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         operationId,
       );
     }
-    if (existing.status === "succeeded" && existing.result) return existing.result;
+    if (existing.status === "succeeded" && existing.result) {
+      if (
+        existing.result.facts.mintUrl !== this.configuration.testMintUrl ||
+        existing.result.facts.unit !== CASHU_TEST_MINT_UNIT
+      ) {
+        cashuError(
+          "operation_rejected",
+          "Private Cashu operation storage is malformed",
+          "failed_definitively",
+          operationId,
+        );
+      }
+      return existing.result;
+    }
     if (existing.status === "submitted_unknown" && existing.prepared) {
       return this.reconcilePrepared(operationId, existing);
     }
@@ -1037,6 +1612,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         existing.kind,
         existing.prepared,
         existing.allowedPublicKeys,
+        existing.spentExposureOperationId,
       );
     }
     cashuError(
@@ -1053,6 +1629,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     kind: "lock" | "spend",
     prepared: CashuPrivatePreparedSwap,
     allowedPublicKeys: readonly string[],
+    spentExposureOperationId?: string,
   ): Promise<CashuMutationResult> {
     try {
       const result = await this.backend.submit(prepared);
@@ -1064,6 +1641,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           prepared,
           allowedPublicKeys,
           result,
+          spentExposureOperationId,
         );
       } catch {
         await this.writeOperation(operationId, {
@@ -1072,6 +1650,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           status: "submitted_unknown",
           prepared,
           allowedPublicKeys,
+          spentExposureOperationId,
         });
         return reconciliationRequired(operationId);
       }
@@ -1086,6 +1665,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           status: "submitted_unknown",
           prepared,
           allowedPublicKeys,
+          spentExposureOperationId,
         });
         return reconciliationRequired(operationId);
       }
@@ -1097,7 +1677,15 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         prepared,
         errorCode: normalized.code,
         allowedPublicKeys,
+        spentExposureOperationId,
       });
+      if (kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          prepared.requestedAmountSats,
+          "released",
+        );
+      }
       throw normalized;
     }
   }
@@ -1126,6 +1714,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         prepared,
         operation.allowedPublicKeys,
         restored,
+        operation.spentExposureOperationId,
       );
     } catch {
       return reconciliationRequired(operationId);
@@ -1139,6 +1728,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     prepared: CashuPrivatePreparedSwap,
     allowedPublicKeys: readonly string[],
     result: CashuPrivateSwapResult,
+    spentExposureOperationId?: string,
   ): Promise<CashuOperationSucceeded> {
     const inputAmount = sumProofAmounts(prepared.inputProofs);
     const outputAmount = sumProofAmounts(result.sendProofs);
@@ -1167,11 +1757,32 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       proofs: result.sendProofs,
       amountSats: prepared.requestedAmountSats,
       allowedPublicKeys: kind === "lock" ? allowedPublicKeys : [],
+      ...(kind === "lock" ? { exposureOperationId: operationId } : {}),
     });
+    let changeHandle: CashuPrivateHandle | undefined;
+    if (result.keepProofs.length > 0) {
+      const changeReference = randomPrivateReference("cashu_private");
+      await this.writeValue(changeReference, {
+        proofs: result.keepProofs,
+        amountSats: changeAmount,
+        allowedPublicKeys: [],
+      });
+      changeHandle = safeHandle(changeReference);
+    }
+    if (kind === "lock") {
+      await this.updateExposure(operationId, prepared.requestedAmountSats, "locked");
+    } else if (spentExposureOperationId !== undefined) {
+      await this.updateExposure(
+        spentExposureOperationId,
+        prepared.requestedAmountSats,
+        "released",
+      );
+    }
     const succeeded: CashuOperationSucceeded = Object.freeze({
       status: "succeeded",
       operationId,
       handle: safeHandle(reference),
+      ...(changeHandle === undefined ? {} : { changeHandle }),
       facts: Object.freeze({
         mintUrl: this.configuration.testMintUrl,
         unit: CASHU_TEST_MINT_UNIT,
@@ -1190,6 +1801,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       prepared,
       result: succeeded,
       allowedPublicKeys,
+      spentExposureOperationId,
     });
     return succeeded;
   }

@@ -455,7 +455,12 @@ interface StoredEscrowRecord {
   readonly economicClaim: "none" | "release" | "refund";
   readonly operations: Readonly<Record<string, StoredSettlementOperation>>;
   readonly fundingHandle?: CashuPrivateHandle;
+  readonly fundingChangeHandle?: CashuPrivateHandle;
   readonly fundingFacts?: StoredCashuFacts;
+  readonly settlementHandle?: CashuPrivateHandle;
+  readonly settlementChangeHandle?: CashuPrivateHandle;
+  readonly refundHandle?: CashuPrivateHandle;
+  readonly refundChangeHandle?: CashuPrivateHandle;
   readonly releaseAuthorization?: StoredReleaseAuthorization;
   readonly refundAuthorization?: StoredRefundAuthorization;
   readonly settlementReference?: string;
@@ -1241,6 +1246,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         {
           state: "funding_confirmed",
           fundingHandle: cashuResult.handle,
+          fundingChangeHandle: cashuResult.changeHandle,
           fundingFacts: toStoredFacts(cashuResult.facts),
         },
       );
@@ -1567,8 +1573,17 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         {
           state: confirmedState,
           ...(type === "release"
-            ? { settlementReference: record.settlementReference ?? publicReference("pactsettlement") }
-            : { refundReference: record.refundReference ?? publicReference("pactrefund") }),
+            ? {
+                settlementReference:
+                  record.settlementReference ?? publicReference("pactsettlement"),
+                settlementHandle: cashuResult.handle,
+                settlementChangeHandle: cashuResult.changeHandle,
+              }
+            : {
+                refundReference: record.refundReference ?? publicReference("pactrefund"),
+                refundHandle: cashuResult.handle,
+                refundChangeHandle: cashuResult.changeHandle,
+              }),
         },
       );
       history = this.contextHistory(record, input.context, input.history);
