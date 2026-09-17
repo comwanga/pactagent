@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="430" height="96" viewBox="0 0 430 96" role="img" aria-labelledby="title desc">
+  <title id="title">PactAgent</title>
+  <desc id="desc">PactAgent wordmark with an angular P and verification ribbon.</desc>
+  <rect x="8" y="8" width="80" height="80" rx="13" fill="#c7ff3d"/>
+  <path fill="#101512" fill-rule="evenodd" d="M24 21h30.67C66.45 21 74.67 28.79 74.67 39.67S66.45 58.33 54.67 58.33H40V74.33H24V21Zm16 13.33V45h14c2.93 0 4.67-2.07 4.67-5.33s-1.74-5.34-4.67-5.34H40Z"/>
+  <path fill="#f2f0e8" d="m41.33 47.67 10.67 10.66 20-20V53L52 73 30.67 51.67l10.66-4Z"/>
+  <path fill="#101512" d="m52 58.33 6.67-6.66V65L52 73l-6.67-6.67L52 58.33Z" opacity=".88"/>
+  <text x="113" y="53" fill="#101512" font-family="Arial, Helvetica, sans-serif" font-size="40" letter-spacing="2"><tspan font-weight="900">PACT</tspan><tspan font-weight="500">AGENT</tspan></text>
+  <text x="115" y="73" fill="#697069" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="700" letter-spacing="2.4">AGENTS THAT AGREE BEFORE THEY ACT</text>
+</svg>
