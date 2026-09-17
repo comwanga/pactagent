@@ -11,9 +11,13 @@ The first pivot phase provides a local, deterministic open-protocol foundation:
 - independent public Nostr identities for P001 Requester and P002 Provider;
 - independently signed PIP-00 agent definitions and relay-backed capability discovery;
 - deterministic pricing, budget, duration, network, and escrow compatibility checks;
+- a bounded requester-model interface whose untrusted recommendation is gated
+  by deterministic policy (no hosted model adapter is configured);
 - a PIP-01 `cashu_escrow` descriptor alongside the existing swap-specific PIP-03 timeout plan;
 - a relay-backed PactAgent service-agreement lifecycle for `document-summary@1`;
-- a private, explicitly configured Cashu test-mint adapter with NUT-11 locking and safe recovery;
+- NIP-59 private task/result transport and a deterministic document-summary executor;
+- a private, explicitly configured Cashu test-mint adapter with narrow proof
+  import, NUT-11 locking, safe recovery, and beneficiary delivery;
 - a durable, idempotent Cashu escrow settlement coordinator for the 350-sat PoC;
 - one bounded `document-summary` fixture and a transparent UI walkthrough.
 
@@ -39,11 +43,14 @@ the referenced PIP-00 identities and PIP-01 descriptor, reconstructs history fro
 predecessor event IDs, and refuses unauthorized, stale, forked, or terminal-state
 advancement. It does not synthesize a PIP-02 kind `7300` swap for document-summary.
 
-No AI execution, agreement-level escrow orchestration, or real funds movement
-exists. The Cashu adapter can connect to one explicitly configured test mint,
-but its required tests are deterministic and offline. Cashu tokens, proofs,
-credentials, preimages, payout instructions, and key material remain private and
-are not part of public models.
+Issue #16 end-to-end application composition, a hosted requester-model adapter,
+role-specific runtime hosting, and a live transaction frontend/API remain
+pending. The Cashu adapter is network-capable for one explicitly configured test
+mint and now imports already-acquired proofs and privately delivers confirmed
+outputs, but it does not acquire ecash through Lightning or provide a production
+wallet. Required tests remain deterministic and offline. Cashu tokens, proofs,
+credentials, preimages, payout instructions, and key material remain private
+and are not part of public models.
 
 ## Technology
 

@@ -2,11 +2,11 @@ import type { ProjectStatus } from "../domain/project-status";
 
 export function getProjectStatus(): ProjectStatus {
   return {
-    application: "ready",
+    application: "foundation_ready",
     project: "PactAgent",
-    phase: "open_protocol_foundation",
-    nostr: "modeled_not_connected",
-    cashu: "modeled_not_connected",
-    ai: "not_implemented",
+    phase: "pre_e2e_composition",
+    nostr: "network_capable_not_composed",
+    cashu: "test_mint_capable_not_composed",
+    ai: "bounded_decision_no_hosted_adapter",
   };
 }

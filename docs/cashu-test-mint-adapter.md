@@ -44,6 +44,14 @@ change, it is retained under a separate optional `changeHandle`; bearer material
 is never embedded in either result. All accounting remains `bigint`/`Sats`;
 unsafe, negative, or inconsistent amounts fail closed.
 
+The first funding mode is deliberately narrow. A trusted runtime wraps an
+already-acquired array of Cashu proofs with `createPrivateCashuProofImport(...)`
+and passes it to `CashuPrivateFundingSource.importFunding(...)`. The source
+checks the configured mint, literal `sat` unit, current capabilities, and every
+proof keyset before constructing `PrivateCashuFunding`. It does not decode
+arbitrary token strings, request mint quotes, pay Lightning invoices, or choose
+a mint.
+
 `maximumExposureSats` is enforced both per request and across all unreleased
 locked values recorded for the configured mint. A reservation is made before a
 swap can be submitted. Ambiguous submissions keep that reservation until
@@ -82,10 +90,20 @@ contains bearer material and must be placed in access-controlled private
 application storage; it must never be served, logged, backed up to a public
 location, or reused as public settlement state.
 
-Funding enters through the existing private `createPrivateCashuFunding(...)`
-boundary. It intentionally accepts already acquired proof material and refuses
-serialization. The adapter does not buy ecash, pay mint quotes, or become a
-wallet. Acquisition of test ecash remains an explicit external runtime concern.
+Funding and outputs remain private capabilities. `CashuPrivateValueDeliveryPort`
+accepts only a retained opaque handle, a bound beneficiary identity, a private
+destination capability, and a stable delivery id. It retrieves proofs inside
+the private store boundary and supplies `PrivateCashuFunding` only to the
+authorized destination callback. Delivery records survive restart; the same id
+is idempotent, while reassignment to another id or beneficiary is rejected. A
+destination must durably deduplicate the stable delivery id because a crash
+after its callback succeeds but before the receipt is stored is necessarily an
+ambiguous delivery that must be reconciled. No handle or bearer material enters
+public status or settlement references.
+
+The adapter still does not buy ecash, pay mint quotes, or become a wallet.
+Acquisition of the proofs accepted by the import boundary and durable handling
+after an authorized private delivery remain explicit runtime responsibilities.
 
 ## Tests
 

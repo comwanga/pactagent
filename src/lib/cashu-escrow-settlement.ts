@@ -24,9 +24,11 @@ import {
   type CashuMutationResult,
   type CashuOperationSucceeded,
   type CashuP2PKSpendingCondition,
+  type CashuPrivateValueDeliveryPort,
   type CashuPrivateHandle,
   type CashuSettlementFacts,
   type CashuTestMintPort,
+  type PrivateCashuBeneficiaryDestination,
   type PrivateCashuFunding,
   type PrivateCashuSpendingKey,
 } from "./cashu-test-mint";
@@ -394,7 +396,9 @@ type SettlementOperationType =
   | "authorize_release"
   | "release"
   | "authorize_refund"
-  | "refund";
+  | "refund"
+  | "deliver_provider_payout"
+  | "deliver_requester_refund";
 
 interface StoredSettlementOperation {
   readonly type: SettlementOperationType;
@@ -556,6 +560,13 @@ function operationFingerprint(input: {
 
 function cashuOperationId(record: StoredEscrowRecord, type: "fund" | "release" | "refund", key: string): string {
   return `cashu_${fingerprint({ escrow: record.reference, type, key }).slice(0, 58)}`;
+}
+
+function privateDeliveryId(
+  record: StoredEscrowRecord,
+  type: "provider-payout" | "requester-funding-change" | "requester-settlement-change" | "requester-refund" | "requester-refund-change",
+): string {
+  return `cashu_delivery_${fingerprint({ escrow: record.reference, type }).slice(0, 48)}`;
 }
 
 function publicReference(prefix: "pactescrow" | "pactsettlement" | "pactrefund"): string {
@@ -776,6 +787,26 @@ export interface RefundPactCashuEscrowInput {
   readonly history: readonly SignedNostrEvent[];
 }
 
+export interface DeliverProviderPayoutInput {
+  readonly idempotencyKey: string;
+  readonly escrowReference: string;
+  readonly expectedVersion: number;
+  readonly providerDestination: PrivateCashuBeneficiaryDestination;
+  readonly requesterChangeDestination: PrivateCashuBeneficiaryDestination;
+}
+
+export interface DeliverRequesterRefundInput {
+  readonly idempotencyKey: string;
+  readonly escrowReference: string;
+  readonly expectedVersion: number;
+  readonly requesterDestination: PrivateCashuBeneficiaryDestination;
+}
+
+export interface PactCashuPrivateDeliveryResult {
+  readonly outcome: "delivered" | "reconciliation_required";
+  readonly escrowReference: string;
+}
+
 export interface PactCashuEscrowSettlementCoordinator {
   prepareEscrow(input: PreparePactCashuEscrowInput): Promise<PactCashuSettlementResult>;
   fundEscrow(input: FundPactCashuEscrowInput): Promise<PactCashuSettlementResult>;
@@ -784,11 +815,14 @@ export interface PactCashuEscrowSettlementCoordinator {
   releaseEscrow(input: ReleasePactCashuEscrowInput): Promise<PactCashuSettlementResult>;
   submitRefundAuthorization(input: SubmitRefundAuthorizationInput): Promise<PactCashuSettlementResult>;
   refundEscrow(input: RefundPactCashuEscrowInput): Promise<PactCashuSettlementResult>;
+  deliverProviderPayout(input: DeliverProviderPayoutInput): Promise<PactCashuPrivateDeliveryResult>;
+  deliverRequesterRefund(input: DeliverRequesterRefundInput): Promise<PactCashuPrivateDeliveryResult>;
 }
 
 export interface PactCashuEscrowSettlementCoordinatorDependencies {
   readonly mintUrl: string;
   readonly cashu: CashuTestMintPort;
+  readonly privateDelivery: CashuPrivateValueDeliveryPort;
   readonly store: PactCashuEscrowSettlementStore;
   readonly escrowAuthoritySigner: NostrSigner;
   readonly normalSpendKey: PrivateCashuSpendingKey;
@@ -1408,6 +1442,136 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
 
   async refundEscrow(input: RefundPactCashuEscrowInput): Promise<PactCashuSettlementResult> {
     return this.executeEconomic(input, "refund");
+  }
+
+  async deliverProviderPayout(
+    input: DeliverProviderPayoutInput,
+  ): Promise<PactCashuPrivateDeliveryResult> {
+    return this.deliverPrivateValue(input, "provider");
+  }
+
+  async deliverRequesterRefund(
+    input: DeliverRequesterRefundInput,
+  ): Promise<PactCashuPrivateDeliveryResult> {
+    return this.deliverPrivateValue(input, "requester_refund");
+  }
+
+  private async deliverPrivateValue(
+    input: DeliverProviderPayoutInput | DeliverRequesterRefundInput,
+    direction: "provider" | "requester_refund",
+  ): Promise<PactCashuPrivateDeliveryResult> {
+    const reference = validateEscrowReference(input.escrowReference);
+    const key = validateIdempotencyKey(input.idempotencyKey);
+    return this.dependencies.store.withExclusiveLock(this.escrowKey(reference), async () => {
+      let record = await this.readEscrow(reference);
+      const type: SettlementOperationType =
+        direction === "provider" ? "deliver_provider_payout" : "deliver_requester_refund";
+      const requiredState = direction === "provider" ? "settled" : "refunded";
+      const operationFingerprintValue = operationFingerprint({
+        record,
+        type,
+        expectedVersion: input.expectedVersion,
+        expectedState: requiredState,
+        actor: direction === "provider" ? record.provider : record.requester,
+      });
+      const existing = this.operation(
+        record,
+        key,
+        type,
+        operationFingerprintValue,
+        input.expectedVersion,
+      );
+      if (existing?.status === "succeeded") {
+        return Object.freeze({ outcome: "delivered", escrowReference: reference });
+      }
+      if (record.state !== requiredState) {
+        settlementError("invalid_state", "Escrow output is not ready for private delivery");
+      }
+      const deliveries =
+        direction === "provider"
+          ? [
+              {
+                handle: record.settlementHandle,
+                deliveryId: privateDeliveryId(record, "provider-payout"),
+                beneficiary: record.provider,
+                destination: (input as DeliverProviderPayoutInput).providerDestination,
+              },
+              {
+                handle: record.fundingChangeHandle,
+                deliveryId: privateDeliveryId(record, "requester-funding-change"),
+                beneficiary: record.requester,
+                destination: (input as DeliverProviderPayoutInput).requesterChangeDestination,
+              },
+              {
+                handle: record.settlementChangeHandle,
+                deliveryId: privateDeliveryId(record, "requester-settlement-change"),
+                beneficiary: record.requester,
+                destination: (input as DeliverProviderPayoutInput).requesterChangeDestination,
+              },
+            ]
+          : [
+              {
+                handle: record.refundHandle,
+                deliveryId: privateDeliveryId(record, "requester-refund"),
+                beneficiary: record.requester,
+                destination: (input as DeliverRequesterRefundInput).requesterDestination,
+              },
+              {
+                handle: record.fundingChangeHandle,
+                deliveryId: privateDeliveryId(record, "requester-funding-change"),
+                beneficiary: record.requester,
+                destination: (input as DeliverRequesterRefundInput).requesterDestination,
+              },
+              {
+                handle: record.refundChangeHandle,
+                deliveryId: privateDeliveryId(record, "requester-refund-change"),
+                beneficiary: record.requester,
+                destination: (input as DeliverRequesterRefundInput).requesterDestination,
+              },
+            ];
+      if (!deliveries[0].handle) {
+        settlementError("invalid_state", "Escrow payout is missing from private custody");
+      }
+      if (!existing) {
+        record = await this.setOperation(record, key, {
+          type,
+          fingerprint: operationFingerprintValue,
+          status: "pending",
+        });
+      }
+      try {
+        for (const delivery of deliveries) {
+          if (!delivery.handle) continue;
+          await this.dependencies.privateDelivery.deliver({
+            deliveryId: delivery.deliveryId,
+            handle: delivery.handle,
+            expectedBeneficiary: delivery.beneficiary,
+            destination: delivery.destination,
+          });
+        }
+      } catch (error) {
+        if (
+          error instanceof CashuTestMintError &&
+          (error.code === "reconciliation_required" ||
+            error.operationStatus === "submitted_unknown")
+        ) {
+          await this.setOperation(record, key, {
+            ...record.operations[key],
+            status: "reconciliation_required",
+          });
+          return Object.freeze({
+            outcome: "reconciliation_required",
+            escrowReference: reference,
+          });
+        }
+        settlementError("unauthorized_operation", "Private Cashu output delivery failed");
+      }
+      await this.setOperation(record, key, {
+        ...record.operations[key],
+        status: "succeeded",
+      });
+      return Object.freeze({ outcome: "delivered", escrowReference: reference });
+    });
   }
 
   private async executeEconomic(

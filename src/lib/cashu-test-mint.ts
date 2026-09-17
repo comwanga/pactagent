@@ -30,6 +30,7 @@ import {
 
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import { sats, type Sats } from "../domain/money";
+import { nostrPublicKey, type NostrPublicKey } from "../domain/nostr";
 
 export const CASHU_TEST_MINT_UNIT = "sat";
 export const CASHU_TEST_MINT_REQUIRED_NUTS = [7, 9, 10, 11] as const;
@@ -190,6 +191,7 @@ export interface ValidatedMintCapabilities {
     id: string;
     inputFeePpk: number;
   }>;
+  readonly acceptedKeysetIds: readonly string[];
 }
 
 export interface CashuPrivateHandle {
@@ -272,6 +274,7 @@ interface PrivateFundingMaterial {
 }
 
 const privateFundingMaterial = new WeakMap<PrivateCashuFunding, PrivateFundingMaterial>();
+const privateProofImportMaterial = new WeakMap<PrivateCashuProofImport, PrivateFundingMaterial>();
 const privateSpendingKeys = new WeakMap<PrivateCashuSpendingKey, string>();
 
 /** @internal Confirms that a key was created by the private NUT-11 key factory. */
@@ -336,6 +339,132 @@ export function createPrivateCashuFunding(input: {
     proofs,
   });
   return Object.freeze(funding);
+}
+
+export function createPrivateCashuProofImport(input: {
+  readonly mintUrl: string;
+  readonly unit: "sat";
+  readonly proofs: readonly ProofLike[];
+}): PrivateCashuProofImport {
+  if (input.unit !== CASHU_TEST_MINT_UNIT) {
+    cashuError("unsupported_unit", "Private Cashu proof import must use sat");
+  }
+  const proofs = parseProofs(input.proofs);
+  const imported = new PrivateCashuProofImport();
+  privateProofImportMaterial.set(imported, {
+    fingerprint: fingerprintPrivateProofs(proofs),
+    mintUrl: normalizeCashuTestMintUrl(input.mintUrl),
+    unit: CASHU_TEST_MINT_UNIT,
+    proofs,
+  });
+  return Object.freeze(imported);
+}
+
+export interface CashuPrivateFundingSource {
+  importFunding(value: PrivateCashuProofImport): Promise<PrivateCashuFunding>;
+}
+
+export function createCashuPrivateFundingSource(input: {
+  readonly configuration: CashuTestMintConfiguration;
+  readonly cashu: CashuTestMintPort;
+}): CashuPrivateFundingSource {
+  const configuration = normalizeCashuTestMintConfiguration(input.configuration);
+  return Object.freeze({
+    async importFunding(value: PrivateCashuProofImport): Promise<PrivateCashuFunding> {
+      const material = privateProofImportMaterial.get(value);
+      if (!material) {
+        cashuError("operation_rejected", "Private Cashu proof import is invalid");
+      }
+      let capabilities: ValidatedMintCapabilities;
+      try {
+        capabilities = await input.cashu.inspectCapabilities();
+      } catch (error) {
+        if (error instanceof CashuTestMintError) throw error;
+        cashuError("mint_unavailable", "Cashu mint capability inspection failed");
+      }
+      if (
+        material.mintUrl !== configuration.testMintUrl ||
+        material.unit !== CASHU_TEST_MINT_UNIT ||
+        capabilities.mintUrl !== configuration.testMintUrl ||
+        capabilities.unit !== CASHU_TEST_MINT_UNIT
+      ) {
+        cashuError(
+          "invalid_mint_configuration",
+          "Private Cashu proof import does not match the configured test mint",
+        );
+      }
+      const acceptedKeysets = new Set(capabilities.acceptedKeysetIds);
+      if (material.proofs.some((proof) => !acceptedKeysets.has(proof.id))) {
+        cashuError(
+          "unsupported_mint_capability",
+          "Private Cashu proof import references an unsupported keyset",
+        );
+      }
+      const funding = new PrivateCashuFunding();
+      privateFundingMaterial.set(funding, material);
+      return Object.freeze(funding);
+    },
+    toJSON(): never {
+      cashuError(
+        "privacy_boundary_violation",
+        "Private Cashu funding source cannot be serialized",
+      );
+    },
+  });
+}
+
+export interface CashuPrivateBeneficiaryDelivery {
+  readonly deliveryId: string;
+  readonly funding: PrivateCashuFunding;
+}
+
+export class PrivateCashuBeneficiaryDestination {
+  readonly beneficiary: NostrPublicKey;
+
+  constructor(beneficiary: NostrPublicKey) {
+    this.beneficiary = beneficiary;
+  }
+
+  toJSON(): never {
+    cashuError(
+      "privacy_boundary_violation",
+      "Private Cashu beneficiary destination cannot be serialized",
+    );
+  }
+}
+
+const privateBeneficiaryDestinations = new WeakMap<
+  PrivateCashuBeneficiaryDestination,
+  (input: CashuPrivateBeneficiaryDelivery) => Promise<void>
+>();
+
+export function createPrivateCashuBeneficiaryDestination(input: {
+  readonly beneficiary: string;
+  readonly deliver: (input: CashuPrivateBeneficiaryDelivery) => Promise<void>;
+}): PrivateCashuBeneficiaryDestination {
+  if (typeof input.deliver !== "function") {
+    cashuError("operation_rejected", "Private Cashu beneficiary delivery is invalid");
+  }
+  const destination = new PrivateCashuBeneficiaryDestination(
+    privateBeneficiary(input.beneficiary),
+  );
+  privateBeneficiaryDestinations.set(destination, input.deliver);
+  return Object.freeze(destination);
+}
+
+export interface CashuPrivateDeliveryResult {
+  readonly status: "delivered";
+  readonly deliveryId: string;
+  readonly beneficiary: NostrPublicKey;
+}
+
+export interface CashuPrivateValueDeliveryPort {
+  deliver(input: {
+    readonly deliveryId: string;
+    readonly handle: CashuPrivateHandle;
+    readonly expectedBeneficiary: NostrPublicKey;
+    readonly destination: PrivateCashuBeneficiaryDestination;
+  }): Promise<CashuPrivateDeliveryResult>;
 }
 
 export function createPrivateCashuSpendingKey(input: {
@@ -447,6 +576,15 @@ export interface CashuPrivateStore {
   read(scope: string, key: string): Promise<unknown | undefined>;
   write(scope: string, key: string, value: unknown): Promise<void>;
   withExclusiveLock<T>(scope: string, key: string, operation: () => Promise<T>): Promise<T>;
+}
+
+export class PrivateCashuProofImport {
+  toJSON(): never {
+    cashuError(
+      "privacy_boundary_violation",
+      "Private Cashu proof import cannot be serialized",
+    );
+  }
 }
 
 export function createInMemoryCashuPrivateStore(): CashuPrivateStore {
@@ -1110,6 +1248,201 @@ function mapBackendError(
   );
 }
 
+interface StoredPrivateDelivery {
+  readonly version: 1;
+  readonly deliveryId: string;
+  readonly fingerprint: string;
+  readonly beneficiary: NostrPublicKey;
+  readonly status: "pending" | "delivered";
+  readonly amountSats: string;
+}
+
+function privateBeneficiary(value: string): NostrPublicKey {
+  try {
+    return nostrPublicKey(value);
+  } catch {
+    cashuError("operation_rejected", "Private Cashu beneficiary identity is invalid");
+  }
+}
+
+function parseStoredPrivateDelivery(value: unknown): StoredPrivateDelivery | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    typeof value.deliveryId !== "string" ||
+    typeof value.fingerprint !== "string" ||
+    typeof value.beneficiary !== "string" ||
+    (value.status !== "pending" && value.status !== "delivered") ||
+    typeof value.amountSats !== "string"
+  ) {
+    cashuError("operation_rejected", "Private Cashu delivery storage is malformed");
+  }
+  validateOperationId(value.deliveryId);
+  const amount = amountToBigInt(value.amountSats);
+  if (amount < 1n) {
+    cashuError("operation_rejected", "Private Cashu delivery storage is malformed");
+  }
+  return Object.freeze({
+    version: 1,
+    deliveryId: value.deliveryId,
+    fingerprint: value.fingerprint,
+    beneficiary: privateBeneficiary(value.beneficiary),
+    status: value.status,
+    amountSats: amount.toString(),
+  });
+}
+
+async function readPrivateValue(
+  configuration: NormalizedCashuTestMintConfiguration,
+  store: CashuPrivateStore,
+  handle: CashuPrivateHandle,
+): Promise<PrivateValueRecord> {
+  safeHandle(handle.reference);
+  let value: unknown;
+  try {
+    value = await store.read(configuration.testMintUrl, `value:${handle.reference}`);
+  } catch {
+    cashuError("operation_rejected", "Private Cashu value storage is unavailable");
+  }
+  if (value === undefined) {
+    cashuError("operation_rejected", "Private Cashu handle was not found");
+  }
+  return parsePrivateValueRecord(value);
+}
+
+export function createCashuPrivateValueDelivery(input: {
+  readonly configuration: CashuTestMintConfiguration;
+  readonly privateStore: CashuPrivateStore;
+}): CashuPrivateValueDeliveryPort {
+  const configuration = normalizeCashuTestMintConfiguration(input.configuration);
+  return Object.freeze({
+    async deliver(delivery: {
+      readonly deliveryId: string;
+      readonly handle: CashuPrivateHandle;
+      readonly expectedBeneficiary: NostrPublicKey;
+      readonly destination: PrivateCashuBeneficiaryDestination;
+    }): Promise<CashuPrivateDeliveryResult> {
+      const deliveryId = validateOperationId(delivery.deliveryId);
+      const expectedBeneficiary = privateBeneficiary(delivery.expectedBeneficiary);
+      const destination = privateBeneficiaryDestinations.get(delivery.destination);
+      if (!destination || delivery.destination.beneficiary !== expectedBeneficiary) {
+        cashuError(
+          "operation_rejected",
+          "Private Cashu beneficiary is not authorized for this delivery",
+        );
+      }
+      const handle = safeHandle(delivery.handle.reference);
+      const fingerprint = createHash("sha256")
+        .update(
+          JSON.stringify({
+            delivery_id: deliveryId,
+            handle: handle.reference,
+            beneficiary: expectedBeneficiary,
+            mint_url: configuration.testMintUrl,
+          }),
+        )
+        .digest("hex");
+      return input.privateStore.withExclusiveLock(
+        configuration.testMintUrl,
+        `delivery:${handle.reference}`,
+        async () => {
+          const storeKey = `delivery:${handle.reference}`;
+          let stored: unknown;
+          try {
+            stored = await input.privateStore.read(configuration.testMintUrl, storeKey);
+          } catch {
+            cashuError("operation_rejected", "Private Cashu delivery storage is unavailable");
+          }
+          const existing = parseStoredPrivateDelivery(stored);
+          if (
+            existing &&
+            (existing.deliveryId !== deliveryId ||
+              existing.fingerprint !== fingerprint ||
+              existing.beneficiary !== expectedBeneficiary)
+          ) {
+            cashuError(
+              "operation_rejected",
+              "Private Cashu output was already assigned to another delivery",
+            );
+          }
+          if (existing?.status === "delivered") {
+            return Object.freeze({
+              status: "delivered",
+              deliveryId,
+              beneficiary: expectedBeneficiary,
+            });
+          }
+          const value = await readPrivateValue(configuration, input.privateStore, handle);
+          if (value.allowedPublicKeys.length !== 0) {
+            cashuError(
+              "operation_rejected",
+              "Locked Cashu value cannot be delivered as a beneficiary payout",
+            );
+          }
+          const pending: StoredPrivateDelivery = Object.freeze({
+            version: 1,
+            deliveryId,
+            fingerprint,
+            beneficiary: expectedBeneficiary,
+            status: "pending",
+            amountSats: value.amountSats.toString(),
+          });
+          try {
+            await input.privateStore.write(configuration.testMintUrl, storeKey, pending);
+          } catch {
+            cashuError("operation_rejected", "Private Cashu delivery storage is unavailable");
+          }
+          const funding = new PrivateCashuFunding();
+          privateFundingMaterial.set(funding, {
+            fingerprint: fingerprintPrivateProofs(value.proofs),
+            mintUrl: configuration.testMintUrl,
+            unit: CASHU_TEST_MINT_UNIT,
+            proofs: value.proofs,
+          });
+          try {
+            await destination(
+              Object.freeze({ deliveryId, funding: Object.freeze(funding) }),
+            );
+          } catch {
+            cashuError(
+              "reconciliation_required",
+              "Private Cashu delivery requires reconciliation",
+              "submitted_unknown",
+              deliveryId,
+            );
+          }
+          try {
+            await input.privateStore.write(
+              configuration.testMintUrl,
+              storeKey,
+              Object.freeze({ ...pending, status: "delivered" }),
+            );
+          } catch {
+            cashuError(
+              "reconciliation_required",
+              "Private Cashu delivery requires reconciliation",
+              "submitted_unknown",
+              deliveryId,
+            );
+          }
+          return Object.freeze({
+            status: "delivered",
+            deliveryId,
+            beneficiary: expectedBeneficiary,
+          });
+        },
+      );
+    },
+    toJSON(): never {
+      cashuError(
+        "privacy_boundary_violation",
+        "Private Cashu delivery boundary cannot be serialized",
+      );
+    },
+  });
+}
+
 class CashuTestMintAdapter implements CashuTestMintPort {
   private capabilities?: ValidatedMintCapabilities;
   private capabilitySnapshot?: CashuMintCapabilitySnapshot;
@@ -1190,6 +1523,12 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         id: activeKeyset.id,
         inputFeePpk: activeKeyset.inputFeePpk,
       }),
+      acceptedKeysetIds: Object.freeze(
+        satKeysets
+          .filter((keyset) => keyset.hasKeys)
+          .map((keyset) => keyset.id)
+          .sort(),
+      ),
     });
     return this.capabilities;
   }

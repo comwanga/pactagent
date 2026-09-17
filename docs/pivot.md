@@ -16,11 +16,11 @@ Pontmore provides an inspectable, Nostr-native protocol family for public agent 
 
 ## Why Nostr identity
 
-PIP-00 makes the Nostr public key the canonical agent identity. That lets capabilities and protocol history remain portable instead of belonging to one application account. PactAgent models independent public identities and unsigned event drafts while reserving private keys for a future isolated signer.
+PIP-00 makes the Nostr public key the canonical agent identity. That lets capabilities and protocol history remain portable instead of belonging to one application account. PactAgent implements independent identities, unsigned event drafts, an isolated signer boundary, and relay-backed publication/retrieval. Deployment-specific key custody and runtime composition remain separate concerns.
 
 ## Why Cashu escrow
 
-Cashu offers an ecash settlement path suited to machine-sized payments. Current PIP-01 defines `cashu_escrow` as a canonical compatibility subtype using NUT-11 conditions, refund pubkeys, and locktime at the service layer. This phase models only the public descriptor and application intent. It does not invent token formats, expose raw tokens, or connect to a mint.
+Cashu offers an ecash settlement path suited to machine-sized payments. Current PIP-01 defines `cashu_escrow` as a canonical compatibility subtype using NUT-11 conditions, refund pubkeys, and locktime at the service layer. PactAgent now includes a network-capable test-mint adapter, durable private proof custody, NUT-11 lock/release/refund operations, and an agreement-bound settlement coordinator. It does not invent token formats or expose raw tokens. Funding currently imports already-acquired proofs; Lightning mint-quote acquisition and a production wallet remain out of scope.
 
 ## Why bounded AI
 
@@ -43,13 +43,12 @@ AI becomes an economic proposal layer: discover, compare, evaluate, and recommen
 
 The original work remains intact in Git history.
 
-## Not implemented yet
+## Still intentionally open
 
-- live Nostr relay discovery or publishing;
-- event signing or private-key storage;
-- Gift Wrap private task transport;
-- live AI inference or autonomous task execution;
-- Cashu wallet, mint, NUT-11 token construction, funding, release, or refund;
-- a production escrow service schema;
+- Issue #16 end-to-end application composition and runtime hosting;
+- a hosted requester-model adapter (the bounded model interface and deterministic policy exist);
+- a live requester/provider transaction API and frontend;
+- Lightning mint-quote acquisition, generic wallet accounts, and production custody operations;
+- optional live value-flow verification beyond capability inspection;
 - real disputes or operator resolutions;
 - generic marketplace, reputation, bidding, or multi-service behavior.
