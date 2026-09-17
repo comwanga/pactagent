@@ -2,6 +2,8 @@ import { evaluateServiceOffer } from "@/domain/pact-agents";
 import { createPactDemoFixtures } from "@/lib/pact-fixtures";
 import { getProjectStatus } from "@/lib/status";
 
+import { PactAgentLogo } from "./pactagent-logo";
+
 export default function Home() {
   const status = getProjectStatus();
   const demo = createPactDemoFixtures();
@@ -16,9 +18,7 @@ export default function Home() {
     <main>
       <section className="hero">
         <nav aria-label="Project identity">
-          <span className="mark" aria-hidden="true">P</span>
-          <span>PACTAGENT</span>
-          <span className="phase">APPLICATION ON OPEN PROTOCOLS</span>
+          <PactAgentLogo />
         </nav>
 
         <div className="heroCopy">
