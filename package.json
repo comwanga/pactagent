@@ -19,7 +19,9 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:integration": "vitest run --maxWorkers=1 src/domain/pact-service-agreement.test.ts src/domain/private-task-transport.test.ts src/lib/provider-discovery.test.ts src/lib/pact-service-agreement-publication.test.ts src/lib/private-task-transport.test.ts src/lib/cashu-escrow-settlement.test.ts"
+    "test:integration": "vitest run --maxWorkers=1 src/domain/pact-service-agreement.test.ts src/domain/private-task-transport.test.ts src/lib/provider-discovery.test.ts src/lib/pact-service-agreement-publication.test.ts src/lib/private-task-transport.test.ts src/lib/cashu-escrow-settlement.test.ts",
+    "test:e2e": "vitest run --maxWorkers=1 src/lib/pactagent-workflow.test.ts",
+    "test:live": "vitest run --maxWorkers=1 src/lib/pactagent-workflow.live.test.ts"
   },
   "dependencies": {
     "@cashu/cashu-ts": "4.10.1",
