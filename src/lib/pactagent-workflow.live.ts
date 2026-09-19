@@ -1,11 +1,13 @@
 import {
   createPactAgentWorkflow,
   type PactAgentParticipantIdentities,
+  type PactAgentWorkflow,
   type PactAgentWorkflowDependencies,
+  type PactAgentWorkflowReport,
 } from "./pactagent-workflow";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
 import { createLocalNostrSigner, generateNostrPrivateKey } from "./nostr-signer";
-import { createLocalNostrEncrypter, generateNostrPrivateKeyForEncrypter } from "./private-task-transport";
+import { createLocalNostrEncrypter } from "./private-task-transport";
 import {
   createCashuTestMintAdapter,
   createCashuPrivateValueDelivery,
@@ -40,8 +42,6 @@ export interface PactAgentLiveDemoConfig {
   readonly requesterPrivateKeyHex: string;
   readonly providerPrivateKeyHex: string;
   readonly escrowAuthorityPrivateKeyHex: string;
-  readonly requesterEncrypterPrivateKeyHex: string;
-  readonly providerEncrypterPrivateKeyHex: string;
   readonly normalSpendKeyHex: string;
   readonly refundSpendKeyHex: string;
 }
@@ -52,8 +52,6 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
   const requesterPrivateKeyHex = process.env.PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY;
   const providerPrivateKeyHex = process.env.PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY;
   const escrowAuthorityPrivateKeyHex = process.env.PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY;
-  const requesterEncrypterPrivateKeyHex = process.env.PACTAGENT_LIVE_REQUESTER_ENCRYPTER_KEY;
-  const providerEncrypterPrivateKeyHex = process.env.PACTAGENT_LIVE_PROVIDER_ENCRYPTER_KEY;
   const normalSpendKeyHex = process.env.PACTAGENT_LIVE_NORMAL_SPEND_KEY;
   const refundSpendKeyHex = process.env.PACTAGENT_LIVE_REFUND_SPEND_KEY;
 
@@ -63,8 +61,6 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     !requesterPrivateKeyHex ||
     !providerPrivateKeyHex ||
     !escrowAuthorityPrivateKeyHex ||
-    !requesterEncrypterPrivateKeyHex ||
-    !providerEncrypterPrivateKeyHex ||
     !normalSpendKeyHex ||
     !refundSpendKeyHex
   ) {
@@ -77,8 +73,6 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     requesterPrivateKeyHex,
     providerPrivateKeyHex,
     escrowAuthorityPrivateKeyHex,
-    requesterEncrypterPrivateKeyHex,
-    providerEncrypterPrivateKeyHex,
     normalSpendKeyHex,
     refundSpendKeyHex,
   };
@@ -88,17 +82,24 @@ export function assertLiveDemoConfig(config: PactAgentLiveDemoConfig | undefined
   if (!config) {
     throw new Error(
       "Live demonstration requires explicit configuration. Set PACTAGENT_LIVE_RELAY_URL, " +
-        "PACTAGENT_CASHU_TEST_MINT_URL, and all PACTAGENT_LIVE_* key environment variables. " +
+        "PACTAGENT_CASHU_TEST_MINT_URL, PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY, " +
+        "PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY, PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY, " +
+        "PACTAGENT_LIVE_NORMAL_SPEND_KEY, and PACTAGENT_LIVE_REFUND_SPEND_KEY. " +
         "Missing configuration causes a clean skip — never a fallback to production.",
     );
   }
   return config;
 }
 
+export interface LiveDemoWorkflow {
+  readonly workflow: PactAgentWorkflow;
+  readonly relay: WebSocketNostrRelayAdapter;
+}
+
 export function createLiveDemoWorkflow(
   config: PactAgentLiveDemoConfig,
   decisionModel: RequesterDecisionModel,
-): ReturnType<typeof createPactAgentWorkflow> {
+): LiveDemoWorkflow {
   const relay = new WebSocketNostrRelayAdapter(config.relayUrl, {
     connectTimeoutMs: 10_000,
     defaultTimeoutMs: 15_000,
@@ -108,8 +109,8 @@ export function createLiveDemoWorkflow(
     requesterSigner: createLocalNostrSigner(config.requesterPrivateKeyHex),
     providerSigner: createLocalNostrSigner(config.providerPrivateKeyHex),
     escrowAuthoritySigner: createLocalNostrSigner(config.escrowAuthorityPrivateKeyHex),
-    requesterEncrypter: createLocalNostrEncrypter(config.requesterEncrypterPrivateKeyHex),
-    providerEncrypter: createLocalNostrEncrypter(config.providerEncrypterPrivateKeyHex),
+    requesterEncrypter: createLocalNostrEncrypter(config.requesterPrivateKeyHex),
+    providerEncrypter: createLocalNostrEncrypter(config.providerPrivateKeyHex),
   };
 
   const cashuPrivateStore = createInMemoryCashuPrivateStore();
@@ -173,15 +174,43 @@ export function createLiveDemoWorkflow(
     refundSpendKey,
   };
 
-  return createPactAgentWorkflow({ identities, dependencies });
+  return { workflow: createPactAgentWorkflow({ identities, dependencies }), relay };
+}
+
+export interface RunLiveDemoTransactionInput {
+  readonly requesterDefinition: Parameters<PactAgentWorkflow["runSuccessfulTransaction"]>[0]["requesterDefinition"];
+  readonly privateDocument: string;
+  readonly mediaType: "text/plain" | "application/pdf";
+  readonly privatePrompt?: string;
+  readonly maximumBudgetSats: Parameters<PactAgentWorkflow["runSuccessfulTransaction"]>[0]["maximumBudgetSats"];
+  readonly funding: Parameters<PactAgentWorkflow["runSuccessfulTransaction"]>[0]["funding"];
+}
+
+export async function runLiveDemoTransaction(
+  config: PactAgentLiveDemoConfig,
+  decisionModel: RequesterDecisionModel,
+  input: RunLiveDemoTransactionInput,
+): Promise<PactAgentWorkflowReport> {
+  const { workflow, relay } = createLiveDemoWorkflow(config, decisionModel);
+  try {
+    await relay.connect();
+    return await workflow.runSuccessfulTransaction({
+      requesterDefinition: input.requesterDefinition,
+      privateDocument: input.privateDocument,
+      mediaType: input.mediaType,
+      privatePrompt: input.privatePrompt,
+      maximumBudgetSats: input.maximumBudgetSats,
+      funding: input.funding,
+    });
+  } finally {
+    await relay.disconnect();
+  }
 }
 
 export function generateLiveDemoIdentities(): {
   readonly requesterPrivateKey: string;
   readonly providerPrivateKey: string;
   readonly escrowAuthorityPrivateKey: string;
-  readonly requesterEncrypterPrivateKey: string;
-  readonly providerEncrypterPrivateKey: string;
   readonly normalSpendKey: string;
   readonly refundSpendKey: string;
 } {
@@ -189,8 +218,6 @@ export function generateLiveDemoIdentities(): {
     requesterPrivateKey: generateNostrPrivateKey(),
     providerPrivateKey: generateNostrPrivateKey(),
     escrowAuthorityPrivateKey: generateNostrPrivateKey(),
-    requesterEncrypterPrivateKey: generateNostrPrivateKeyForEncrypter(),
-    providerEncrypterPrivateKey: generateNostrPrivateKeyForEncrypter(),
     normalSpendKey: generateNostrPrivateKey(),
     refundSpendKey: generateNostrPrivateKey(),
   };

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import type { NostrPublicKey, SignedNostrEvent } from "../domain/nostr";
 import type { Sats } from "../domain/money";
@@ -48,6 +49,7 @@ import {
   sealPrivateResult,
   sealPrivateTask,
   type NostrEncrypter,
+  type PrivateTaskPayload,
 } from "./private-task-transport";
 import type { PrivateTaskProvenance } from "../domain/private-task-transport";
 import {
@@ -192,7 +194,7 @@ export interface PactAgentWorkflowReport {
     readonly eventId: string;
   }>;
   readonly escrowReference: string;
-  readonly resultReference: string;
+  readonly resultReference?: string;
   readonly settlementReference?: string;
   readonly refundReference?: string;
   readonly finalOutcome: "settled" | "refunded";
@@ -221,6 +223,11 @@ function assertNoForbiddenMaterial(value: unknown, label: string): void {
       `${label} contains forbidden private material`,
     );
   }
+}
+
+function preparationIdempotencyKey(agreementRootEventId: string): string {
+  const hash = createHash("sha256").update(agreementRootEventId).digest("hex").slice(0, 56);
+  return `prep${hash}`;
 }
 
 export class PactAgentWorkflow {
@@ -265,6 +272,21 @@ export class PactAgentWorkflow {
 
   #now(): number {
     return this.#dependencies.clock.now();
+  }
+
+  #resetState(): void {
+    this.#state.discovery = undefined;
+    this.#state.decision = undefined;
+    this.#state.context = undefined;
+    this.#state.references = undefined;
+    this.#state.privateTerms = undefined;
+    this.#state.privateSalt = undefined;
+    this.#state.termsCommitment = undefined;
+    this.#state.escrowReference = undefined;
+    this.#state.escrowVersion = undefined;
+    this.#state.resultReference = undefined;
+    this.#state.completionDecision = undefined;
+    this.#state.report = undefined;
   }
 
   async #discoverProviders(): Promise<DiscoveryResult> {
@@ -433,7 +455,7 @@ export class PactAgentWorkflow {
     let prepared, funded;
     try {
       prepared = await coordinator.prepareEscrow({
-        idempotencyKey: "wf-prepare-escrow-1",
+        idempotencyKey: preparationIdempotencyKey(context.root.event.id),
         context,
         history,
       });
@@ -499,7 +521,7 @@ export class PactAgentWorkflow {
   async #providerReceivesAndDeliversTask(
     context: PactAgreementContext,
     history: SignedNostrEvent[],
-  ): Promise<void> {
+  ): Promise<PrivateTaskPayload> {
     const provenance: PrivateTaskProvenance = {
       agreementId: context.root.content.agreement_id,
       agreementRoot: context.root.event.id,
@@ -507,8 +529,9 @@ export class PactAgentWorkflow {
       recipient: this.providerPublicKey,
     };
 
+    let task: PrivateTaskPayload;
     try {
-      await retrieveAndOpenPrivateTask(
+      task = await retrieveAndOpenPrivateTask(
         this.providerPublicKey,
         this.#identities.providerEncrypter,
         provenance,
@@ -539,18 +562,20 @@ export class PactAgentWorkflow {
       if (error instanceof PactAgentWorkflowError) throw error;
       workflowError("agreement_publication_failed", "Task delivered transition failed");
     }
+
+    return task!;
   }
 
   async #providerExecutesAndReturnsResult(
     context: PactAgreementContext,
     history: SignedNostrEvent[],
-    privateTerms: DocumentSummaryPrivateTerms,
+    task: PrivateTaskPayload,
   ): Promise<string> {
     const outcome = summarizeDocument({
-      source_document: privateTerms.source_document,
-      input_media_type: privateTerms.input_media_type,
-      ...(privateTerms.private_prompt !== undefined
-        ? { private_prompt: privateTerms.private_prompt }
+      source_document: task.source_document,
+      input_media_type: task.input_media_type,
+      ...(task.private_prompt !== undefined
+        ? { private_prompt: task.private_prompt }
         : {}),
       agreementRoot: context.root.event.id,
     });
@@ -805,7 +830,9 @@ export class PactAgentWorkflow {
         eventId: t.event.id,
       })),
       escrowReference: this.#state.escrowReference!,
-      resultReference: this.#state.resultReference!,
+      ...(this.#state.resultReference !== undefined
+        ? { resultReference: this.#state.resultReference }
+        : {}),
       ...(settlementReference !== undefined ? { settlementReference } : {}),
       ...(refundReference !== undefined ? { refundReference } : {}),
       finalOutcome: refundReference !== undefined ? "refunded" : "settled",
@@ -838,6 +865,7 @@ export class PactAgentWorkflow {
     readonly expiresAt?: number;
     readonly funding: PrivateCashuFunding;
   }): Promise<PactAgentWorkflowReport> {
+    this.#resetState();
     const privateTerms: DocumentSummaryPrivateTerms = {
       source_document: input.privateDocument,
       input_media_type: input.mediaType,
@@ -874,13 +902,13 @@ export class PactAgentWorkflow {
     const fundedHistory = await this.#collectHistoryEvents(context);
 
     await this.#deliverPrivateTask(context, privateTerms);
-    await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+    const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
 
     const taskDeliveredHistory = await this.#collectHistoryEvents(context);
     const resultReference = await this.#providerExecutesAndReturnsResult(
       context,
       taskDeliveredHistory,
-      privateTerms,
+      task,
     );
 
     const resultSubmittedHistory = await this.#collectHistoryEvents(context);
@@ -930,6 +958,7 @@ export class PactAgentWorkflow {
     readonly expiresAt?: number;
     readonly funding: PrivateCashuFunding;
   }): Promise<PactAgentWorkflowReport> {
+    this.#resetState();
     const privateTerms: DocumentSummaryPrivateTerms = {
       source_document: input.privateDocument,
       input_media_type: input.mediaType,
@@ -977,39 +1006,23 @@ export class PactAgentWorkflow {
       clock: this.#dependencies.clock,
     });
 
-    if (this.#dependencies.clock instanceof DeterministicPactAgentClock) {
-      const escrowRecord = await this.#dependencies.settlementStore.read(
-        `escrow:${this.#state.escrowReference}`,
-      );
-      const record = escrowRecord as { locktime?: number } | undefined;
-      if (!record?.locktime || !Number.isSafeInteger(record.locktime)) {
-        workflowError("escrow_failed", "Escrow locktime is not available for refund demonstration");
-      }
-      this.#dependencies.clock.advanceTo(record.locktime!);
+    const escrowRecord = await this.#dependencies.settlementStore.read(
+      `escrow:${this.#state.escrowReference}`,
+    );
+    const record = escrowRecord as { locktime?: number } | undefined;
+    if (!record?.locktime || !Number.isSafeInteger(record.locktime)) {
+      workflowError("escrow_failed", "Escrow locktime is not available for refund demonstration");
     }
 
-    const refundHistory = await this.#collectHistoryEvents(context);
-
-    try {
-      await signAndPublishPactAgreementTransition({
+    if (this.#dependencies.clock instanceof DeterministicPactAgentClock) {
+      const rejectedBeforeLocktime = await this.refundRejectedBeforeLocktime(
         context,
-        history: refundHistory,
-        transition: createPactAgreementTransition({
-          context,
-          history: refundHistory,
-          predecessorEventId: refundHistory.at(-1)?.id ?? null,
-          nextState: "refund_authorized",
-          actor: this.requesterPublicKey,
-          actorRole: "requester",
-          reasonCode: "timeout",
-          createdAt: this.#now(),
-        }),
-        signer: this.#identities.requesterSigner,
-        relay: this.#dependencies.relay,
-      });
-    } catch (error) {
-      if (error instanceof PactAgentWorkflowError) throw error;
-      workflowError("agreement_publication_failed", "Refund authorization publication failed");
+        record.locktime!,
+      );
+      if (!rejectedBeforeLocktime) {
+        workflowError("unexpected_state", "Refund was not rejected before locktime");
+      }
+      this.#dependencies.clock.advanceTo(record.locktime!);
     }
 
     const refundAuthorizedHistory = await this.#collectHistoryEvents(context);
@@ -1068,8 +1081,23 @@ export class PactAgentWorkflow {
     return this.#buildReport(context, finalHistory, undefined, refunded.escrow.refundReference);
   }
 
-  async refundRejectedBeforeLocktime(context: PactAgreementContext): Promise<boolean> {
+  async refundRejectedBeforeLocktime(
+    context: PactAgreementContext,
+    locktime: number,
+  ): Promise<boolean> {
     const history = await this.#collectHistoryEvents(context);
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: this.#dependencies.mintUrl,
+      cashu: this.#dependencies.cashu,
+      privateDelivery: this.#dependencies.privateDelivery,
+      store: this.#dependencies.settlementStore,
+      escrowAuthoritySigner: this.#identities.escrowAuthoritySigner,
+      normalSpendKey: this.#dependencies.normalSpendKey,
+      refundSpendKey: this.#dependencies.refundSpendKey,
+      relay: this.#dependencies.relay,
+      clock: this.#dependencies.clock,
+    });
+
     try {
       await signAndPublishPactAgreementTransition({
         context,
@@ -1082,10 +1110,20 @@ export class PactAgentWorkflow {
           actor: this.requesterPublicKey,
           actorRole: "requester",
           reasonCode: "timeout",
-          createdAt: this.#now(),
+          createdAt: locktime,
         }),
         signer: this.#identities.requesterSigner,
         relay: this.#dependencies.relay,
+      });
+
+      const refundAuthorizedHistory = await this.#collectHistoryEvents(context);
+      await coordinator.submitRefundAuthorization({
+        idempotencyKey: "wf-authorize-refund-rejected",
+        escrowReference: this.#state.escrowReference!,
+        expectedVersion: this.#state.escrowVersion!,
+        context,
+        history: refundAuthorizedHistory,
+        basis: "timeout",
       });
       return false;
     } catch {
