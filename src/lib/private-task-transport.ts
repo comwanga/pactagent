@@ -38,6 +38,7 @@ import {
   type PrivateTaskPayload,
   type PrivateTaskProvenance,
 } from "../domain/private-task-transport";
+export type { PrivateTaskPayload } from "../domain/private-task-transport";
 import type { NostrFilter, NostrRelayAdapter, NostrRelayPublishOptions } from "./nostr-relay";
 import { createPactResultReference, DOCUMENT_SUMMARY_PROFILE_ID } from "../domain/pact-service-agreement";
 import { isTimeoutError, operationOptions } from "./pontmore-publication-helpers";

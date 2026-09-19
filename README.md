@@ -43,9 +43,13 @@ the referenced PIP-00 identities and PIP-01 descriptor, reconstructs history fro
 predecessor event IDs, and refuses unauthorized, stale, forked, or terminal-state
 advancement. It does not synthesize a PIP-02 kind `7300` swap for document-summary.
 
-Issue #16 end-to-end application composition, a hosted requester-model adapter,
-role-specific runtime hosting, and a live transaction frontend/API remain
-pending. The Cashu adapter is network-capable for one explicitly configured test
+Issue #16 delivers end-to-end application composition that sequences the
+existing #9–#15 boundaries into one executable document-summary transaction.
+The workflow is reusable application/runtime code, not test-only logic, and
+both deterministic and opt-in live verification lanes exercise the same
+composition. See the [PactAgent workflow documentation](docs/pactagent-workflow.md).
+
+The Cashu adapter is network-capable for one explicitly configured test
 mint and now imports already-acquired proofs and privately delivers confirmed
 outputs, but it does not acquire ecash through Lightning or provide a production
 wallet. Required tests remain deterministic and offline. Cashu tokens, proofs,
@@ -75,9 +79,22 @@ npm run dev
 npm run lint
 npm run typecheck
 npm test
+npm run test:e2e
 npm run build -- --webpack
 npm start
 ```
+
+### End-to-end workflow verification
+
+```sh
+npm run test:e2e
+```
+
+### Opt-in live demonstration
+
+The live demonstration requires explicit configuration and skips cleanly
+when configuration is missing. See
+[docs/pactagent-workflow.md](docs/pactagent-workflow.md) for details.
 
 ## Trust boundary
 
