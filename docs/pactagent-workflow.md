@@ -110,10 +110,9 @@ PACTAGENT_CASHU_TEST_MINT_URL=https://testmint.example/cashu \
 PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY=<hex> \
 PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY=<hex> \
 PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY=<hex> \
-PACTAGENT_LIVE_REQUESTER_ENCRYPTER_KEY=<hex> \
-PACTAGENT_LIVE_PROVIDER_ENCRYPTER_KEY=<hex> \
 PACTAGENT_LIVE_NORMAL_SPEND_KEY=<hex> \
 PACTAGENT_LIVE_REFUND_SPEND_KEY=<hex> \
+PACTAGENT_LIVE_FUNDING_TOKEN=<cashuA...> \
 npx vitest run src/lib/pactagent-workflow.live.test.ts
 ```
 
@@ -159,7 +158,9 @@ material to the repository.**
 - Existing `WebSocketNostrRelayAdapter`
 - One explicitly configured Cashu test mint
 - Unit `sat`
-- Separately configured P001, P002, and escrow-authority identities
+- Separately configured requester, provider, and escrow-authority identities
+- Pre-acquired test ecash supplied as a Cashu token (`PACTAGENT_LIVE_FUNDING_TOKEN`)
+- Real signed PIP-00 provider definition, PactAgent service offer, and PIP-01 escrow descriptor published to and discovered from the configured relay
 - Bounded operation timeouts
 - Test ecash only; no production funds
 
