@@ -2,10 +2,25 @@ import { deserializeProofs } from "@cashu/cashu-ts";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 
-import { nostrPublicKey, type NostrIdentity, type SignedNostrEvent, type UnsignedNostrEvent } from "../domain/nostr";
+import { nostrPublicKey, type NostrIdentity, type NostrPublicKey, type SignedNostrEvent, type UnsignedNostrEvent } from "../domain/nostr";
 import { sats } from "../domain/money";
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
 import { createCashuEscrowDescriptor } from "../domain/pontmore-escrow";
+import {
+  createPactAgreementTransition,
+  createPactEscrowAuthorityBinding,
+  createPactEscrowAuthoritySource,
+  PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
+  PACT_AGREEMENT_TRANSITION_TYPE,
+  PACT_SERVICE_AGREEMENT_ROOT_TYPE,
+  parsePactServiceAgreementRootEvent,
+  reconstructPactAgreementHistory,
+  type PactAgreementContext,
+  type PactAgreementHistory,
+  type PactAgreementTransition,
+  type PactAgreementTransitionContent,
+  type PactServiceAgreementRoot,
+} from "../domain/pact-service-agreement";
 import {
   createPactServiceOffer,
   PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID,
@@ -13,6 +28,8 @@ import {
 import {
   createPactCashuEscrowSettlementCoordinator,
   createInMemoryPactCashuEscrowSettlementStore,
+  type PactCashuEscrowSettlementCoordinator,
+  type PactCashuEscrowSettlementStore,
 } from "./cashu-escrow-settlement";
 import {
   createPrivateCashuSpendingKey,
@@ -28,14 +45,19 @@ import {
   type ValidatedMintCapabilities,
 } from "./cashu-test-mint";
 import { createLocalNostrSigner } from "./nostr-signer";
-import { createLocalNostrEncrypter } from "./private-task-transport";
+import {
+  createLocalNostrEncrypter,
+  retrieveAndOpenPrivateTask,
+} from "./private-task-transport";
 import type { NostrFilter, NostrRelayAdapter } from "./nostr-relay";
 import {
   createPactAgentWorkflow,
   DeterministicPactAgentClock,
+  PactAgentWorkflowError,
   type PactAgentParticipantIdentities,
   type PactAgentWorkflowDependencies,
 } from "./pactagent-workflow";
+import { publishSignedPactAgreementTransition } from "./pact-service-agreement-publication";
 import type { RequesterDecisionModel } from "./requester-decision";
 import type { RequesterPolicy } from "../domain/pact-agents";
 
@@ -99,6 +121,95 @@ class MemoryRelay implements NostrRelayAdapter {
   async queryEvents(filter: NostrFilter): Promise<SignedNostrEvent[]> {
     return this.events.filter((e) => filterMatches(e, filter)).sort((a, b) => b.created_at - a.created_at);
   }
+}
+
+class FailingPublicationRelay extends MemoryRelay {
+  private failedOnce = false;
+  private readonly tagValue: string;
+
+  constructor(tagValue: "settled" | "refunded" | "settled-only") {
+    super();
+    this.tagValue = tagValue;
+  }
+
+  async publish(event: SignedNostrEvent): Promise<void> {
+    if (!this.failedOnce) {
+      const matches = event.tags.some((t) => t[0] === "t" && t[1] === "settled");
+      if (matches && (this.tagValue === "settled" || this.tagValue === "settled-only")) {
+        this.failedOnce = true;
+        throw new Error("Simulated publication failure");
+      }
+      if (this.tagValue === "refunded" && event.tags.some((t) => t[0] === "t" && t[1] === "refunded")) {
+        this.failedOnce = true;
+        throw new Error("Simulated publication failure");
+      }
+    }
+    await super.publish(event);
+  }
+}
+
+class RejectingGiftWrapRelay extends MemoryRelay {
+  async publish(event: SignedNostrEvent): Promise<void> {
+    if (event.kind === 1059) {
+      throw new Error("Simulated gift-wrap publication failure");
+    }
+    await super.publish(event);
+  }
+}
+
+function findRootEvent(relay: MemoryRelay): SignedNostrEvent | undefined {
+  return relay.events.find(
+    (e) =>
+      e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
+      e.tags.some((t) => t[0] === "t" && t[1] === PACT_SERVICE_AGREEMENT_ROOT_TYPE),
+  );
+}
+
+async function readStoredEscrow(
+  store: PactCashuEscrowSettlementStore,
+  trackingStore: PactCashuEscrowSettlementStore & { readonly insertedKeys: readonly string[] },
+): Promise<{ key: string; reference: string; revision: number; state: string }> {
+  const escrowKey = trackingStore.insertedKeys.find((k) => k.startsWith("escrow:pactescrow_"));
+  if (!escrowKey) throw new Error("Escrow record key not found in tracking store");
+  const stored = (await store.read(escrowKey)) as { reference: string; revision: number; state: string };
+  return { key: escrowKey, ...stored };
+}
+
+function createWorkingCoordinator(
+  s: ReturnType<typeof buildWorkflow>,
+  workingRelay: MemoryRelay,
+): PactCashuEscrowSettlementCoordinator {
+  return createPactCashuEscrowSettlementCoordinator({
+    mintUrl: MINT_URL,
+    cashu: s.cashu,
+    privateDelivery: s.privateDelivery,
+    store: s.store,
+    escrowAuthoritySigner: s.identities.escrowAuthoritySigner,
+    normalSpendKey: s.dependencies.normalSpendKey,
+    refundSpendKey: s.dependencies.refundSpendKey,
+    relay: workingRelay,
+    clock: s.clock,
+  });
+}
+
+function createTrackingStore(): PactCashuEscrowSettlementStore & { readonly insertedKeys: readonly string[] } {
+  const inner = createInMemoryPactCashuEscrowSettlementStore();
+  const insertedKeys: string[] = [];
+  return {
+    insertedKeys,
+    async read(key: string) { return inner.read(key); },
+    async insert(key: string, value: unknown) {
+      const result = await inner.insert(key, value);
+      if (result) insertedKeys.push(key);
+      return result;
+    },
+    async compareAndSet(key: string, expectedRevision: number, value: unknown) {
+      return inner.compareAndSet(key, expectedRevision, value);
+    },
+    async withExclusiveLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+      return inner.withExclusiveLock(key, operation);
+    },
+  };
 }
 
 class FakeCashuPort implements CashuTestMintPort {
@@ -171,7 +282,88 @@ function scanForSecrets(value: unknown): string[] {
   return SECRET_MARKERS.filter((m) => serialized.includes(m));
 }
 
-function buildWorkflow(options: { timeout?: number } = {}) {
+function parseReferenceAddress(address: string): { kind: number; pubkey: string; identifier: string } {
+  const parts = address.split(":");
+  if (parts.length !== 3) throw new Error(`Invalid reference address: ${address}`);
+  return { kind: parseInt(parts[0]!, 10), pubkey: parts[1]!, identifier: parts[2]! };
+}
+
+function findEventByAddress(relay: MemoryRelay, address: string): SignedNostrEvent | undefined {
+  const { kind, pubkey, identifier } = parseReferenceAddress(address);
+  return relay.events.find(
+    (e) => e.kind === kind && e.pubkey === pubkey && e.tags.some((t) => t[0] === "d" && t[1] === identifier),
+  );
+}
+
+function findAgreementRoot(relay: MemoryRelay, agreementRootEventId: string): PactServiceAgreementRoot<SignedNostrEvent> {
+  const event = relay.events.find((e) => e.id === agreementRootEventId);
+  if (!event) throw new Error("Agreement root not found on relay");
+  return parsePactServiceAgreementRootEvent(event);
+}
+
+function buildAgreementReferences(relay: MemoryRelay, root: PactServiceAgreementRoot<SignedNostrEvent>): {
+  requesterDefinition: SignedNostrEvent;
+  providerDefinition: SignedNostrEvent;
+  escrowDescriptor: SignedNostrEvent;
+} {
+  const requesterDefinition = findEventByAddress(relay, root.content.requester_definition);
+  const providerDefinition = findEventByAddress(relay, root.content.provider_definition);
+  const escrowDescriptor = findEventByAddress(relay, root.content.escrow_descriptor);
+  if (!requesterDefinition || !providerDefinition || !escrowDescriptor) {
+    throw new Error("Agreement references not found on relay");
+  }
+  return { requesterDefinition, providerDefinition, escrowDescriptor };
+}
+
+async function reconstructContextFromRelay(
+  relay: MemoryRelay,
+  agreementRootEventId: string,
+  authorityPublicKey: NostrPublicKey,
+  providerSigner: ReturnType<typeof createLocalNostrSigner>,
+): Promise<PactAgreementContext> {
+  const root = findAgreementRoot(relay, agreementRootEventId);
+  const references = buildAgreementReferences(relay, root);
+  const authoritySource = createPactEscrowAuthoritySource({
+    root,
+    references,
+    authority: authorityPublicKey,
+    createdAt: root.event.created_at + 1,
+  });
+  const signedSource = await providerSigner.sign(authoritySource.event);
+  const escrowAuthority = createPactEscrowAuthorityBinding({
+    root,
+    references,
+    authority: authorityPublicKey,
+    source: signedSource,
+  });
+  return { root, references, escrowAuthority };
+}
+
+function buildHistoryFromRelay(relay: MemoryRelay, context: PactAgreementContext): PactAgreementHistory {
+  const events = relay.events.filter(
+    (e) =>
+      e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
+      e.tags.some((t) => t[0] === "t" && t[1] === PACT_AGREEMENT_TRANSITION_TYPE) &&
+      e.tags.some((t) => t[0] === "d" && t[1] === context.root.content.agreement_id),
+  );
+  return reconstructPactAgreementHistory(context, events);
+}
+
+function createCoordinatorFromWorkflow(s: ReturnType<typeof buildWorkflow>): PactCashuEscrowSettlementCoordinator {
+  return createPactCashuEscrowSettlementCoordinator({
+    mintUrl: MINT_URL,
+    cashu: s.cashu,
+    privateDelivery: s.privateDelivery,
+    store: s.store,
+    escrowAuthoritySigner: s.identities.escrowAuthoritySigner,
+    normalSpendKey: s.dependencies.normalSpendKey,
+    refundSpendKey: s.dependencies.refundSpendKey,
+    relay: s.relay,
+    clock: s.clock,
+  });
+}
+
+function buildWorkflow(options: { timeout?: number; relay?: MemoryRelay; store?: PactCashuEscrowSettlementStore } = {}) {
   const timeoutSeconds = options.timeout ?? 900;
   const requesterKey = key(31);
   const providerKey = key(32);
@@ -179,7 +371,7 @@ function buildWorkflow(options: { timeout?: number } = {}) {
   const requester = ident(requesterKey);
   const provider = ident(providerKey);
 
-  const relay = new MemoryRelay();
+  const relay = options.relay ?? new MemoryRelay();
   const clock = new DeterministicPactAgentClock(ROOT_TIME);
 
   const descriptor = createCashuEscrowDescriptor({
@@ -210,6 +402,7 @@ function buildWorkflow(options: { timeout?: number } = {}) {
   relay.events.push(signEvent(providerDefinition.event, providerKey));
 
   const signedRequesterDefinition = signEvent(requesterDefinition.event, requesterKey);
+  relay.events.push(signedRequesterDefinition);
   const providerPubkey = provider.publicKey;
 
   const recommendation = {
@@ -237,7 +430,7 @@ function buildWorkflow(options: { timeout?: number } = {}) {
   };
 
   const cashu = new FakeCashuPort();
-  const store = createInMemoryPactCashuEscrowSettlementStore();
+  const store = options.store ?? createInMemoryPactCashuEscrowSettlementStore();
   const privateDelivery = new FakePrivateDelivery();
 
   const dependencies: PactAgentWorkflowDependencies = {
@@ -341,6 +534,56 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(report.lifecycle.length).toBe(7);
       expect(report.lifecycle.every((l) => l.eventId.length === 64));
     }, 30_000);
+
+    it("provider executes the document returned by the NIP-59 receive path", async () => {
+      const s = buildWorkflow();
+      const document =
+        "PRIVATE-DOCUMENT NIP-59 task execution regression. Bitcoin and Lightning Network protocols.";
+      const report = await s.workflow.runSuccessfulTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: document,
+        mediaType: "text/plain",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+      expect(report.resultReference).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+      const context = await reconstructContextFromRelay(
+        s.relay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const provenance = {
+        agreementId: context.root.content.agreement_id,
+        agreementRoot: context.root.event.id,
+        authorizedSender: s.workflow.requesterPublicKey,
+        recipient: s.workflow.providerPublicKey,
+      };
+      const receivedTask = await retrieveAndOpenPrivateTask(
+        s.workflow.providerPublicKey,
+        s.identities.providerEncrypter,
+        provenance,
+        s.relay,
+      );
+      expect(receivedTask.source_document).toBe(document);
+
+      const executed = await (async () => {
+        const { summarizeDocument } = await import("../domain/document-summary-service");
+        return summarizeDocument({
+          source_document: receivedTask.source_document,
+          input_media_type: receivedTask.input_media_type,
+          ...(receivedTask.private_prompt !== undefined
+            ? { private_prompt: receivedTask.private_prompt }
+            : {}),
+          agreementRoot: context.root.event.id,
+        });
+      })();
+      expect(executed.status).toBe("completed");
+      if (executed.status === "completed") {
+        expect(executed.resultReference).toBe(report.resultReference);
+      }
+    }, 30_000);
   });
 
   describe("recovery / refund path", () => {
@@ -372,21 +615,26 @@ describe("PactAgent end-to-end workflow integration", () => {
       });
 
       expect(report.finalOutcome).toBe("refunded");
-      const coordinator = createPactCashuEscrowSettlementCoordinator({
-        mintUrl: MINT_URL, cashu: s.cashu, privateDelivery: s.privateDelivery,
-        store: s.store, escrowAuthoritySigner: s.identities.escrowAuthoritySigner,
-        normalSpendKey: s.dependencies.normalSpendKey, refundSpendKey: s.dependencies.refundSpendKey,
-        relay: s.relay, clock: s.clock,
-      });
+      const context = await reconstructContextFromRelay(
+        s.relay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const history = buildHistoryFromRelay(s.relay, context);
+      expect(history.status).toBe("ok");
+      expect(history.currentState).toBe("refunded");
+
+      const coordinator = createCoordinatorFromWorkflow(s);
       await expect(
         coordinator.releaseEscrow({
           idempotencyKey: "release-after-refund",
           escrowReference: report.escrowReference,
-          expectedVersion: 999,
-          context: { root: { event: { id: report.agreementRootEventId } } as never, references: {} as never },
-          history: [],
+          expectedVersion: 1,
+          context,
+          history: history.transitions.map((t) => t.event),
         }),
-      ).rejects.toBeDefined();
+      ).rejects.toMatchObject({ code: "already_refunded" });
     }, 30_000);
   });
 
@@ -409,7 +657,7 @@ describe("PactAgent end-to-end workflow integration", () => {
       }
     }, 30_000);
 
-    it("repeated workflow calls do not repeat confirmed economic execution", async () => {
+    it("repeated workflow calls execute independent transactions without double-spending within a run", async () => {
       const s = buildWorkflow();
       await s.workflow.runSuccessfulTransaction({
         requesterDefinition: s.requesterDefinition,
@@ -420,15 +668,15 @@ describe("PactAgent end-to-end workflow integration", () => {
       });
       expect(s.cashu.spendCalls).toBe(1);
 
-      await expect(
-        s.workflow.runSuccessfulTransaction({
-          requesterDefinition: s.requesterDefinition,
-          privateDocument: "PRIVATE-DOCUMENT Second attempt.",
-          mediaType: "text/plain",
-          maximumBudgetSats: sats(500n),
-          funding: privateFunding(),
-        }),
-      ).rejects.toBeDefined();
+      const secondReport = await s.workflow.runSuccessfulTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Second independent transaction.",
+        mediaType: "text/plain",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+      expect(secondReport.finalOutcome).toBe("settled");
+      expect(s.cashu.spendCalls).toBe(2);
     }, 30_000);
 
     it("the model remains advisory and receives no signer or Cashu capability", async () => {
@@ -460,6 +708,325 @@ describe("PactAgent end-to-end workflow integration", () => {
       });
       expect(modelReceivedSigner).toBe(false);
       expect(modelReceivedCashuSecret).toBe(false);
+    }, 30_000);
+  });
+
+  describe("economic retry and publication recovery", () => {
+    it("coordinator retry after publication failure does not repeat Cashu spending", async () => {
+      const failingRelay = new FailingPublicationRelay("refunded");
+      const trackingStore = createTrackingStore();
+      const s = buildWorkflow({ timeout: 300, relay: failingRelay, store: trackingStore });
+
+      await expect(
+        s.workflow.runRefundTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument: "PRIVATE-DOCUMENT Publication recovery document.",
+          mediaType: "text/plain",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        }),
+      ).rejects.toBeDefined();
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const rootEvent = findRootEvent(s.relay);
+      expect(rootEvent).toBeDefined();
+
+      const context = await reconstructContextFromRelay(
+        s.relay,
+        rootEvent!.id,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const history = buildHistoryFromRelay(s.relay, context);
+      expect(history.status).toBe("ok");
+      expect(history.currentState).toBe("refund_authorized");
+
+      const storedEscrow = await readStoredEscrow(s.store, trackingStore);
+      expect(storedEscrow.state).toBe("refund_confirmed");
+
+      const workingRelay = new MemoryRelay();
+      workingRelay.events.push(...s.relay.events);
+
+      const coordinator = createWorkingCoordinator(s, workingRelay);
+
+      const refunded = await coordinator.refundEscrow({
+        idempotencyKey: "wf-refund-escrow-retry",
+        escrowReference: storedEscrow.reference,
+        expectedVersion: storedEscrow.revision,
+        context,
+        history: history.transitions.map((t) => t.event),
+      });
+      expect(refunded.outcome).toBe("confirmed");
+      expect(s.cashu.spendCalls).toBe(1);
+    }, 30_000);
+
+    it("coordinator retry after settlement publication failure does not repeat Cashu spending", async () => {
+      const failingRelay = new FailingPublicationRelay("settled-only");
+      const trackingStore = createTrackingStore();
+      const s = buildWorkflow({ relay: failingRelay, store: trackingStore });
+
+      await expect(
+        s.workflow.runSuccessfulTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument: "PRIVATE-DOCUMENT Settlement publication recovery document.",
+          mediaType: "text/plain",
+          privatePrompt: "PRIVATE-PROMPT Settlement recovery.",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        }),
+      ).rejects.toBeInstanceOf(PactAgentWorkflowError);
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const rootEvent = findRootEvent(s.relay);
+      expect(rootEvent).toBeDefined();
+
+      const context = s.workflow.currentContext;
+      expect(context).toBeDefined();
+      const history = buildHistoryFromRelay(s.relay, context!);
+      expect(history.status).toBe("ok");
+      expect(history.currentState).toBe("release_authorized");
+
+      const storedEscrow = await readStoredEscrow(s.store, trackingStore);
+      expect(storedEscrow.state).toBe("release_confirmed");
+
+      const workingRelay = new MemoryRelay();
+      workingRelay.events.push(...s.relay.events);
+
+      const coordinator = createWorkingCoordinator(s, workingRelay);
+
+      const settled = await coordinator.releaseEscrow({
+        idempotencyKey: "wf-release-escrow-retry",
+        escrowReference: storedEscrow.reference,
+        expectedVersion: storedEscrow.revision,
+        context: context!,
+        history: history.transitions.map((t) => t.event),
+      });
+      expect(settled.outcome).toBe("confirmed");
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const settledEvent = workingRelay.events.find(
+        (e) =>
+          e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
+          e.tags.some((t) => t[0] === "t" && t[1] === "settled"),
+      );
+      expect(settledEvent).toBeDefined();
+    }, 30_000);
+  });
+
+  describe("adversarial integration", () => {
+    it("rejects an otherwise valid transition signed by an unauthorized identity", async () => {
+      const s = buildWorkflow({ timeout: 300 });
+      const report = await s.workflow.runRefundTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Unauthorized identity document.",
+        mediaType: "text/plain",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const context = await reconstructContextFromRelay(
+        s.relay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const history = buildHistoryFromRelay(s.relay, context);
+      expect(history.status).toBe("ok");
+
+      const unauthorizedKey = key(99);
+      const unauthorizedSigner = createLocalNostrSigner(hex(unauthorizedKey));
+      const refundAuthorizedEvent = history.transitions.at(-2)!.event;
+      const content: PactAgreementTransitionContent = {
+        version: 1,
+        agreement_id: context.root.content.agreement_id,
+        agreement_root: context.root.event.id,
+        predecessor: refundAuthorizedEvent.id,
+        state: "refunded",
+        prev_state: "refund_authorized",
+        actor: unauthorizedSigner.publicKey,
+        actor_role: "escrow",
+      };
+      const unsignedEvent: UnsignedNostrEvent = {
+        pubkey: unauthorizedSigner.publicKey,
+        created_at: s.clock.now(),
+        kind: PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
+        tags: [
+          ["d", content.agreement_id],
+          ["t", PACT_AGREEMENT_TRANSITION_TYPE],
+          ["t", "refunded"],
+          ["e", content.agreement_root],
+          ["e", content.predecessor!],
+          ["p", content.actor],
+        ],
+        content: JSON.stringify(content),
+      };
+      const signedEvent = await unauthorizedSigner.sign(unsignedEvent);
+
+      const historyBeforeRefunded = history.transitions.slice(0, -1).map((t) => t.event);
+
+      await expect(
+        publishSignedPactAgreementTransition({
+          context,
+          history: historyBeforeRefunded,
+          transition: { event: signedEvent, content } as PactAgreementTransition<SignedNostrEvent>,
+          relay: s.relay,
+        }),
+      ).rejects.toMatchObject({ code: "signer_not_authorized" });
+
+      expect(
+        s.relay.events.some(
+          (e) =>
+            e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
+            e.pubkey === unauthorizedSigner.publicKey &&
+            e.tags.some((t) => t[0] === "t" && t[1] === "refunded"),
+        ),
+      ).toBe(false);
+
+      expect(() =>
+        reconstructPactAgreementHistory(context, [...historyBeforeRefunded, signedEvent]),
+      ).toThrowError(expect.objectContaining({ code: "signer_not_authorized" }));
+
+      expect(s.cashu.spendCalls).toBe(1);
+    }, 30_000);
+
+    it("rejects stale or forked history before Cashu execution", async () => {
+      const trackingStore = createTrackingStore();
+      const s = buildWorkflow({ timeout: 300, relay: new RejectingGiftWrapRelay(), store: trackingStore });
+
+      await expect(
+        s.workflow.runSuccessfulTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument: "PRIVATE-DOCUMENT Forked history document.",
+          mediaType: "text/plain",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        }),
+      ).rejects.toBeInstanceOf(PactAgentWorkflowError);
+      expect(s.cashu.spendCalls).toBe(0);
+      expect(s.cashu.prepareCalls).toBe(1);
+
+      const rootEvent = findRootEvent(s.relay);
+      expect(rootEvent).toBeDefined();
+
+      const context = await reconstructContextFromRelay(
+        s.relay,
+        rootEvent!.id,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const history = buildHistoryFromRelay(s.relay, context);
+      expect(history.status).toBe("ok");
+      expect(history.currentState).toBe("escrow_funded");
+
+      const storedEscrow = await readStoredEscrow(s.store, trackingStore);
+      expect(storedEscrow.state).toBe("funded");
+
+      const escrowFundedEvent = history.transitions.find(
+        (t) => t.content.state === "escrow_funded",
+      )!.event;
+      const historyEvents = history.transitions.map((t) => t.event);
+
+      const taskDelivered = createPactAgreementTransition({
+        context,
+        history: historyEvents,
+        predecessorEventId: escrowFundedEvent.id,
+        nextState: "task_delivered",
+        actor: s.workflow.providerPublicKey,
+        actorRole: "provider",
+        createdAt: s.clock.now(),
+      });
+      const signedTaskDelivered = await s.identities.providerSigner.sign(taskDelivered.event);
+
+      const refundAuthorized = createPactAgreementTransition({
+        context,
+        history: historyEvents,
+        predecessorEventId: escrowFundedEvent.id,
+        nextState: "refund_authorized",
+        actor: s.workflow.requesterPublicKey,
+        actorRole: "requester",
+        reasonCode: "timeout",
+        createdAt: s.clock.now() + s.escrowTimeoutSeconds + 100,
+      });
+      const signedRefundAuthorized = await s.identities.requesterSigner.sign(refundAuthorized.event);
+
+      const coordinator = createCoordinatorFromWorkflow(s);
+      await expect(
+        coordinator.refundEscrow({
+          idempotencyKey: "forked-refund-attempt",
+          escrowReference: storedEscrow.reference,
+          expectedVersion: storedEscrow.revision,
+          context,
+          history: [...historyEvents, signedTaskDelivered, signedRefundAuthorized],
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_state",
+        message: /Forked agreement history cannot authorize settlement/,
+      });
+      expect(s.cashu.spendCalls).toBe(0);
+    }, 30_000);
+
+    it("workflow error serialization contains no private material", async () => {
+      const s = buildWorkflow();
+      const privateDocument = "PRIVATE-DOCUMENT Secret scanning error document.";
+      const logs: string[] = [];
+      const originalError = console.error;
+      const originalLog = console.log;
+      console.error = (...args: unknown[]) => {
+        logs.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+      };
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+      };
+
+      let caught: PactAgentWorkflowError | undefined;
+      try {
+        const rejectingWorkflow = createPactAgentWorkflow({
+          identities: s.identities,
+          dependencies: {
+            ...s.dependencies,
+            requesterPolicy: { ...s.requesterPolicy, maxBudgetSats: sats(100n) },
+          },
+        });
+        await rejectingWorkflow.runSuccessfulTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument,
+          mediaType: "text/plain",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        });
+      } catch (error) {
+        if (error instanceof PactAgentWorkflowError) caught = error;
+      } finally {
+        console.error = originalError;
+        console.log = originalLog;
+      }
+
+      expect(caught).toBeInstanceOf(PactAgentWorkflowError);
+      const serialized = JSON.stringify(caught!.toJSON());
+      expect(scanForSecrets(serialized)).toEqual([]);
+      expect(scanForSecrets(logs.join("\n"))).toEqual([]);
+      expect(caught!.toJSON()).toEqual({
+        name: "PactAgentWorkflowError",
+        code: "discovery_failed",
+        message: "No compatible provider was discovered",
+      });
+    }, 30_000);
+
+    it("refund report omits resultReference and contains no private material", async () => {
+      const s = buildWorkflow({ timeout: 300 });
+      const report = await s.workflow.runRefundTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Refund report shape document.",
+        mediaType: "text/plain",
+        privatePrompt: "PRIVATE-PROMPT Refund scan.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+
+      expect(report.finalOutcome).toBe("refunded");
+      expect(report.resultReference).toBeUndefined();
+      expect(scanForSecrets(report)).toEqual([]);
     }, 30_000);
   });
 });
