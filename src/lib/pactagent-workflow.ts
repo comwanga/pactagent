@@ -5,7 +5,6 @@ import type { Sats } from "../domain/money";
 import {
   DOCUMENT_SUMMARY_PROFILE_ID,
   PactPrivateCommitmentSalt,
-  PactServiceAgreementError,
   createPactAgreementId,
   createPactAgreementTransition,
   createPactCompletionDecision,
@@ -13,7 +12,6 @@ import {
   createPactEscrowAuthoritySource,
   createPactResultReference,
   createPactTermsCommitment,
-  reconstructPactAgreementHistory,
   verifyPactTermsCommitment,
   type DocumentSummaryPrivateResult,
   type DocumentSummaryPrivateTerms,
@@ -32,6 +30,7 @@ import type { NostrSigner } from "../domain/nostr";
 import {
   createPactServiceAgreementRootFromDiscovery,
   retrieveAndReconstructPactAgreement,
+  signPactAgreementTransition,
   signAndPublishPactAgreementTransition,
   signAndPublishPactServiceAgreementRoot,
 } from "./pact-service-agreement-publication";
@@ -56,6 +55,7 @@ import {
 import type { PrivateTaskProvenance } from "../domain/private-task-transport";
 import {
   createPactCashuEscrowSettlementCoordinator,
+  PactCashuSettlementError,
   type PactCashuClock,
   type PactCashuEscrowSettlementStore,
 } from "./cashu-escrow-settlement";
@@ -175,6 +175,17 @@ export interface PactAgentWorkflowConfig {
   readonly dependencies: PactAgentWorkflowDependencies;
 }
 
+export interface PactAgentWorkflowTransactionInput {
+  readonly requesterDefinition: SignedNostrEvent;
+  readonly privateDocument: string;
+  readonly mediaType: "text/plain" | "application/pdf";
+  readonly privatePrompt?: string;
+  readonly maximumBudgetSats: Sats;
+  readonly agreementId?: string;
+  readonly expiresAt?: number;
+  readonly funding: PrivateCashuFunding;
+}
+
 /** Safe structured report returned by a completed workflow run. */
 export interface PactAgentWorkflowReport {
   readonly workflowVersion: 1;
@@ -236,6 +247,7 @@ export class PactAgentWorkflow {
   readonly #identities: PactAgentParticipantIdentities;
   readonly #dependencies: PactAgentWorkflowDependencies;
   readonly #state: WorkflowState;
+  #running = false;
 
   constructor(config: PactAgentWorkflowConfig) {
     this.#identities = config.identities;
@@ -278,6 +290,18 @@ export class PactAgentWorkflow {
 
   #now(): number {
     return this.#dependencies.clock.now();
+  }
+
+  async #runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#running) {
+      workflowError("unexpected_state", "A PactAgent workflow run is already active");
+    }
+    this.#running = true;
+    try {
+      return await operation();
+    } finally {
+      this.#running = false;
+    }
   }
 
   #resetState(): void {
@@ -776,6 +800,15 @@ export class PactAgentWorkflow {
         context,
         history,
       });
+      if (settled.outcome === "publication_pending") {
+        settled = await coordinator.releaseEscrow({
+          idempotencyKey: "wf-release-escrow-1",
+          escrowReference,
+          expectedVersion: authorized.escrow.version,
+          context,
+          history,
+        });
+      }
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
       workflowError("settlement_failed", "Cashu release failed");
@@ -861,16 +894,15 @@ export class PactAgentWorkflow {
     }
   }
 
-  async runSuccessfulTransaction(input: {
-    readonly requesterDefinition: SignedNostrEvent;
-    readonly privateDocument: string;
-    readonly mediaType: "text/plain" | "application/pdf";
-    readonly privatePrompt?: string;
-    readonly maximumBudgetSats: Sats;
-    readonly agreementId?: string;
-    readonly expiresAt?: number;
-    readonly funding: PrivateCashuFunding;
-  }): Promise<PactAgentWorkflowReport> {
+  async runSuccessfulTransaction(
+    input: PactAgentWorkflowTransactionInput,
+  ): Promise<PactAgentWorkflowReport> {
+    return this.#runExclusive(() => this.#runSuccessfulTransaction(input));
+  }
+
+  async #runSuccessfulTransaction(
+    input: PactAgentWorkflowTransactionInput,
+  ): Promise<PactAgentWorkflowReport> {
     this.#resetState();
     const privateTerms: DocumentSummaryPrivateTerms = {
       source_document: input.privateDocument,
@@ -954,16 +986,15 @@ export class PactAgentWorkflow {
     return this.#buildReport(verifiedContext, finalHistory, settlementReference);
   }
 
-  async runRefundTransaction(input: {
-    readonly requesterDefinition: SignedNostrEvent;
-    readonly privateDocument: string;
-    readonly mediaType: "text/plain" | "application/pdf";
-    readonly privatePrompt?: string;
-    readonly maximumBudgetSats: Sats;
-    readonly agreementId?: string;
-    readonly expiresAt?: number;
-    readonly funding: PrivateCashuFunding;
-  }): Promise<PactAgentWorkflowReport> {
+  async runRefundTransaction(
+    input: PactAgentWorkflowTransactionInput,
+  ): Promise<PactAgentWorkflowReport> {
+    return this.#runExclusive(() => this.#runRefundTransaction(input));
+  }
+
+  async #runRefundTransaction(
+    input: PactAgentWorkflowTransactionInput,
+  ): Promise<PactAgentWorkflowReport> {
     this.#resetState();
     const privateTerms: DocumentSummaryPrivateTerms = {
       source_document: input.privateDocument,
@@ -1024,6 +1055,8 @@ export class PactAgentWorkflow {
       const rejectedBeforeLocktime = await this.refundRejectedBeforeLocktime(
         context,
         record.locktime!,
+        this.#state.escrowReference!,
+        this.#state.escrowVersion!,
       );
       if (!rejectedBeforeLocktime) {
         workflowError("unexpected_state", "Refund was not rejected before locktime");
@@ -1067,6 +1100,15 @@ export class PactAgentWorkflow {
         context,
         history: refundAuthorizedHistory,
       });
+      if (refunded.outcome === "publication_pending") {
+        refunded = await coordinator.refundEscrow({
+          idempotencyKey: "wf-refund-escrow-1",
+          escrowReference: this.#state.escrowReference!,
+          expectedVersion: authorized.escrow.version,
+          context,
+          history: refundAuthorizedHistory,
+        });
+      }
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
       workflowError("settlement_failed", "Cashu refund failed");
@@ -1107,39 +1149,62 @@ export class PactAgentWorkflow {
   async refundRejectedBeforeLocktime(
     context: PactAgreementContext,
     locktime: number,
+    escrowReference: string,
+    escrowVersion: number,
   ): Promise<boolean> {
     if (this.#now() >= locktime) return false;
 
     const history = await this.#collectHistoryEvents(context);
+    const transition = createPactAgreementTransition({
+      context,
+      history,
+      predecessorEventId: history.at(-1)?.id ?? null,
+      nextState: "refund_authorized",
+      actor: this.requesterPublicKey,
+      actorRole: "requester",
+      reasonCode: "timeout",
+      createdAt: this.#now(),
+    });
+    const signed = await signPactAgreementTransition({
+      context,
+      history,
+      transition,
+      signer: this.#identities.requesterSigner,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: this.#dependencies.mintUrl,
+      cashu: this.#dependencies.cashu,
+      privateDelivery: this.#dependencies.privateDelivery,
+      store: this.#dependencies.settlementStore,
+      escrowAuthoritySigner: this.#identities.escrowAuthoritySigner,
+      normalSpendKey: this.#dependencies.normalSpendKey,
+      refundSpendKey: this.#dependencies.refundSpendKey,
+      relay: this.#dependencies.relay,
+      clock: this.#dependencies.clock,
+    });
 
     try {
-      await signAndPublishPactAgreementTransition({
+      await coordinator.submitRefundAuthorization({
+        idempotencyKey: "wf-probe-refund-before-locktime",
+        escrowReference,
+        expectedVersion: escrowVersion,
         context,
-        history,
-        transition: createPactAgreementTransition({
-          context,
-          history,
-          predecessorEventId: history.at(-1)?.id ?? null,
-          nextState: "refund_authorized",
-          actor: this.requesterPublicKey,
-          actorRole: "requester",
-          reasonCode: "timeout",
-          createdAt: this.#now(),
-        }),
-        signer: this.#identities.requesterSigner,
-        relay: this.#dependencies.relay,
+        history: [...history, signed.event],
+        basis: "timeout",
       });
       return false;
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
       if (
-        !(error instanceof PactServiceAgreementError) ||
+        !(error instanceof PactCashuSettlementError) ||
         error.code !== "timeout_not_reached"
       ) {
         throw error;
       }
-      const afterHistory = reconstructPactAgreementHistory(context, await this.#collectHistoryEvents(context));
-      return !afterHistory.transitions.some((t) => t.content.state === "refund_authorized");
+      const afterHistory = await this.#collectHistoryEvents(context);
+      return !afterHistory.some((event) =>
+        event.tags.some((tag) => tag[0] === "t" && tag[1] === "refund_authorized"),
+      );
     }
   }
 }

@@ -113,6 +113,7 @@ PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY=<hex> \
 PACTAGENT_LIVE_NORMAL_SPEND_KEY=<hex> \
 PACTAGENT_LIVE_REFUND_SPEND_KEY=<hex> \
 PACTAGENT_LIVE_FUNDING_TOKEN=<cashuA...> \
+PACTAGENT_LIVE_STATE_DIRECTORY=/private/path/pactagent-live-state \
 npx vitest run src/lib/pactagent-workflow.live.test.ts
 ```
 
@@ -129,17 +130,17 @@ function key(seed: number): Uint8Array {
 }
 ```
 
-For the live demonstration, generate fresh identities:
+For the live demonstration, generate five independent 32-byte keys (requester,
+provider, escrow authority, normal spend, and refund spend), for example by
+running this command five times:
 
-```typescript
-import { generateLiveDemoIdentities } from "./pactagent-workflow.live";
-
-const identities = generateLiveDemoIdentities();
-// Store the private keys securely; never commit or print them.
+```sh
+openssl rand -hex 32
 ```
 
-**Never commit private keys, tokens, proofs, credentials, or payout
-material to the repository.**
+Store the values and live-state directory securely. **Never commit private
+keys, tokens, proofs, credentials, SQLite state, or payout material to the
+repository.**
 
 ## Deterministic versus live verification
 
@@ -160,6 +161,7 @@ material to the repository.**
 - Unit `sat`
 - Separately configured requester, provider, and escrow-authority identities
 - Pre-acquired test ecash supplied as a Cashu token (`PACTAGENT_LIVE_FUNDING_TOKEN`)
+- Durable private Cashu and escrow recovery state under `PACTAGENT_LIVE_STATE_DIRECTORY`
 - Real signed PIP-00 provider definition, PactAgent service offer, and PIP-01 escrow descriptor published to and discovered from the configured relay
 - Bounded operation timeouts
 - Test ecash only; no production funds
