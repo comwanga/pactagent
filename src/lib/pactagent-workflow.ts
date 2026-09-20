@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as pactServiceAgreementDomain from "../domain/pact-service-agreement";
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import type { NostrPublicKey, SignedNostrEvent } from "../domain/nostr";
 import type { Sats } from "../domain/money";
@@ -442,6 +443,11 @@ export class PactAgentWorkflow {
   }
 
   async #providerAccepts(context: PactAgreementContext, history: SignedNostrEvent[]): Promise<SignedNostrEvent> {
+    const now = this.#now();
+    const trustedValidationTime =
+      "PACT_AGREEMENT_CLOCK_SKEW_SECONDS" in pactServiceAgreementDomain
+        ? { validationTime: now }
+        : {};
     try {
       const signed = await signAndPublishPactAgreementTransition({
         context,
@@ -453,10 +459,12 @@ export class PactAgentWorkflow {
           nextState: "accepted",
           actor: this.providerPublicKey,
           actorRole: "provider",
-          createdAt: this.#now(),
+          createdAt: now,
+          ...trustedValidationTime,
         }),
         signer: this.#identities.providerSigner,
         relay: this.#dependencies.relay,
+        ...trustedValidationTime,
       });
       return signed.event;
     } catch (error) {
