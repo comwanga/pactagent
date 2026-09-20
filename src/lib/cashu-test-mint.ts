@@ -994,6 +994,11 @@ interface StoredOperation {
   readonly spentExposureOperationId?: string;
 }
 
+interface SpendSourceTombstone {
+  readonly handle: CashuPrivateHandle;
+  readonly value: PrivateValueRecord;
+}
+
 interface StoredExposureLedger {
   readonly version: 1;
   readonly reservations: Readonly<
@@ -1973,8 +1978,9 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           existing.status !== "not_submitted" ||
           existing.prepared !== undefined)
       ) {
-        const resumed = await this.resumeExisting(operationId, fingerprint, existing);
-        if (resumed.status === "succeeded") {
+        const tombstone = { handle: input.handle, value };
+        const resumed = await this.resumeExisting(operationId, fingerprint, existing, tombstone);
+        if (resumed.status === "succeeded" && existing.status === "succeeded") {
           await this.markValueConsumed(input.handle, value, operationId);
         }
         return resumed;
@@ -2021,10 +2027,8 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         prepared,
         [],
         value.exposureOperationId,
+        { handle: input.handle, value },
       );
-      if (result.status === "succeeded") {
-        await this.markValueConsumed(input.handle, value, operationId);
-      }
       return result;
     });
   }
@@ -2054,6 +2058,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     operationId: string,
     fingerprint: string,
     existing: StoredOperation,
+    tombstone?: SpendSourceTombstone,
   ): Promise<CashuMutationResult> {
     if (existing.fingerprint !== fingerprint) {
       cashuError(
@@ -2078,7 +2083,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       return existing.result;
     }
     if (existing.status === "submitted_unknown" && existing.prepared) {
-      return this.reconcilePrepared(operationId, existing);
+      return this.reconcilePrepared(operationId, existing, tombstone);
     }
     if (existing.status === "failed_definitively") {
       cashuError(
@@ -2104,6 +2109,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         existing.prepared,
         existing.allowedPublicKeys,
         existing.spentExposureOperationId,
+        tombstone,
       );
     }
     cashuError(
@@ -2121,6 +2127,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     prepared: CashuPrivatePreparedSwap,
     allowedPublicKeys: readonly string[],
     spentExposureOperationId?: string,
+    tombstone?: SpendSourceTombstone,
   ): Promise<CashuMutationResult> {
     try {
       const result = await this.backend.submit(prepared);
@@ -2133,6 +2140,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           allowedPublicKeys,
           result,
           spentExposureOperationId,
+          tombstone,
         );
       } catch {
         await this.writeOperation(operationId, {
@@ -2183,6 +2191,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
   private async reconcilePrepared(
     operationId: string,
     operation: StoredOperation,
+    tombstone?: SpendSourceTombstone,
   ): Promise<CashuMutationResult> {
     const prepared = operation.prepared;
     if (!prepared) return reconciliationRequired(operationId);
@@ -2237,6 +2246,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       operation.allowedPublicKeys,
       restored,
       operation.spentExposureOperationId,
+      tombstone,
     );
   }
 
@@ -2248,6 +2258,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     allowedPublicKeys: readonly string[],
     result: CashuPrivateSwapResult,
     spentExposureOperationId?: string,
+    tombstone?: SpendSourceTombstone,
   ): Promise<CashuOperationSucceeded> {
     const inputAmount = sumProofAmounts(prepared.inputProofs);
     const outputAmount = sumProofAmounts(result.sendProofs);
@@ -2315,6 +2326,9 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         reservedSpendFeeSats: safeSats(reservedSpendFee),
       }),
     });
+    if (tombstone) {
+      await this.markValueConsumed(tombstone.handle, tombstone.value, operationId);
+    }
     await this.writeOperation(operationId, {
       fingerprint,
       kind,

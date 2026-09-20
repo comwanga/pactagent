@@ -693,6 +693,41 @@ describe("Cashu test-mint private operations", () => {
     expect(deliveries).toBe(0);
   });
 
+  it("tombstones the source handle before persisting spend success", async () => {
+    const base = createInMemoryCashuPrivateStore();
+    let failSuccess = true;
+    const privateStore: CashuPrivateStore = {
+      read: (scope, key) => base.read(scope, key),
+      async write(scope, key, value) {
+        if (
+          failSuccess &&
+          key === "operation:spend-tombstone-order" &&
+          (value as { status?: unknown }).status === "succeeded"
+        ) {
+          failSuccess = false;
+          throw new Error("fault after spend success persistence");
+        }
+        await base.write(scope, key, value);
+      },
+      withExclusiveLock: (scope, key, operation) => base.withExclusiveLock(scope, key, operation),
+    };
+    const backend = new FakeCashuBackend();
+    const configuration = {
+      testMintUrl: MINT_URL,
+      unit: "sat" as const,
+      maximumExposureSats: sats(1_000n),
+    };
+    const adapter = createCashuTestMintAdapterWithBackend({ configuration, backend, privateStore });
+    const locked = await prepare(adapter, "tombstone-order-lock");
+    await expect(adapter.spendLockedValue({
+      operationId: "spend-tombstone-order",
+      handle: locked.result.handle,
+      spendingKey: locked.lockKey,
+    })).resolves.toMatchObject({ status: "submitted_unknown" });
+    const sourceRecord = await base.read(MINT_URL, `value:${locked.result.handle.reference}`);
+    expect(sourceRecord).toMatchObject({ consumedByOperationId: "spend-tombstone-order" });
+  });
+
   it("rejects insufficient value before submission", async () => {
     const { adapter, backend } = harness();
     const key = spendingKey();
