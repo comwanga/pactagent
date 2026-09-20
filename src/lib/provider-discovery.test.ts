@@ -88,16 +88,19 @@ class MemoryNostrRelay implements NostrRelayAdapter {
       const overridden = this.queryOverride(filter);
       if (overridden !== undefined) return overridden;
     }
-    return this.published.filter((event) => {
+    const matches = this.published.filter((event) => {
       const kindMatches = !filter.kinds || filter.kinds.includes(event.kind);
       const authorMatches = !filter.authors || filter.authors.includes(event.pubkey);
+      const sinceMatches = filter.since === undefined || event.created_at >= filter.since;
+      const untilMatches = filter.until === undefined || event.created_at <= filter.until;
       const tagMatches =
         !filter.tags ||
         Object.entries(filter.tags).every(([name, values]) =>
           event.tags.some((tag) => tag[0] === name && values.includes(tag[1])),
         );
-      return kindMatches && authorMatches && tagMatches;
+      return kindMatches && authorMatches && sinceMatches && untilMatches && tagMatches;
     });
+    return filter.limit === undefined ? matches : matches.slice(0, filter.limit);
   }
 }
 
@@ -1112,8 +1115,68 @@ describe("relay-backed provider discovery", () => {
         now: FIXTURE_TIME + 60,
         bounds: { maxProfiles: 1 },
       });
-      expect(relay.filters[0]?.limit).toBe(1);
+      expect(relay.filters[0]?.limit).toBe(100);
       expect(result.candidates).toHaveLength(1);
+    });
+
+    it("continues to an older profile page when the newest page is unauthentic", async () => {
+      const relay = new MemoryNostrRelay();
+      const provider = createProviderBundle(2);
+      await publishBundle(provider, relay);
+      const validProfile = relay.published.find(
+        (event) => event.kind === PIP00_AGENT_DEFINITION_KIND,
+      )!;
+      for (let index = 1; index <= 100; index += 1) {
+        relay.published.unshift({
+          ...validProfile,
+          id: index.toString(16).padStart(64, "0"),
+          created_at: FIXTURE_TIME + index + 1,
+          tags: validProfile.tags.map((tag) =>
+            tag[0] === "d" ? ["d", `invalid-${index}`] : [...tag],
+          ),
+        });
+      }
+
+      const result = await discoverProviders({
+        requesterPolicy: REQUESTER_POLICY,
+        capability: "document-summary",
+        relay,
+        now: FIXTURE_TIME + 60,
+        bounds: { maxProfiles: 1 },
+      });
+
+      expect(relay.filters.filter((filter) => filter.kinds?.includes(30360))).toHaveLength(2);
+      expect(result.candidates.map((candidate) => candidate.providerPublicKey)).toEqual([
+        provider.publicKey,
+      ]);
+    });
+
+    it("does not let an unauthentic profile consume the authenticated-profile budget", async () => {
+      const relay = new MemoryNostrRelay();
+      const provider = createProviderBundle(2);
+      await publishBundle(provider, relay);
+      const profile = relay.published.find((event) => event.kind === PIP00_AGENT_DEFINITION_KIND)!;
+      relay.published.unshift({
+        ...profile,
+        id: "f".repeat(64),
+        pubkey: nostrPublicKey("ab".repeat(32)),
+        sig: "0".repeat(128),
+      });
+
+      const result = await discoverProviders({
+        requesterPolicy: REQUESTER_POLICY,
+        capability: "document-summary",
+        relay,
+        now: FIXTURE_TIME + 60,
+        bounds: { maxProfiles: 1 },
+      });
+
+      expect(result.candidates.map((candidate) => candidate.providerPublicKey)).toEqual([
+        provider.publicKey,
+      ]);
+      expect(result.rejections.map((candidate) => candidate.category)).toContain(
+        "invalid_nostr_event",
+      );
     });
 
     it("rejects a non-positive maxProfiles bound", async () => {
@@ -1173,6 +1236,37 @@ describe("relay-backed provider discovery", () => {
       expect(result.candidates.map((c) => c.providerPublicKey)).toContain(p002.publicKey);
       expect(result.candidates).toHaveLength(1);
       expect(result.rejections.some((r) => r.category === "discovery_truncated")).toBe(true);
+    });
+
+    it("enforces one global deadline when a candidate resolution never settles", async () => {
+      const relay = new MemoryNostrRelay();
+      const provider = createProviderBundle(2);
+      await publishBundle(provider, relay);
+      const hangingRelay: NostrRelayAdapter = {
+        url: relay.url,
+        connect: () => relay.connect(),
+        disconnect: () => relay.disconnect(),
+        publish: (event, options) => relay.publish(event, options),
+        queryEvents(filter, options) {
+          if (filter.kinds?.includes(PACTAGENT_SERVICE_OFFER_KIND)) {
+            return new Promise<SignedNostrEvent[]>(() => undefined);
+          }
+          return relay.queryEvents(filter, options);
+        },
+      };
+
+      const result = await discoverProviders({
+        requesterPolicy: REQUESTER_POLICY,
+        capability: "document-summary",
+        relay: hangingRelay,
+        now: FIXTURE_TIME + 60,
+        options: { timeoutMs: 25 },
+      });
+
+      expect(result.candidates).toEqual([]);
+      expect(result.rejections).toContainEqual(expect.objectContaining({
+        category: "discovery_truncated",
+      }));
     });
 
     it("returns no candidates when the capability is not allowed by the requester policy", async () => {

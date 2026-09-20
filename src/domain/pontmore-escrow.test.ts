@@ -39,6 +39,35 @@ describe("PIP-01 Cashu escrow modeling", () => {
     expect(parsed.content).toEqual(escrowDescriptor.content);
   });
 
+  it.each([-1, 0, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects unsafe timeout duration %s",
+    (durationSeconds) => {
+      const { escrowDescriptor } = createPactDemoFixtures();
+      const content = JSON.parse(escrowDescriptor.event.content) as {
+        dispute_rules: { timeout: { duration_seconds: number } };
+      };
+      content.dispute_rules.timeout.duration_seconds = durationSeconds;
+      const event = { ...escrowDescriptor.event, content: JSON.stringify(content) };
+      expect(() => parseCashuEscrowDescriptor(JSON.stringify(event))).toThrowError(
+        expect.objectContaining({ code: "missing_required_metadata" }),
+      );
+    },
+  );
+
+  it.each([1, 900, Number.MAX_SAFE_INTEGER])(
+    "accepts positive safe timeout duration %s at the descriptor boundary",
+    (durationSeconds) => {
+      const { escrowDescriptor } = createPactDemoFixtures();
+      const content = JSON.parse(escrowDescriptor.event.content) as {
+        dispute_rules: { timeout: { duration_seconds: number } };
+      };
+      content.dispute_rules.timeout.duration_seconds = durationSeconds;
+      const event = { ...escrowDescriptor.event, content: JSON.stringify(content) };
+      expect(parseCashuEscrowDescriptor(JSON.stringify(event)).content.dispute_rules.timeout.duration_seconds)
+        .toBe(durationSeconds);
+    },
+  );
+
   it("constructs identical content and tags for identical logical input", () => {
     const { provider } = createPactDemoFixtures();
     const input = {

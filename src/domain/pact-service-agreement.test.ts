@@ -167,6 +167,7 @@ function appendTransition(
   options: { reasonCode?: string; resultReference?: string; createdAt?: number } = {},
 ): SignedNostrEvent {
   const actor = identity(secretKey).publicKey;
+  const createdAt = options.createdAt ?? ROOT_TIME + history.length + 1;
   const draft = createPactAgreementTransition({
     context: fixture.context,
     history,
@@ -176,7 +177,8 @@ function appendTransition(
     actorRole,
     reasonCode: options.reasonCode,
     resultReference: options.resultReference,
-    createdAt: options.createdAt ?? ROOT_TIME + history.length + 1,
+    createdAt,
+    validationTime: createdAt,
   });
   const event = sign(draft.event, secretKey);
   history.push(event);
@@ -816,6 +818,7 @@ describe("PactAgent service agreement kernel", () => {
       actor: fixture.providerIdentity.publicKey,
       actorRole: "provider",
       createdAt: ROOT_TIME + 2,
+      validationTime: ROOT_TIME + 2,
     });
     const replay = sign(replayDraft.event, fixture.providerKey);
     const fork = reconstructPactAgreementHistory(fixture.context, [replay, accepted]);
@@ -824,6 +827,66 @@ describe("PactAgent service agreement kernel", () => {
       expect(fork.conflict.predecessorEventId).toBeNull();
       expect(fork.conflict.competingEventIds).toEqual([accepted.id, replay.id].sort());
     }
+  });
+
+  it("anchors current acceptance and expiry decisions to trusted validator time", () => {
+    const fixture = createFixture();
+    const acceptanceInput = {
+      context: fixture.context,
+      history: [] as SignedNostrEvent[],
+      nextState: "accepted" as const,
+      actor: fixture.providerIdentity.publicKey,
+      actorRole: "provider" as const,
+      createdAt: ROOT_TIME + 1,
+    };
+    expect(() => createPactAgreementTransition({
+      ...acceptanceInput,
+      validationTime: EXPIRY,
+    })).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+    expect(() => createPactAgreementTransition({
+      ...acceptanceInput,
+      createdAt: ROOT_TIME + 100,
+      validationTime: ROOT_TIME + 1,
+    })).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+    expect(() => createPactAgreementTransition({
+      ...acceptanceInput,
+      validationTime: ROOT_TIME + 31,
+    })).not.toThrow();
+
+    expect(() => createPactAgreementTransition({
+      context: fixture.context,
+      history: [],
+      nextState: "expired",
+      actor: fixture.requesterIdentity.publicKey,
+      actorRole: "requester",
+      createdAt: EXPIRY,
+      validationTime: ROOT_TIME + 1,
+    })).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+
+    const historical: SignedNostrEvent[] = [];
+    appendTransition(fixture, historical, "accepted", "provider", fixture.providerKey);
+    expect(reconstructPactAgreementHistory(fixture.context, historical)).toMatchObject({
+      currentState: "accepted",
+    });
+  });
+
+  it("rejects conflicting duplicate IDs and histories beyond the protocol maximum", () => {
+    const fixture = createFixture();
+    const history: SignedNostrEvent[] = [];
+    const accepted = appendTransition(fixture, history, "accepted", "provider", fixture.providerKey);
+    const conflicting = { ...accepted, content: `${accepted.content} ` };
+    expect(() => reconstructPactAgreementHistory(fixture.context, [accepted, conflicting]))
+      .toThrowError(expect.objectContaining({ code: "malformed_event" }));
+
+    const oversized = Array.from({ length: 9 }, (_value, index) => ({
+      ...accepted,
+      id: index.toString(16).padStart(64, "0"),
+    }));
+    expect(() => reconstructPactAgreementHistory(fixture.context, oversized))
+      .toThrowError(expect.objectContaining({
+        code: "malformed_event",
+        message: expect.stringContaining("exceeds 8"),
+      }));
   });
 
   it("rejects stale and malformed predecessor references", () => {
@@ -891,6 +954,7 @@ describe("PactAgent service agreement kernel", () => {
       actor: fixture.providerIdentity.publicKey,
       actorRole: "provider",
       createdAt: ROOT_TIME + 1,
+      validationTime: ROOT_TIME + 1,
     });
     const backdated = sign(
       { ...valid.event, created_at: ROOT_TIME - 1 },
@@ -1032,6 +1096,7 @@ describe("PactAgent service agreement kernel", () => {
       actor: fixture.providerIdentity.publicKey,
       actorRole: "provider",
       createdAt: ROOT_TIME + 1,
+      validationTime: ROOT_TIME + 1,
     });
     const content = JSON.parse(draft.event.content) as Record<string, unknown>;
     content.raw_cashu_token = "cashuA-DO-NOT-LOG";

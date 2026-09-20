@@ -215,6 +215,12 @@ export function evaluateServiceOffer(input: {
   ) {
     reasons.push("escrow_incompatible");
   }
+  if (
+    input.escrowDescriptor.content.dispute_rules.timeout.duration_seconds >
+    input.requester.policy.maximumEscrowDurationSeconds
+  ) {
+    reasons.push("requester_escrow_duration_exceeded");
+  }
   if (input.offer.estimatedExecutionSeconds > input.provider.policy.maximumExecutionDurationSeconds) {
     reasons.push("provider_execution_limit_exceeded");
   }

@@ -216,10 +216,10 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     expect(retrieved.event.id).toBe(valid.id);
   });
 
-  it("rejects an authentic malformed descriptor replacement without falling back", async () => {
+  it("falls back from an authentic malformed replacement to the newest valid descriptor", async () => {
     const { descriptor, signer } = createSignedDescriptorFixture();
     const relay = new MemoryNostrRelay();
-    await signAndPublishCashuEscrowDescriptor(descriptor, signer, relay);
+    const valid = await signAndPublishCashuEscrowDescriptor(descriptor, signer, relay);
     const content = JSON.parse(descriptor.event.content) as Record<string, unknown>;
     const malformedReplacement = await signer.sign({
       ...descriptor.event,
@@ -232,9 +232,9 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     });
     relay.published.push(malformedReplacement);
 
-    await expect(
-      retrieveCashuEscrowDescriptor(descriptor.address, relay),
-    ).rejects.toMatchObject({ code: "invalid_descriptor" });
+    await expect(retrieveCashuEscrowDescriptor(descriptor.address, relay)).resolves.toMatchObject({
+      event: { id: valid.id },
+    });
   });
 
   it("skips malformed unrelated relay events and still resolves the valid descriptor", async () => {

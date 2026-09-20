@@ -220,19 +220,24 @@ export async function retrieveCashuEscrowDescriptor(
     const timestampOrder = right.created_at - left.created_at;
     return timestampOrder === 0 ? left.id.localeCompare(right.id) : timestampOrder;
   });
-  const current = authenticMatches[0];
-
-  try {
-    const descriptor = parseCashuEscrowDescriptorEvent(current);
-    if (descriptor.address !== reference) {
-      throw new Pip01PublicationError(
-        "descriptor_agent_mismatch",
-        "Retrieved PIP-01 descriptor does not match its agent reference",
-      );
+  let newestParseError: Pip01PublicationError | undefined;
+  for (const current of authenticMatches) {
+    try {
+      const descriptor = parseCashuEscrowDescriptorEvent(current);
+      if (descriptor.address !== reference) {
+        throw new Pip01PublicationError(
+          "descriptor_agent_mismatch",
+          "Retrieved PIP-01 descriptor does not match its agent reference",
+        );
+      }
+      return descriptor;
+    } catch (error) {
+      const mapped =
+        error instanceof Pip01PublicationError
+          ? error
+          : mapDescriptorValidationError(error);
+      newestParseError ??= mapped;
     }
-    return descriptor;
-  } catch (error) {
-    if (error instanceof Pip01PublicationError) throw error;
-    throw mapDescriptorValidationError(error);
   }
+  throw newestParseError ?? new Pip01PublicationError("invalid_descriptor", "PIP-01 descriptor is invalid");
 }

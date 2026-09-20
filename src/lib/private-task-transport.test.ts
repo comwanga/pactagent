@@ -68,8 +68,12 @@ class MemoryNostrRelay implements NostrRelayAdapter {
         Object.entries(filter.tags).every(([name, values]) =>
           event.tags.some((tag) => tag[0] === name && values.includes(tag[1])),
         );
-      return kindMatches && tagMatches;
-    });
+      const timeMatches =
+        (filter.since === undefined || event.created_at >= filter.since) &&
+        (filter.until === undefined || event.created_at <= filter.until);
+      return kindMatches && tagMatches && timeMatches;
+    }).sort((left, right) => right.created_at - left.created_at)
+      .slice(0, filter.limit);
   }
 }
 
@@ -461,6 +465,40 @@ describe("Private task transport (NIP-59 Gift Wrap)", () => {
 
       const recovered = await retrieveAndOpenPrivateTask(provider.publicKey, provider, provenance, relay);
       expect(recovered.source_document).toBe(createValidPayload().source_document);
+    });
+
+    it("continues to an older page when the newest wrap window fails provenance", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const attacker = createLocalNostrEncrypter(generateNostrPrivateKeyForEncrypter());
+      const relay = new MemoryNostrRelay();
+      const provenance = taskProvenance(requester, provider);
+      const legitimate = await sealPrivateTask(
+        createValidPayload(),
+        requester,
+        provenance,
+        TEST_TIMESTAMP,
+      );
+      relay.published.push(legitimate.wrapEvent);
+
+      const spamProvenance = {
+        ...provenance,
+        agreementId: "attacker-controlled-agreement",
+        authorizedSender: attacker.publicKey,
+      };
+      const spam = await sealPrivateTask(
+        { ...createValidPayload(), source_document: "spam" },
+        attacker,
+        spamProvenance,
+        TEST_TIMESTAMP + 1,
+      );
+      relay.published.push(...Array.from({ length: 50 }, (_value, index) => ({
+        ...spam.wrapEvent,
+        created_at: TEST_TIMESTAMP + index + 1,
+      })));
+
+      await expect(
+        retrieveAndOpenPrivateTask(provider.publicKey, provider, provenance, relay),
+      ).resolves.toEqual(createValidPayload());
     });
 
     it("an unrelated identity retrieves wraps but cannot open the task", async () => {

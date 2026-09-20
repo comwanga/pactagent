@@ -313,11 +313,13 @@ export async function signPactAgreementTransition(input: {
   readonly history: readonly SignedNostrEvent[];
   readonly transition: PactAgreementTransition;
   readonly signer: NostrSigner;
+  readonly validationTime?: number;
 }): Promise<PactAgreementTransition<SignedNostrEvent>> {
   const transition = validatePactAgreementTransitionCandidate(
     input.context,
     input.history,
     input.transition,
+    input.validationTime,
   );
   assertSignerIdentity(input.signer, transition.event.pubkey);
   let signerResult: SignedNostrEvent;
@@ -344,6 +346,7 @@ export async function publishSignedPactAgreementTransition(input: {
   readonly transition: PactAgreementTransition<SignedNostrEvent>;
   readonly relay: NostrRelayAdapter;
   readonly options?: NostrRelayPublishOptions;
+  readonly validationTime?: number;
 }): Promise<void> {
   const signed = parseSignedNostrEvent(input.transition.event);
   verifySignedNostrEvent(signed);
@@ -351,7 +354,12 @@ export async function publishSignedPactAgreementTransition(input: {
     signed,
     input.context.root.content.capability_profile,
   );
-  validatePactAgreementTransitionCandidate(input.context, input.history, parsed);
+  validatePactAgreementTransitionCandidate(
+    input.context,
+    input.history,
+    parsed,
+    input.validationTime,
+  );
   await publish(signed, input.relay, input.options);
 }
 
@@ -362,6 +370,7 @@ export async function signAndPublishPactAgreementTransition(input: {
   readonly signer: NostrSigner;
   readonly relay: NostrRelayAdapter;
   readonly options?: NostrRelayPublishOptions;
+  readonly validationTime?: number;
 }): Promise<PactAgreementTransition<SignedNostrEvent>> {
   const signed = await signPactAgreementTransition(input);
   await publishSignedPactAgreementTransition({
@@ -370,6 +379,7 @@ export async function signAndPublishPactAgreementTransition(input: {
     transition: signed,
     relay: input.relay,
     options: input.options,
+    validationTime: input.validationTime,
   });
   return signed;
 }

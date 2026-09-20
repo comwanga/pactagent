@@ -101,6 +101,13 @@ export interface PrivateResultMessage extends PrivateMessageBinding {
 
 const ALLOWED_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
 const MAX_DOCUMENT_BYTES = 1_000_000;
+export const PRIVATE_TASK_MAX_PROMPT_BYTES = 64 * 1024;
+export const PRIVATE_RESULT_MAX_SUMMARY_BYTES = 1_000_000;
+export const PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES = 128;
+
+function exceedsUtf8Bytes(value: string, maximumBytes: number): boolean {
+  return Buffer.byteLength(value, "utf8") > maximumBytes;
+}
 
 function assertNoForbiddenMaterial(value: unknown, label: string): void {
   const reason = findForbiddenPublicMaterial(value);
@@ -132,6 +139,12 @@ export function validatePrivateTaskPayload(input: unknown): PrivateTaskPayload {
   if (candidate.private_prompt !== undefined && (typeof candidate.private_prompt !== "string" || candidate.private_prompt.length === 0)) {
     transportError("invalid_payload", "Private task private_prompt must be a non-empty string if present");
   }
+  if (
+    typeof candidate.private_prompt === "string" &&
+    exceedsUtf8Bytes(candidate.private_prompt, PRIVATE_TASK_MAX_PROMPT_BYTES)
+  ) {
+    transportError("payload_too_large", "Private task private_prompt exceeds the maximum prompt size");
+  }
 
   const payload: PrivateTaskPayload = {
     source_document: candidate.source_document as string,
@@ -153,6 +166,12 @@ export function validatePrivateResultPayload(input: unknown): PrivateResultPaylo
   }
   if (typeof candidate.summary !== "string" || (candidate.summary as string).trim().length === 0) {
     transportError("invalid_payload", "Private result summary must be a non-empty string");
+  }
+  if (
+    typeof candidate.summary === "string" &&
+    exceedsUtf8Bytes(candidate.summary, PRIVATE_RESULT_MAX_SUMMARY_BYTES)
+  ) {
+    transportError("payload_too_large", "Private result summary exceeds the maximum result size");
   }
 
   const result: PrivateResultPayload = { summary: candidate.summary as string };
@@ -194,6 +213,9 @@ export function validateProvenance(input: unknown): PrivateTaskProvenance {
     transportError("invalid_payload", "Private task provenance is missing required fields");
   }
   const agreementId = requireNonEmptyString(candidate.agreementId, "agreementId");
+  if (exceedsUtf8Bytes(agreementId, PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES)) {
+    transportError("payload_too_large", "Private task agreementId exceeds the maximum identifier size");
+  }
   const agreementRoot = requireNonEmptyString(candidate.agreementRoot, "agreementRoot");
   if (!/^[0-9a-f]{64}$/.test(agreementRoot)) {
     transportError("invalid_payload", "Private task agreementRoot must be a Nostr event id");

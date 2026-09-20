@@ -51,4 +51,28 @@ describe("local agent discovery and bounded policy", () => {
     });
     expect(result.reasons).toContain("escrow_incompatible");
   });
+
+  it("binds the descriptor timeout to the requester escrow-duration policy", () => {
+    const { requester, provider, offer, escrowDescriptor } = createPactDemoFixtures();
+    const oversizedDescriptor = {
+      ...escrowDescriptor,
+      content: {
+        ...escrowDescriptor.content,
+        dispute_rules: {
+          ...escrowDescriptor.content.dispute_rules,
+          timeout: {
+            ...escrowDescriptor.content.dispute_rules.timeout,
+            duration_seconds: requester.policy.maximumEscrowDurationSeconds + 1,
+          },
+        },
+      },
+    };
+    const result = evaluateServiceOffer({
+      requester,
+      provider,
+      offer,
+      escrowDescriptor: oversizedDescriptor,
+    });
+    expect(result.reasons).toContain("requester_escrow_duration_exceeded");
+  });
 });

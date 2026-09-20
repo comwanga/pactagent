@@ -31,6 +31,9 @@ export const PACT_TERMS_COMMITMENT_SCHEME = "sha256-salted-canonical-json-v1";
 export const DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES = 1_000_000;
 export const DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS = 5 * 60;
 export const DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
+/** Longest acyclic document-summary@1 path from proposed to a terminal state. */
+export const PACT_AGREEMENT_MAX_TRANSITIONS = 8;
+export const PACT_AGREEMENT_CLOCK_SKEW_SECONDS = 60;
 
 export type PactCapabilityProfileId = typeof DOCUMENT_SUMMARY_PROFILE_ID;
 export type PactTermsCommitmentScheme = typeof PACT_TERMS_COMMITMENT_SCHEME;
@@ -217,7 +220,7 @@ const DOCUMENT_SUMMARY_TRANSITIONS: Readonly<
   task_delivered: ["result_submitted"],
   result_submitted: ["result_verified", "rejected"],
   result_verified: ["release_authorized"],
-  release_authorized: ["settled"],
+  release_authorized: ["settled", "refund_authorized"],
   rejected: ["refund_authorized"],
   refund_authorized: ["refunded"],
   settled: [],
@@ -1197,12 +1200,11 @@ function validatedSignedTransitions(
   readonly transitions: readonly PactAgreementTransition<SignedNostrEvent>[];
   readonly duplicateEventIds: readonly string[];
 } {
-  const unique = new Map<string, PactAgreementTransition<SignedNostrEvent>>();
+  const parsedById = new Map<string, SignedNostrEvent>();
   const serialized = new Map<string, string>();
   const duplicates = new Set<string>();
   for (const value of events) {
     const signed = parseSignedNostrEvent(value);
-    verifySignedNostrEvent(signed);
     const wire = JSON.stringify(signed);
     const prior = serialized.get(signed.id);
     if (prior !== undefined) {
@@ -1212,6 +1214,19 @@ function validatedSignedTransitions(
       duplicates.add(signed.id);
       continue;
     }
+    serialized.set(signed.id, wire);
+    parsedById.set(signed.id, signed);
+  }
+  if (parsedById.size > PACT_AGREEMENT_MAX_TRANSITIONS) {
+    agreementError(
+      "malformed_event",
+      `PactAgent history exceeds ${PACT_AGREEMENT_MAX_TRANSITIONS} unique transitions`,
+    );
+  }
+
+  const unique = new Map<string, PactAgreementTransition<SignedNostrEvent>>();
+  for (const signed of parsedById.values()) {
+    verifySignedNostrEvent(signed);
     const transition = parsePactAgreementTransitionEvent(
       signed,
       context.root.content.capability_profile,
@@ -1223,7 +1238,6 @@ function validatedSignedTransitions(
       agreementError("invalid_reference", "PactAgent transition references another agreement");
     }
     validateTransitionAuthorization(transition, context);
-    serialized.set(signed.id, wire);
     unique.set(signed.id, transition);
   }
   return {
@@ -1395,6 +1409,30 @@ export interface CreatePactAgreementTransitionInput {
   readonly reasonCode?: string;
   readonly resultReference?: string;
   readonly createdAt: number;
+  /** Trusted validator time, required for current acceptance/expiry decisions. */
+  readonly validationTime?: number;
+}
+
+function validateCurrentTransitionTime(
+  state: PactAgreementState,
+  createdAt: number,
+  expiresAt: number,
+  validationTime: number | undefined,
+): void {
+  if (state !== "accepted" && state !== "expired") return;
+  if (!Number.isSafeInteger(validationTime) || (validationTime as number) < 0) {
+    agreementError("malformed_event", "Current agreement transition validation requires trusted time");
+  }
+  const now = validationTime as number;
+  if (Math.abs(createdAt - now) > PACT_AGREEMENT_CLOCK_SKEW_SECONDS) {
+    agreementError("invalid_transition", "PactAgent transition timestamp exceeds permitted clock skew");
+  }
+  if (state === "accepted" && now >= expiresAt) {
+    agreementError("invalid_transition", "Expired PactAgent proposal cannot be accepted");
+  }
+  if (state === "expired" && now < expiresAt) {
+    agreementError("invalid_transition", "PactAgent proposal cannot expire before its deadline");
+  }
 }
 
 export function createPactAgreementTransition(
@@ -1412,6 +1450,7 @@ export function createPactAgreementTransition(
       "reasonCode",
       "resultReference",
       "createdAt",
+      "validationTime",
     ],
     "privacy_boundary_violation",
   );
@@ -1483,6 +1522,12 @@ export function createPactAgreementTransition(
     context.root.content.capability_profile,
   );
   validateTransitionAuthorization(transition, context);
+  validateCurrentTransitionTime(
+    transition.content.state,
+    transition.event.created_at,
+    context.root.content.expires_at,
+    input.validationTime,
+  );
   return transition;
 }
 
@@ -1490,6 +1535,7 @@ export function validatePactAgreementTransitionCandidate(
   context: PactAgreementContext,
   historyEvents: readonly SignedNostrEvent[],
   candidate: PactAgreementTransition,
+  validationTime?: number,
 ): PactAgreementTransition {
   const recreated = createPactAgreementTransition({
     context,
@@ -1501,6 +1547,7 @@ export function validatePactAgreementTransitionCandidate(
     reasonCode: candidate.content.reason_code,
     resultReference: candidate.content.result_reference,
     createdAt: candidate.event.created_at,
+    validationTime,
   });
   if (
     serializeUnsignedNostrEvent(recreated.event) !==

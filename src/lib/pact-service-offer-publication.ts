@@ -205,16 +205,21 @@ export async function retrievePactServiceOffer(
     const timestampOrder = right.created_at - left.created_at;
     return timestampOrder === 0 ? left.id.localeCompare(right.id) : timestampOrder;
   });
-  const current = authenticMatches[0];
-
-  try {
-    const offer = parsePactServiceOfferEvent(current);
-    if (offer.address !== reference) {
-      throw new PactServiceOfferPublicationError("address_mismatch", "Retrieved PactAgent service-offer does not match its reference");
+  let newestParseError: PactServiceOfferPublicationError | undefined;
+  for (const current of authenticMatches) {
+    try {
+      const offer = parsePactServiceOfferEvent(current);
+      if (offer.address !== reference) {
+        throw new PactServiceOfferPublicationError("address_mismatch", "Retrieved PactAgent service-offer does not match its reference");
+      }
+      return offer;
+    } catch (error) {
+      const mapped =
+        error instanceof PactServiceOfferPublicationError
+          ? error
+          : mapOfferValidationError(error);
+      newestParseError ??= mapped;
     }
-    return offer;
-  } catch (error) {
-    if (error instanceof PactServiceOfferPublicationError) throw error;
-    throw mapOfferValidationError(error);
   }
+  throw newestParseError ?? new PactServiceOfferPublicationError("invalid_offer", "PactAgent service-offer is invalid");
 }
