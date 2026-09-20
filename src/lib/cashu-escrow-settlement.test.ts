@@ -1486,16 +1486,15 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       earlyRefund.locktime - 1,
       { reasonCode: "timeout" },
     );
-    await expect(
-      earlyRefund.coordinator.submitRefundAuthorization({
-        idempotencyKey: "refund-too-early",
-        escrowReference: earlyFund.funded.escrow.escrowReference,
-        expectedVersion: earlyFund.funded.escrow.version,
-        context: earlyRefund.context,
-        history: earlyRefund.history,
-        basis: "timeout",
-      }),
-    ).rejects.toMatchObject({ code: "timeout_not_reached" });
+    await expect(earlyRefund.coordinator.submitRefundAuthorization({
+      idempotencyKey: "early-refund",
+      escrowReference: earlyFund.funded.escrow.escrowReference,
+      expectedVersion: earlyFund.funded.escrow.version,
+      context: earlyRefund.context,
+      history: earlyRefund.history,
+      basis: "timeout",
+    })).rejects.toMatchObject({ code: "timeout_not_reached" });
+    expect(earlyRefund.cashu.spendSubmissions).toBe(0);
   });
 
   it("does not let clock skew extend release authorization to locktime", async () => {
