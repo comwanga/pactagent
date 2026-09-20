@@ -175,23 +175,6 @@ async function readStoredEscrow(
   return { key: escrowKey, ...stored };
 }
 
-function createWorkingCoordinator(
-  s: ReturnType<typeof buildWorkflow>,
-  workingRelay: MemoryRelay,
-): PactCashuEscrowSettlementCoordinator {
-  return createPactCashuEscrowSettlementCoordinator({
-    mintUrl: MINT_URL,
-    cashu: s.cashu,
-    privateDelivery: s.privateDelivery,
-    store: s.store,
-    escrowAuthoritySigner: s.identities.escrowAuthoritySigner,
-    normalSpendKey: s.dependencies.normalSpendKey,
-    refundSpendKey: s.dependencies.refundSpendKey,
-    relay: workingRelay,
-    clock: s.clock,
-  });
-}
-
 function createTrackingStore(): PactCashuEscrowSettlementStore & { readonly insertedKeys: readonly string[] } {
   const inner = createInMemoryPactCashuEscrowSettlementStore();
   const insertedKeys: string[] = [];
@@ -712,69 +695,82 @@ describe("PactAgent end-to-end workflow integration", () => {
   });
 
   describe("economic retry and publication recovery", () => {
-    it("coordinator retry after publication failure does not repeat Cashu spending", async () => {
+    it("workflow retry after refund publication failure does not repeat Cashu spending", async () => {
       const failingRelay = new FailingPublicationRelay("refunded");
       const trackingStore = createTrackingStore();
       const s = buildWorkflow({ timeout: 300, relay: failingRelay, store: trackingStore });
 
-      await expect(
-        s.workflow.runRefundTransaction({
-          requesterDefinition: s.requesterDefinition,
-          privateDocument: "PRIVATE-DOCUMENT Publication recovery document.",
-          mediaType: "text/plain",
-          maximumBudgetSats: sats(500n),
-          funding: privateFunding(),
-        }),
-      ).rejects.toBeDefined();
+      const report = await s.workflow.runRefundTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Publication recovery document.",
+        mediaType: "text/plain",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+      expect(report.finalOutcome).toBe("refunded");
       expect(s.cashu.spendCalls).toBe(1);
 
       const rootEvent = findRootEvent(s.relay);
       expect(rootEvent).toBeDefined();
 
-      const context = await reconstructContextFromRelay(
-        s.relay,
-        rootEvent!.id,
-        s.identities.escrowAuthoritySigner.publicKey,
-        s.identities.providerSigner,
-      );
+      const context = s.workflow.currentContext!;
       const history = buildHistoryFromRelay(s.relay, context);
       expect(history.status).toBe("ok");
-      expect(history.currentState).toBe("refund_authorized");
+      expect(history.currentState).toBe("refunded");
 
       const storedEscrow = await readStoredEscrow(s.store, trackingStore);
-      expect(storedEscrow.state).toBe("refund_confirmed");
-
-      const workingRelay = new MemoryRelay();
-      workingRelay.events.push(...s.relay.events);
-
-      const coordinator = createWorkingCoordinator(s, workingRelay);
-
-      const refunded = await coordinator.refundEscrow({
-        idempotencyKey: "wf-refund-escrow-retry",
-        escrowReference: storedEscrow.reference,
-        expectedVersion: storedEscrow.revision,
-        context,
-        history: history.transitions.map((t) => t.event),
-      });
-      expect(refunded.outcome).toBe("confirmed");
-      expect(s.cashu.spendCalls).toBe(1);
+      expect(storedEscrow.state).toBe("refunded");
     }, 30_000);
 
-    it("coordinator retry after settlement publication failure does not repeat Cashu spending", async () => {
+    it("rejects overlapping runs before shared workflow state can be reset", async () => {
+      const s = buildWorkflow();
+      let signalEntered!: () => void;
+      let releaseModel!: () => void;
+      const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+      const modelRelease = new Promise<void>((resolve) => { releaseModel = resolve; });
+      const gatedModel: RequesterDecisionModel = {
+        async recommend(): Promise<unknown> {
+          signalEntered();
+          await modelRelease;
+          return s.recommendation;
+        },
+      };
+      const workflow = createPactAgentWorkflow({
+        identities: s.identities,
+        dependencies: { ...s.dependencies, decisionModel: gatedModel },
+      });
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Concurrent workflow document.",
+        mediaType: "text/plain" as const,
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      };
+
+      const first = workflow.runSuccessfulTransaction(input);
+      await entered;
+      await expect(workflow.runRefundTransaction(input)).rejects.toMatchObject({
+        code: "unexpected_state",
+        message: "A PactAgent workflow run is already active",
+      });
+      releaseModel();
+      await expect(first).resolves.toMatchObject({ finalOutcome: "settled" });
+    }, 30_000);
+
+    it("workflow retry after settlement publication failure does not repeat Cashu spending", async () => {
       const failingRelay = new FailingPublicationRelay("settled-only");
       const trackingStore = createTrackingStore();
       const s = buildWorkflow({ relay: failingRelay, store: trackingStore });
 
-      await expect(
-        s.workflow.runSuccessfulTransaction({
-          requesterDefinition: s.requesterDefinition,
-          privateDocument: "PRIVATE-DOCUMENT Settlement publication recovery document.",
-          mediaType: "text/plain",
-          privatePrompt: "PRIVATE-PROMPT Settlement recovery.",
-          maximumBudgetSats: sats(500n),
-          funding: privateFunding(),
-        }),
-      ).rejects.toBeInstanceOf(PactAgentWorkflowError);
+      const report = await s.workflow.runSuccessfulTransaction({
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Settlement publication recovery document.",
+        mediaType: "text/plain",
+        privatePrompt: "PRIVATE-PROMPT Settlement recovery.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      });
+      expect(report.finalOutcome).toBe("settled");
       expect(s.cashu.spendCalls).toBe(1);
 
       const rootEvent = findRootEvent(s.relay);
@@ -784,27 +780,12 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(context).toBeDefined();
       const history = buildHistoryFromRelay(s.relay, context!);
       expect(history.status).toBe("ok");
-      expect(history.currentState).toBe("release_authorized");
+      expect(history.currentState).toBe("settled");
 
       const storedEscrow = await readStoredEscrow(s.store, trackingStore);
-      expect(storedEscrow.state).toBe("release_confirmed");
+      expect(storedEscrow.state).toBe("settled");
 
-      const workingRelay = new MemoryRelay();
-      workingRelay.events.push(...s.relay.events);
-
-      const coordinator = createWorkingCoordinator(s, workingRelay);
-
-      const settled = await coordinator.releaseEscrow({
-        idempotencyKey: "wf-release-escrow-retry",
-        escrowReference: storedEscrow.reference,
-        expectedVersion: storedEscrow.revision,
-        context: context!,
-        history: history.transitions.map((t) => t.event),
-      });
-      expect(settled.outcome).toBe("confirmed");
-      expect(s.cashu.spendCalls).toBe(1);
-
-      const settledEvent = workingRelay.events.find(
+      const settledEvent = s.relay.events.find(
         (e) =>
           e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
           e.tags.some((t) => t[0] === "t" && t[1] === "settled"),

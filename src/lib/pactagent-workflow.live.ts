@@ -1,7 +1,9 @@
 import { getDecodedToken } from "@cashu/cashu-ts";
+import { join, resolve } from "node:path";
 
 import {
   createPactAgentWorkflow,
+  PactAgentWorkflowError,
   type PactAgentParticipantIdentities,
   type PactAgentWorkflow,
   type PactAgentWorkflowDependencies,
@@ -14,12 +16,13 @@ import {
   createCashuPrivateFundingSource,
   createCashuTestMintAdapter,
   createCashuPrivateValueDelivery,
-  createInMemoryCashuPrivateStore,
   createPrivateCashuProofImport,
   createPrivateCashuSpendingKey,
+  createSqliteCashuPrivateStore,
+  type CashuTestMintPort,
 } from "./cashu-test-mint";
 import {
-  createInMemoryPactCashuEscrowSettlementStore,
+  createSqlitePactCashuEscrowSettlementStore,
 } from "./cashu-escrow-settlement";
 import { createNostrIdentity } from "../domain/nostr";
 import { sats, type Sats } from "../domain/money";
@@ -73,6 +76,7 @@ export interface PactAgentLiveDemoConfig {
   readonly normalSpendKeyHex: string;
   readonly refundSpendKeyHex: string;
   readonly fundingToken: string;
+  readonly stateDirectory: string;
 }
 
 export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined {
@@ -84,6 +88,7 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
   const normalSpendKeyHex = process.env.PACTAGENT_LIVE_NORMAL_SPEND_KEY;
   const refundSpendKeyHex = process.env.PACTAGENT_LIVE_REFUND_SPEND_KEY;
   const fundingToken = process.env.PACTAGENT_LIVE_FUNDING_TOKEN;
+  const stateDirectory = process.env.PACTAGENT_LIVE_STATE_DIRECTORY;
 
   if (
     !relayUrl ||
@@ -93,7 +98,8 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     !escrowAuthorityPrivateKeyHex ||
     !normalSpendKeyHex ||
     !refundSpendKeyHex ||
-    !fundingToken
+    !fundingToken ||
+    !stateDirectory
   ) {
     return undefined;
   }
@@ -107,6 +113,7 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     normalSpendKeyHex,
     refundSpendKeyHex,
     fundingToken,
+    stateDirectory,
   };
 }
 
@@ -117,7 +124,7 @@ export function assertLiveDemoConfig(config: PactAgentLiveDemoConfig | undefined
         "PACTAGENT_CASHU_TEST_MINT_URL, PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY, " +
         "PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY, PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY, " +
         "PACTAGENT_LIVE_NORMAL_SPEND_KEY, PACTAGENT_LIVE_REFUND_SPEND_KEY, and " +
-        "PACTAGENT_LIVE_FUNDING_TOKEN. " +
+        "PACTAGENT_LIVE_FUNDING_TOKEN, and PACTAGENT_LIVE_STATE_DIRECTORY. " +
         "Missing configuration causes a clean skip — never a fallback to production.",
     );
   }
@@ -127,6 +134,8 @@ export function assertLiveDemoConfig(config: PactAgentLiveDemoConfig | undefined
 export interface LiveDemoWorkflow {
   readonly workflow: PactAgentWorkflow;
   readonly relay: WebSocketNostrRelayAdapter;
+  readonly cashu: CashuTestMintPort;
+  readonly close: () => void;
 }
 
 export function createLiveDemoWorkflow(
@@ -146,7 +155,13 @@ export function createLiveDemoWorkflow(
     providerEncrypter: createLocalNostrEncrypter(config.providerPrivateKeyHex),
   };
 
-  const cashuPrivateStore = createInMemoryCashuPrivateStore();
+  const stateDirectory = resolve(config.stateDirectory);
+  const cashuPrivateStore = createSqliteCashuPrivateStore(
+    join(stateDirectory, "cashu-private.sqlite"),
+  );
+  const settlementStore = createSqlitePactCashuEscrowSettlementStore(
+    join(stateDirectory, "escrow-settlement.sqlite"),
+  );
   const cashu = createCashuTestMintAdapter({
     configuration: {
       testMintUrl: config.testMintUrl,
@@ -201,13 +216,21 @@ export function createLiveDemoWorkflow(
     decisionBounds,
     cashu,
     privateDelivery,
-    settlementStore: createInMemoryPactCashuEscrowSettlementStore(),
+    settlementStore,
     mintUrl: config.testMintUrl,
     normalSpendKey,
     refundSpendKey,
   };
 
-  return { workflow: createPactAgentWorkflow({ identities, dependencies }), relay };
+  return {
+    workflow: createPactAgentWorkflow({ identities, dependencies }),
+    relay,
+    cashu,
+    close() {
+      settlementStore.close();
+      cashuPrivateStore.close();
+    },
+  };
 }
 
 export interface RunLiveDemoTransactionInput {
@@ -297,42 +320,39 @@ export function createLiveDemoRequesterDefinition(
 
 export async function importLiveDemoFunding(
   config: PactAgentLiveDemoConfig,
+  cashu: CashuTestMintPort,
 ): Promise<import("./cashu-test-mint").PrivateCashuFunding> {
-  const cashu = createCashuTestMintAdapter({
-    configuration: {
-      testMintUrl: config.testMintUrl,
-      unit: "sat",
-      maximumExposureSats: sats(400n),
-      requestTimeoutMs: 10_000,
-      maximumResponseBytes: 500_000,
-    },
-    privateStore: createInMemoryCashuPrivateStore(),
-  });
+  try {
+    const capabilities = await cashu.inspectCapabilities();
+    const decoded = getDecodedToken(config.fundingToken, capabilities.acceptedKeysetIds);
+    if (decoded.unit !== undefined && decoded.unit !== "sat") {
+      throw new Error("invalid token unit");
+    }
 
-  const capabilities = await cashu.inspectCapabilities();
-  const decoded = getDecodedToken(config.fundingToken, capabilities.acceptedKeysetIds);
-  if (decoded.unit !== undefined && decoded.unit !== "sat") {
-    throw new Error("Live demonstration funding token must use sat unit");
+    const source = createCashuPrivateFundingSource({
+      configuration: {
+        testMintUrl: config.testMintUrl,
+        unit: "sat",
+        maximumExposureSats: sats(400n),
+        requestTimeoutMs: 10_000,
+        maximumResponseBytes: 500_000,
+      },
+      cashu,
+    });
+
+    const imported = createPrivateCashuProofImport({
+      mintUrl: decoded.mint,
+      unit: "sat",
+      proofs: decoded.proofs,
+    });
+
+    return await source.importFunding(imported);
+  } catch {
+    throw new PactAgentWorkflowError(
+      "invalid_configuration",
+      "Live demonstration funding token is invalid or unusable",
+    );
   }
-
-  const source = createCashuPrivateFundingSource({
-    configuration: {
-      testMintUrl: config.testMintUrl,
-      unit: "sat",
-      maximumExposureSats: sats(400n),
-      requestTimeoutMs: 10_000,
-      maximumResponseBytes: 500_000,
-    },
-    cashu,
-  });
-
-  const imported = createPrivateCashuProofImport({
-    mintUrl: decoded.mint,
-    unit: "sat",
-    proofs: decoded.proofs,
-  });
-
-  return source.importFunding(imported);
 }
 
 export function createLiveDemoApprovalDecisionModel(): RequesterDecisionModel {
@@ -359,7 +379,7 @@ export async function runLiveDemoTransaction(
   config: PactAgentLiveDemoConfig,
   input: RunLiveDemoTransactionInput,
 ): Promise<PactAgentWorkflowReport> {
-  const { workflow, relay } = createLiveDemoWorkflow(
+  const { workflow, relay, cashu, close } = createLiveDemoWorkflow(
     config,
     createLiveDemoApprovalDecisionModel(),
   );
@@ -375,7 +395,7 @@ export async function runLiveDemoTransaction(
     );
     const requesterSigner = createLocalNostrSigner(config.requesterPrivateKeyHex);
     const signedRequesterDefinition = await requesterSigner.sign(requesterDefinition.event);
-    const funding = await importLiveDemoFunding(config);
+    const funding = await importLiveDemoFunding(config, cashu);
 
     return await workflow.runSuccessfulTransaction({
       requesterDefinition: signedRequesterDefinition,
@@ -386,6 +406,10 @@ export async function runLiveDemoTransaction(
       funding,
     });
   } finally {
-    await relay.disconnect();
+    try {
+      await relay.disconnect();
+    } finally {
+      close();
+    }
   }
 }

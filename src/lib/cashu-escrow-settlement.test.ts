@@ -1475,19 +1475,25 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     await expect(before.coordinator.submitReleaseAuthorization({ idempotencyKey: "before-locktime", escrowReference: beforeFund.funded.escrow.escrowReference, expectedVersion: beforeFund.funded.escrow.version, context: release.context, history: before.history, resultReference: release.resultReference })).resolves.toMatchObject({ outcome: "confirmed" });
 
     const earlyRefund = setup();
-    await prepareAndFund(earlyRefund);
+    const earlyFund = await prepareAndFund(earlyRefund);
     earlyRefund.clock.value = earlyRefund.locktime - 1;
-    expect(() =>
-      append(
-        earlyRefund.context,
-        earlyRefund.history,
-        "refund_authorized",
-        "requester",
-        earlyRefund.requesterKey,
-        earlyRefund.locktime - 1,
-        { reasonCode: "timeout" },
-      ),
-    ).toThrowError(expect.objectContaining({ code: "timeout_not_reached" }));
+    append(
+      earlyRefund.context,
+      earlyRefund.history,
+      "refund_authorized",
+      "requester",
+      earlyRefund.requesterKey,
+      earlyRefund.locktime - 1,
+      { reasonCode: "timeout" },
+    );
+    await expect(earlyRefund.coordinator.submitRefundAuthorization({
+      idempotencyKey: "early-refund",
+      escrowReference: earlyFund.funded.escrow.escrowReference,
+      expectedVersion: earlyFund.funded.escrow.version,
+      context: earlyRefund.context,
+      history: earlyRefund.history,
+      basis: "timeout",
+    })).rejects.toMatchObject({ code: "timeout_not_reached" });
     expect(earlyRefund.cashu.spendSubmissions).toBe(0);
   });
 
