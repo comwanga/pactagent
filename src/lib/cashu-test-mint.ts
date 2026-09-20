@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -36,6 +36,7 @@ export const CASHU_TEST_MINT_UNIT = "sat";
 export const CASHU_TEST_MINT_REQUIRED_NUTS = [7, 9, 10, 11] as const;
 export const CASHU_TEST_MINT_DEFAULT_TIMEOUT_MS = 10_000;
 export const CASHU_TEST_MINT_DEFAULT_MAX_RESPONSE_BYTES = 1_000_000;
+export const CASHU_TEST_MINT_MAX_ACTIVE_KEYSETS = 32;
 
 export type CashuTestMintErrorCode =
   | "invalid_mint_configuration"
@@ -282,8 +283,16 @@ export function isPrivateCashuSpendingKey(value: unknown): value is PrivateCashu
   return value instanceof PrivateCashuSpendingKey && privateSpendingKeys.has(value);
 }
 
-function randomPrivateReference(prefix: string): string {
-  return `${prefix}_${randomUUID()}`;
+function operationPrivateReference(
+  prefix: string,
+  operationId: string,
+  purpose: "value" | "change",
+): string {
+  const digest = createHash("sha256")
+    .update(`${operationId}:${purpose}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `${prefix}_${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20)}`;
 }
 
 function bytesToHex(value: Uint8Array): string {
@@ -640,6 +649,14 @@ function privateStoreFailure(): never {
   cashuError("operation_rejected", "Private Cashu storage is unavailable");
 }
 
+function privateStoreOwnershipFailure(): never {
+  cashuError(
+    "reconciliation_required",
+    "Private Cashu lock ownership was lost before commit",
+    "submitted_unknown",
+  );
+}
+
 function privateStoreIdentifier(value: string): string {
   if (!/^[A-Za-z0-9:/._-]{1,512}$/.test(value)) privateStoreFailure();
   return value;
@@ -663,6 +680,12 @@ function parsePrivateStoreValue(value: string): unknown {
 
 function waitForPrivateStore(milliseconds: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+function restrictPrivateStoreFiles(databasePath: string): void {
+  for (const candidate of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    if (existsSync(candidate)) chmodSync(candidate, 0o600);
+  }
 }
 
 /**
@@ -695,7 +718,7 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
         expires_at_ms INTEGER NOT NULL
       );
     `);
-    chmodSync(resolvedPath, 0o600);
+    restrictPrivateStoreFiles(resolvedPath);
   } catch {
     return privateStoreFailure();
   }
@@ -722,13 +745,21 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
   const releaseStatement = database.prepare(
     "DELETE FROM pact_cashu_private_locks WHERE lock_key = ? AND owner = ?",
   );
+  type ActiveLease = {
+    readonly assertOwned: () => void;
+    readonly release: () => void;
+  };
+  const activeLeasesByScope = new Map<string, Set<ActiveLease>>();
   let closed = false;
 
   function ensureOpen(): void {
     if (closed) privateStoreFailure();
   }
 
-  async function acquire(lockKey: string): Promise<() => void> {
+  async function acquire(lockKey: string): Promise<{
+    readonly assertOwned: () => void;
+    readonly release: () => void;
+  }> {
     const owner = randomUUID();
     const deadline = Date.now() + PRIVATE_STORE_LOCK_WAIT_MILLISECONDS;
     while (Date.now() <= deadline) {
@@ -742,25 +773,43 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
           now,
         );
         if (result.changes === 1) {
+          let ownershipLost = false;
           const heartbeat = setInterval(() => {
             try {
-              heartbeatStatement.run(
+              const renewed = heartbeatStatement.run(
                 Date.now() + PRIVATE_STORE_LOCK_LEASE_MILLISECONDS,
                 lockKey,
                 owner,
               );
+              if (renewed.changes !== 1) ownershipLost = true;
             } catch {
-              // The following private-store operation still fails closed.
+              ownershipLost = true;
             }
           }, PRIVATE_STORE_LOCK_HEARTBEAT_MILLISECONDS);
           heartbeat.unref();
-          return () => {
-            clearInterval(heartbeat);
-            try {
-              releaseStatement.run(lockKey, owner);
-            } catch {
-              // The bounded lease releases an abandoned lock.
-            }
+          return {
+            assertOwned(): void {
+              if (ownershipLost) privateStoreOwnershipFailure();
+              try {
+                const renewed = heartbeatStatement.run(
+                  Date.now() + PRIVATE_STORE_LOCK_LEASE_MILLISECONDS,
+                  lockKey,
+                  owner,
+                );
+                if (renewed.changes !== 1) privateStoreOwnershipFailure();
+              } catch (error) {
+                if (error instanceof CashuTestMintError) throw error;
+                privateStoreOwnershipFailure();
+              }
+            },
+            release(): void {
+              clearInterval(heartbeat);
+              try {
+                releaseStatement.run(lockKey, owner);
+              } catch {
+                // The bounded lease releases an abandoned lock.
+              }
+            },
           };
         }
       } catch {
@@ -787,13 +836,18 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
     },
     async write(scope: string, key: string, value: unknown): Promise<void> {
       ensureOpen();
+      const normalizedScope = privateStoreIdentifier(scope);
       const serialized = serializePrivateStoreValue(value);
       try {
+        for (const lease of activeLeasesByScope.get(normalizedScope) ?? []) {
+          lease.assertOwned();
+        }
         writeStatement.run(
-          privateStoreIdentifier(scope),
+          normalizedScope,
           privateStoreIdentifier(key),
           serialized,
         );
+        restrictPrivateStoreFiles(resolvedPath);
       } catch (error) {
         if (error instanceof CashuTestMintError) throw error;
         return privateStoreFailure();
@@ -805,13 +859,21 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
       operation: () => Promise<T>,
     ): Promise<T> {
       ensureOpen();
-      const release = await acquire(
+      const normalizedScope = privateStoreIdentifier(scope);
+      const lease = await acquire(
         privateStoreIdentifier(`${scope}:${key}`),
       );
+      const activeLeases = activeLeasesByScope.get(normalizedScope) ?? new Set<ActiveLease>();
+      activeLeases.add(lease);
+      activeLeasesByScope.set(normalizedScope, activeLeases);
       try {
-        return await operation();
+        const value = await operation();
+        lease.assertOwned();
+        return value;
       } finally {
-        release();
+        activeLeases.delete(lease);
+        if (activeLeases.size === 0) activeLeasesByScope.delete(normalizedScope);
+        lease.release();
       }
     },
     close(): void {
@@ -848,6 +910,8 @@ export interface CashuPrivatePreparedSwap {
   readonly kind: "lock" | "spend";
   readonly inputProofs: readonly Proof[];
   readonly requestedAmountSats: bigint;
+  /** Actual bearer-proof value exposed by the swap outputs. */
+  readonly exposureAmountSats: bigint;
   readonly opaque: unknown;
 }
 
@@ -916,6 +980,7 @@ interface PrivateValueRecord {
   readonly amountSats: bigint;
   readonly allowedPublicKeys: readonly string[];
   readonly exposureOperationId?: string;
+  readonly consumedByOperationId?: string;
 }
 
 interface StoredOperation {
@@ -954,8 +1019,8 @@ function parsePrivateValueRecord(value: unknown): PrivateValueRecord {
     typeof value.amountSats !== "string" ||
     !Array.isArray(value.allowedPublicKeys) ||
     !value.allowedPublicKeys.every((item) => typeof item === "string") ||
-    (value.exposureOperationId !== undefined &&
-      typeof value.exposureOperationId !== "string")
+    (value.exposureOperationId !== undefined && typeof value.exposureOperationId !== "string") ||
+    (value.consumedByOperationId !== undefined && typeof value.consumedByOperationId !== "string")
   ) {
     cashuError("operation_rejected", "Private Cashu value storage is malformed");
   }
@@ -971,6 +1036,9 @@ function parsePrivateValueRecord(value: unknown): PrivateValueRecord {
     ...(value.exposureOperationId === undefined
       ? {}
       : { exposureOperationId: validateOperationId(value.exposureOperationId as string) }),
+    ...(value.consumedByOperationId === undefined
+      ? {}
+      : { consumedByOperationId: validateOperationId(value.consumedByOperationId as string) }),
   });
 }
 
@@ -983,6 +1051,9 @@ function serializePrivateValueRecord(value: PrivateValueRecord): Readonly<Record
     ...(value.exposureOperationId === undefined
       ? {}
       : { exposureOperationId: value.exposureOperationId }),
+    ...(value.consumedByOperationId === undefined
+      ? {}
+      : { consumedByOperationId: value.consumedByOperationId }),
   });
 }
 
@@ -993,6 +1064,7 @@ function parsePreparedSwap(value: unknown): CashuPrivatePreparedSwap | undefined
     (value.kind !== "lock" && value.kind !== "spend") ||
     !Array.isArray(value.inputProofs) ||
     typeof value.requestedAmountSats !== "string" ||
+    (value.exposureAmountSats !== undefined && typeof value.exposureAmountSats !== "string") ||
     !("opaque" in value)
   ) {
     cashuError("operation_rejected", "Private Cashu operation storage is malformed");
@@ -1001,6 +1073,10 @@ function parsePreparedSwap(value: unknown): CashuPrivatePreparedSwap | undefined
     kind: value.kind,
     inputProofs: parseProofs(value.inputProofs as string[]),
     requestedAmountSats: amountToBigInt(value.requestedAmountSats),
+    exposureAmountSats:
+      value.exposureAmountSats === undefined
+        ? amountToBigInt(value.requestedAmountSats)
+        : amountToBigInt(value.exposureAmountSats),
     opaque: value.opaque,
   });
 }
@@ -1013,6 +1089,7 @@ function serializePreparedSwap(
     kind: value.kind,
     inputProofs: serializeProofs([...value.inputProofs]),
     requestedAmountSats: value.requestedAmountSats.toString(),
+    exposureAmountSats: value.exposureAmountSats.toString(),
     opaque: value.opaque,
   });
 }
@@ -1374,6 +1451,12 @@ export function createCashuPrivateValueDelivery(input: {
             });
           }
           const value = await readPrivateValue(configuration, input.privateStore, handle);
+          if (value.consumedByOperationId !== undefined) {
+            cashuError(
+              "operation_rejected",
+              "Spent Cashu value cannot be delivered",
+            );
+          }
           if (value.allowedPublicKeys.length !== 0) {
             cashuError(
               "operation_rejected",
@@ -1619,17 +1702,17 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         }
         const ledger = parseExposureLedger(stored);
         const existing = ledger.reservations[operationId];
-        if (existing && amountToBigInt(existing.amountSats) !== amountSats) {
+        if (
+          existing &&
+          nextStatus !== "released" &&
+          amountToBigInt(existing.amountSats) !== amountSats
+        ) {
           cashuError("operation_rejected", "Cashu exposure operation was reused");
         }
-        if (
-          nextStatus === "reserved" &&
-          existing?.status !== "reserved" &&
-          existing?.status !== "locked"
-        ) {
+        if (nextStatus === "reserved" && existing?.status !== "locked") {
           const activeExposure = Object.values(ledger.reservations).reduce(
             (total, reservation) =>
-              reservation.status === "released"
+              reservation.status === "released" || reservation === existing
                 ? total
                 : total + amountToBigInt(reservation.amountSats),
             0n,
@@ -1770,7 +1853,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         });
         throw error;
       }
-      await this.updateExposure(operationId, input.amountSats, "reserved");
       let prepared: CashuPrivatePreparedSwap;
       try {
         prepared = await this.backend.prepareLock({
@@ -1779,7 +1861,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           options: condition.options,
         });
       } catch (error) {
-        await this.updateExposure(operationId, input.amountSats, "released");
         const normalized =
           error instanceof CashuPrivateBackendError
             ? mapBackendError(error, operationId)
@@ -1798,6 +1879,26 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         });
         throw normalized;
       }
+      if (
+        prepared.kind !== "lock" ||
+        prepared.requestedAmountSats !== input.amountSats ||
+        prepared.exposureAmountSats < prepared.requestedAmountSats
+      ) {
+        const error = new CashuTestMintError(
+          "operation_rejected",
+          "Cashu locked-value preparation returned inconsistent accounting",
+          "not_submitted",
+          operationId,
+        );
+        await this.writeOperation(operationId, {
+          fingerprint,
+          kind: "lock",
+          status: "not_submitted",
+          errorCode: error.code,
+          allowedPublicKeys: condition.allowedPublicKeys,
+        });
+        throw error;
+      }
       try {
         await this.writeOperation(operationId, {
           fingerprint,
@@ -1807,9 +1908,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           allowedPublicKeys: condition.allowedPublicKeys,
         });
       } catch (error) {
-        await this.updateExposure(operationId, input.amountSats, "released");
         throw error;
       }
+      await this.updateExposure(
+        operationId,
+        prepared.exposureAmountSats,
+        "reserved",
+      );
       return this.submitPrepared(
         operationId,
         fingerprint,
@@ -1840,6 +1945,17 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     });
     return this.runIdempotent(operationId, fingerprint, async () => {
       const value = await this.readValue(input.handle);
+      if (
+        value.consumedByOperationId !== undefined &&
+        value.consumedByOperationId !== operationId
+      ) {
+        cashuError(
+          "operation_rejected",
+          "Private Cashu value was already consumed",
+          "failed_definitively",
+          operationId,
+        );
+      }
       if (!value.allowedPublicKeys.includes(input.spendingKey.publicKey)) {
         cashuError(
           "invalid_spending_condition",
@@ -1857,7 +1973,11 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           existing.status !== "not_submitted" ||
           existing.prepared !== undefined)
       ) {
-        return this.resumeExisting(operationId, fingerprint, existing);
+        const resumed = await this.resumeExisting(operationId, fingerprint, existing);
+        if (resumed.status === "succeeded") {
+          await this.markValueConsumed(input.handle, value, operationId);
+        }
+        return resumed;
       }
       let prepared: CashuPrivatePreparedSwap;
       try {
@@ -1894,7 +2014,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         allowedPublicKeys: [],
         spentExposureOperationId: value.exposureOperationId,
       });
-      return this.submitPrepared(
+      const result = await this.submitPrepared(
         operationId,
         fingerprint,
         "spend",
@@ -1902,7 +2022,32 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         [],
         value.exposureOperationId,
       );
+      if (result.status === "succeeded") {
+        await this.markValueConsumed(input.handle, value, operationId);
+      }
+      return result;
     });
+  }
+
+  private async markValueConsumed(
+    handle: CashuPrivateHandle,
+    value: PrivateValueRecord,
+    operationId: string,
+  ): Promise<void> {
+    if (value.consumedByOperationId === operationId) return;
+    try {
+      await this.writeValue(handle.reference, {
+        ...value,
+        consumedByOperationId: operationId,
+      });
+    } catch {
+      cashuError(
+        "reconciliation_required",
+        "Cashu spend completion requires reconciliation",
+        "submitted_unknown",
+        operationId,
+      );
+    }
   }
 
   private async resumeExisting(
@@ -1945,6 +2090,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     }
     // A prior not-submitted attempt can be prepared and submitted again safely.
     if (existing.prepared) {
+      if (existing.kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          existing.prepared.exposureAmountSats,
+          "reserved",
+        );
+      }
       return this.submitPrepared(
         operationId,
         existing.fingerprint,
@@ -2013,7 +2165,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         fingerprint,
         kind,
         status: error.submissionStatus,
-        prepared,
         errorCode: normalized.code,
         allowedPublicKeys,
         spentExposureOperationId,
@@ -2021,7 +2172,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       if (kind === "lock") {
         await this.updateExposure(
           operationId,
-          prepared.requestedAmountSats,
+          prepared.exposureAmountSats,
           "released",
         );
       }
@@ -2035,6 +2186,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
   ): Promise<CashuMutationResult> {
     const prepared = operation.prepared;
     if (!prepared) return reconciliationRequired(operationId);
+    let restored: CashuPrivateSwapResult | undefined;
     try {
       const states = await this.backend.inspectProofStates(prepared.inputProofs);
       if (
@@ -2044,20 +2196,48 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       ) {
         return reconciliationRequired(operationId);
       }
-      const restored = await this.backend.restore(prepared);
-      if (!restored) return reconciliationRequired(operationId);
-      return this.completeSuccessfulOperation(
-        operationId,
-        operation.fingerprint,
-        operation.kind,
-        prepared,
-        operation.allowedPublicKeys,
-        restored,
-        operation.spentExposureOperationId,
-      );
+      restored = await this.backend.restore(prepared);
     } catch {
       return reconciliationRequired(operationId);
     }
+    if (!restored) {
+      await this.writeOperation(operationId, {
+        fingerprint: operation.fingerprint,
+        kind: operation.kind,
+        status: "failed_definitively",
+        errorCode: "proof_already_spent",
+        allowedPublicKeys: operation.allowedPublicKeys,
+        spentExposureOperationId: operation.spentExposureOperationId,
+      });
+      if (operation.kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          prepared.exposureAmountSats,
+          "released",
+        );
+      } else if (operation.spentExposureOperationId !== undefined) {
+        await this.updateExposure(
+          operation.spentExposureOperationId,
+          prepared.requestedAmountSats,
+          "released",
+        );
+      }
+      cashuError(
+        "proof_already_spent",
+        "Cashu inputs were spent by another operation",
+        "failed_definitively",
+        operationId,
+      );
+    }
+    return this.completeSuccessfulOperation(
+      operationId,
+      operation.fingerprint,
+      operation.kind,
+      prepared,
+      operation.allowedPublicKeys,
+      restored,
+      operation.spentExposureOperationId,
+    );
   }
 
   private async completeSuccessfulOperation(
@@ -2075,10 +2255,12 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     const mintFee = inputAmount - outputAmount - changeAmount;
     const reservedSpendFee =
       kind === "lock" ? outputAmount - prepared.requestedAmountSats : 0n;
+    const exposureAmount = prepared.exposureAmountSats;
     if (
       result.sendProofs.length === 0 ||
       inputAmount < 1n ||
       outputAmount < prepared.requestedAmountSats ||
+      (kind === "lock" && outputAmount !== exposureAmount) ||
       (kind === "spend" && outputAmount !== prepared.requestedAmountSats) ||
       mintFee < 0n ||
       reservedSpendFee < 0n
@@ -2091,7 +2273,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       );
     }
     this.assertProofKeysets([...result.keepProofs, ...result.sendProofs]);
-    const reference = randomPrivateReference("cashu_private");
+    const reference = operationPrivateReference("cashu_private", operationId, "value");
     await this.writeValue(reference, {
       proofs: result.sendProofs,
       amountSats: prepared.requestedAmountSats,
@@ -2100,7 +2282,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     });
     let changeHandle: CashuPrivateHandle | undefined;
     if (result.keepProofs.length > 0) {
-      const changeReference = randomPrivateReference("cashu_private");
+      const changeReference = operationPrivateReference("cashu_private", operationId, "change");
       await this.writeValue(changeReference, {
         proofs: result.keepProofs,
         amountSats: changeAmount,
@@ -2109,7 +2291,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       changeHandle = safeHandle(changeReference);
     }
     if (kind === "lock") {
-      await this.updateExposure(operationId, prepared.requestedAmountSats, "locked");
+      await this.updateExposure(operationId, exposureAmount, "locked");
     } else if (spentExposureOperationId !== undefined) {
       await this.updateExposure(
         spentExposureOperationId,
@@ -2137,7 +2319,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       fingerprint,
       kind,
       status: "succeeded",
-      prepared,
       result: succeeded,
       allowedPublicKeys,
       spentExposureOperationId,
@@ -2389,8 +2570,12 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
         this.mint.getInfo(),
         this.mint.getKeySets(),
       ]);
+      const activeKeysets = keysetResponse.keysets.filter((value) => value.active);
+      if (activeKeysets.length > CASHU_TEST_MINT_MAX_ACTIVE_KEYSETS) {
+        throw new CashuPrivateBackendError("malformed_response", "not_submitted");
+      }
       const keyIdsWithKeys = new Set<string>();
-      for (const keyset of keysetResponse.keysets.filter((value) => value.active)) {
+      for (const keyset of activeKeysets) {
         const response = await this.mint.getKeys(keyset.id);
         const keys = response.keysets.find((value) => value.id === keyset.id);
         if (keys && Keyset.fromMintApi(keyset, keys).verify()) keyIdsWithKeys.add(keyset.id);
@@ -2435,6 +2620,13 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
       kind,
       inputProofs: preview.inputs,
       requestedAmountSats: amountToBigInt(preview.amount),
+      exposureAmountSats:
+        kind === "lock"
+          ? (preview.sendOutputs ?? []).reduce(
+              (total, output) => total + amountToBigInt(output.blindedMessage.amount),
+              0n,
+            )
+          : amountToBigInt(preview.amount),
       opaque: {
         preview: serializeSwapPreview(preview),
         unselectedProofs: serializeProofs(preview.unselectedProofs ?? []),

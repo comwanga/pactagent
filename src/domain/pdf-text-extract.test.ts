@@ -163,6 +163,22 @@ describe("pdf-text-extract", () => {
     expect(result.text).toContain("Actual content stream");
   });
 
+  it("scans many page and stray stream markers with monotonic structural progress", () => {
+    const valid = buildPdf({ lines: ["Bounded structural scan."] });
+    const markerPrefix = Buffer.from(
+      `${"/Type /Page\n".repeat(5_000)}${"not-a-dictionary stream\n".repeat(5_000)}`,
+      "latin1",
+    );
+    const adversarial = Buffer.concat([
+      valid.subarray(0, "%PDF-1.4\n".length),
+      markerPrefix,
+      valid.subarray("%PDF-1.4\n".length),
+    ]);
+    const result = extractPdfText(adversarial);
+    expect(result.text).toContain("Bounded structural scan.");
+    expect(result.pageCount).toBe(5_001);
+  });
+
   it("rejects a stream dictionary without a supported direct /Length", () => {
     const contentText = "BT /F1 12 Tf 72 720 Td (Missing length test) Tj ET";
     const pdf = Buffer.from(

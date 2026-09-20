@@ -360,6 +360,7 @@ function append(
     reasonCode: options.reasonCode,
     resultReference: options.resultReference,
     createdAt,
+    validationTime: createdAt,
   });
   const event = sign(draft.event, secret);
   history.push(event);
@@ -553,6 +554,108 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       },
     });
     expect(JSON.stringify(refunded)).not.toContain("cashu_private_");
+  });
+
+  it("recovers a definitively failed authorized release by timeout refund", async () => {
+    const data = setup();
+    data.cashu.spendModes.push("definitive");
+    const { funded } = await prepareAndFund(data);
+    const release = advanceReleaseHistory(data);
+    const authorized = await data.coordinator.submitReleaseAuthorization({
+      idempotencyKey: "recover-release-auth",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    await expect(data.coordinator.releaseEscrow({
+      idempotencyKey: "recover-release-run",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    })).rejects.toMatchObject({ code: "settlement_conflict" });
+
+    data.clock.value = data.locktime;
+    append(release.context, data.history, "refund_authorized", "requester", data.requesterKey, data.locktime, {
+      reasonCode: "timeout",
+    });
+    const refundAuthorized = await data.coordinator.submitRefundAuthorization({
+      idempotencyKey: "recover-refund-auth",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version + 2,
+      context: release.context,
+      history: data.history,
+      basis: "timeout",
+    });
+    await expect(data.coordinator.refundEscrow({
+      idempotencyKey: "recover-refund-run",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: refundAuthorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    })).resolves.toMatchObject({ outcome: "confirmed", escrow: { state: "refunded" } });
+  });
+
+  it("reconciles an ambiguous authorized release after locktime and never permits refund", async () => {
+    const data = setup();
+    data.cashu.spendModes.push("unknown");
+    const { funded } = await prepareAndFund(data);
+    const release = advanceReleaseHistory(data);
+    const authorized = await data.coordinator.submitReleaseAuthorization({
+      idempotencyKey: "late-reconcile-auth",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    const request = {
+      idempotencyKey: "late-reconcile-run",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    };
+    await expect(data.coordinator.releaseEscrow(request)).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "release_reconciliation_required" },
+    });
+    data.clock.value = data.locktime;
+    await expect(data.coordinator.releaseEscrow(request)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "settled" },
+    });
+    await expect(data.coordinator.submitRefundAuthorization({
+      idempotencyKey: "late-reconcile-refund",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version + 3,
+      context: release.context,
+      history: data.history,
+      basis: "timeout",
+    })).rejects.toMatchObject({ code: "invalid_state" });
+  });
+
+  it("rejects preparation when a positive descriptor timeout has already elapsed", async () => {
+    const data = setup({ fixture: fixture({ timeout: 1 }) });
+    await expect(data.coordinator.prepareEscrow({
+      idempotencyKey: "stale-timeout-prepare",
+      context: data.context,
+      history: data.history,
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(data.cashu.capabilityCalls).toBe(0);
+  });
+
+  it("rejects a backdated acceptance when trusted preparation time is past agreement expiry", async () => {
+    const data = setup();
+    data.clock.value = data.context.root.content.expires_at;
+    await expect(data.coordinator.prepareEscrow({
+      idempotencyKey: "expired-agreement-prepare",
+      context: data.context,
+      history: data.history,
+    })).rejects.toMatchObject({ code: "agreement_mismatch" });
+    expect(data.cashu.capabilityCalls).toBe(0);
   });
 
   it("recovers and idempotently delivers provider payout plus requester change after restart", async () => {
@@ -1009,6 +1112,55 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     await expect(data.coordinator.inspectEscrowStatus(funded.escrow.escrowReference)).resolves.toMatchObject({
       state: "release_authorized",
     });
+    await expect(data.coordinator.releaseEscrow(request)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "settled" },
+    });
+    expect(cashu.spendSubmissions).toBe(1);
+  });
+
+  it("retries the same economic operation after the post-mutation CAS loses", async () => {
+    const base = createInMemoryPactCashuEscrowSettlementStore();
+    let failConfirmedWrite = true;
+    const store: PactCashuEscrowSettlementStore = {
+      read: (key) => base.read(key),
+      insert: (key, value) => base.insert(key, value),
+      compareAndSet(key, expectedRevision, value) {
+        if (
+          failConfirmedWrite &&
+          (value as { state?: unknown }).state === "release_confirmed"
+        ) {
+          failConfirmedWrite = false;
+          return Promise.resolve(false);
+        }
+        return base.compareAndSet(key, expectedRevision, value);
+      },
+      withExclusiveLock: (key, operation) => base.withExclusiveLock(key, operation),
+    };
+    const cashu = new FakeCashuPort();
+    const data = setup({ cashu, store });
+    const { funded } = await prepareAndFund(data);
+    const release = advanceReleaseHistory(data);
+    const authorized = await data.coordinator.submitReleaseAuthorization({
+      idempotencyKey: "auth-post-mutation-cas",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    const request = {
+      idempotencyKey: "release-post-mutation-cas",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    };
+
+    await expect(data.coordinator.releaseEscrow(request)).rejects.toMatchObject({
+      code: "stale_state",
+    });
+    expect(cashu.spendSubmissions).toBe(1);
     await expect(data.coordinator.releaseEscrow(request)).resolves.toMatchObject({
       outcome: "confirmed",
       escrow: { state: "settled" },

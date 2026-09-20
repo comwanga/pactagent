@@ -269,10 +269,10 @@ describe("PactAgent service-offer publication", () => {
       expect(retrieved.event.id).toBe(valid.id);
     });
 
-    it("rejects an authentic malformed replacement without falling back", async () => {
+    it("falls back from an authentic malformed replacement to the newest valid offer", async () => {
       const { signer, offer } = createOfferFixture();
       const relay = new MemoryNostrRelay();
-      await signAndPublishPactServiceOffer(offer, signer, relay);
+      const valid = await signAndPublishPactServiceOffer(offer, signer, relay);
       const content = JSON.parse(offer.event.content) as Record<string, unknown>;
       const malformedReplacement = await signer.sign({
         ...offer.event,
@@ -285,8 +285,8 @@ describe("PactAgent service-offer publication", () => {
       });
       relay.published.push(malformedReplacement);
 
-      await expect(retrievePactServiceOffer(offer.address, relay)).rejects.toMatchObject({
-        code: "invalid_offer",
+      await expect(retrievePactServiceOffer(offer.address, relay)).resolves.toMatchObject({
+        event: { id: valid.id },
       });
     });
 

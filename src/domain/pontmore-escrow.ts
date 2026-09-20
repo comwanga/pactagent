@@ -142,8 +142,8 @@ function descriptorError(code: PontmoreEscrowDescriptorErrorCode, message: strin
 }
 
 function requirePositiveInteger(value: number, field: string): void {
-  if (!Number.isInteger(value) || value < 1) {
-    descriptorError("invalid_descriptor", `${field} must be a positive integer`);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    descriptorError("invalid_descriptor", `${field} must be a positive safe integer`);
   }
 }
 
@@ -310,7 +310,7 @@ export function parseCashuEscrowDescriptorEvent<TEvent extends UnsignedNostrEven
     timeout === null ||
     Object.keys(timeout).some((key) => !["class", "duration_seconds", "fallback_resolution"].includes(key)) ||
     timeout.class !== "refund-trigger timeout" ||
-    !Number.isInteger(timeout.duration_seconds) ||
+    !Number.isSafeInteger(timeout.duration_seconds) ||
     (timeout.duration_seconds as number) < 1 ||
     timeout.fallback_resolution !== "cancelling and refunding"
   ) {

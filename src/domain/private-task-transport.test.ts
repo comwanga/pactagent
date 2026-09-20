@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   PrivateTaskTransportError,
+  PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES,
+  PRIVATE_RESULT_MAX_SUMMARY_BYTES,
+  PRIVATE_TASK_MAX_PROMPT_BYTES,
   validatePrivateResultPayload,
   validatePrivateTaskPayload,
   validateProvenance,
@@ -95,6 +98,27 @@ describe("Private task transport domain", () => {
       const payload = createValidPayload({ input_media_type: "application/pdf" });
       expect(() => validatePrivateTaskPayload(payload)).not.toThrow();
     });
+
+    it.each([PRIVATE_TASK_MAX_PROMPT_BYTES - 1, PRIVATE_TASK_MAX_PROMPT_BYTES])(
+      "accepts a private prompt at %s UTF-8 bytes",
+      (size) => {
+        expect(() => validatePrivateTaskPayload({
+          ...createValidPayload(),
+          private_prompt: "x".repeat(size),
+        })).not.toThrow();
+      },
+    );
+
+    it("rejects prompt bytes beyond the limit, including multibyte input", () => {
+      expect(() => validatePrivateTaskPayload({
+        ...createValidPayload(),
+        private_prompt: "x".repeat(PRIVATE_TASK_MAX_PROMPT_BYTES + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
+      expect(() => validatePrivateTaskPayload({
+        ...createValidPayload(),
+        private_prompt: "é".repeat(PRIVATE_TASK_MAX_PROMPT_BYTES / 2 + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
+    });
   });
 
   describe("validatePrivateResultPayload", () => {
@@ -120,6 +144,22 @@ describe("Private task transport domain", () => {
       expect(() =>
         validatePrivateResultPayload({ ...createValidResult(), summary: "cashuAtoken-leak" }),
       ).toThrow(PrivateTaskTransportError);
+    });
+
+    it.each([PRIVATE_RESULT_MAX_SUMMARY_BYTES - 1, PRIVATE_RESULT_MAX_SUMMARY_BYTES])(
+      "accepts a summary at %s UTF-8 bytes",
+      (size) => {
+        expect(() => validatePrivateResultPayload({ summary: "x".repeat(size) })).not.toThrow();
+      },
+    );
+
+    it("rejects summary bytes beyond the limit, including multibyte input", () => {
+      expect(() => validatePrivateResultPayload({
+        summary: "x".repeat(PRIVATE_RESULT_MAX_SUMMARY_BYTES + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
+      expect(() => validatePrivateResultPayload({
+        summary: "é".repeat(PRIVATE_RESULT_MAX_SUMMARY_BYTES / 2 + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
     });
   });
 
@@ -152,6 +192,27 @@ describe("Private task transport domain", () => {
       expect(() =>
         validateProvenance({ ...createValidProvenance(), agreementId: "" }),
       ).toThrow(PrivateTaskTransportError);
+    });
+
+    it.each([
+      PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES - 1,
+      PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES,
+    ])("accepts an agreementId at %s UTF-8 bytes", (size) => {
+      expect(() => validateProvenance({
+        ...createValidProvenance(),
+        agreementId: "x".repeat(size),
+      })).not.toThrow();
+    });
+
+    it("rejects agreementId bytes beyond the limit, including multibyte input", () => {
+      expect(() => validateProvenance({
+        ...createValidProvenance(),
+        agreementId: "x".repeat(PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
+      expect(() => validateProvenance({
+        ...createValidProvenance(),
+        agreementId: "é".repeat(PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES / 2 + 1),
+      })).toThrowError(expect.objectContaining({ code: "payload_too_large" }));
     });
   });
 

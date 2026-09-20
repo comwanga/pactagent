@@ -53,6 +53,9 @@ import {
 export const PIP00_PROFILE_DISCOVERY_TIMEOUT_MS = 10_000;
 export const DEFAULT_DISCOVERY_MAX_PROFILES = 100;
 export const DEFAULT_DISCOVERY_MAX_RESOLUTIONS = 200;
+/** Cheaply inspected relay events are separately bounded from authenticated profiles. */
+export const DEFAULT_DISCOVERY_MAX_RAW_PROFILE_EVENTS = 1_000;
+export const DEFAULT_DISCOVERY_PROFILE_PAGE_SIZE = 100;
 
 export interface DiscoveryBounds {
   readonly maxProfiles: number;
@@ -157,12 +160,33 @@ function rejection(
   return { providerPublicKey, category, reason };
 }
 
-function profileDiscoveryFilter(maxProfiles: number): NostrFilter {
+function profileDiscoveryFilter(maxProfiles: number, until?: number): NostrFilter {
   return {
     kinds: [30360],
     tags: { t: ["agent"] },
     limit: maxProfiles,
+    ...(until === undefined ? {} : { until }),
   };
+}
+
+async function withinDiscoveryDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+): Promise<T | undefined> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<undefined>((resolveTimeout) => {
+        timeout = setTimeout(() => resolveTimeout(undefined), remaining);
+        timeout.unref();
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 /*
@@ -403,9 +427,20 @@ async function resolveDescriptor(
 
 function crossValidateDescriptor(
   descriptor: PontmoreEscrowDescriptor<SignedNostrEvent>,
+  requesterPolicy: RequesterPolicy,
 ): DiscoveryRejection | undefined {
   if (!isCashuEscrowCompatible(descriptor)) {
     return { providerPublicKey: descriptor.event.pubkey, category: "escrow_incompatible", reason: "PIP-01 descriptor is not Cashu-compatible" };
+  }
+  if (
+    descriptor.content.dispute_rules.timeout.duration_seconds >
+    requesterPolicy.maximumEscrowDurationSeconds
+  ) {
+    return rejection(
+      descriptor.event.pubkey,
+      "duration_rejected",
+      "PIP-01 descriptor timeout exceeds the requester escrow duration",
+    );
   }
   return undefined;
 }
@@ -469,23 +504,75 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
     return { candidates: [], selected: undefined, rejections: [] };
   }
 
-  let rawProfiles: readonly SignedNostrEvent[];
-  try {
-    rawProfiles = await input.relay.queryEvents(
-      profileDiscoveryFilter(maxProfiles),
-      operationOptions(PIP00_PROFILE_DISCOVERY_TIMEOUT_MS, input.options),
-    );
-  } catch (error) {
-    if (isTimeoutError(error)) {
-      throw new DiscoveryError("profile_query_timeout", "PIP-00 profile discovery query timed out");
+  const discoveryTimeoutMs = input.options?.timeoutMs ?? PIP00_PROFILE_DISCOVERY_TIMEOUT_MS;
+  const deadline = Date.now() + discoveryTimeoutMs;
+  const rawProfiles: SignedNostrEvent[] = [];
+  const seenProfiles = new Set<string>();
+  let profileQueryTruncated = false;
+  let until: number | undefined;
+  while (rawProfiles.length < DEFAULT_DISCOVERY_MAX_RAW_PROFILE_EVENTS) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      profileQueryTruncated = true;
+      break;
     }
-    throw new DiscoveryError("profile_query_failed", "PIP-00 profile discovery query failed");
+    let page: readonly SignedNostrEvent[] | undefined;
+    try {
+      page = await withinDiscoveryDeadline(
+        input.relay.queryEvents(
+          profileDiscoveryFilter(DEFAULT_DISCOVERY_PROFILE_PAGE_SIZE, until),
+          operationOptions(remaining, input.options),
+        ),
+        deadline,
+      );
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        throw new DiscoveryError("profile_query_timeout", "PIP-00 profile discovery query timed out");
+      }
+      throw new DiscoveryError("profile_query_failed", "PIP-00 profile discovery query failed");
+    }
+    if (page === undefined) {
+      if (rawProfiles.length === 0) {
+        throw new DiscoveryError("profile_query_timeout", "PIP-00 profile discovery query timed out");
+      }
+      profileQueryTruncated = true;
+      break;
+    }
+    let added = 0;
+    for (const event of page) {
+      const eventFingerprint = JSON.stringify(event);
+      if (seenProfiles.has(eventFingerprint)) continue;
+      seenProfiles.add(eventFingerprint);
+      rawProfiles.push(event);
+      added += 1;
+      if (rawProfiles.length === DEFAULT_DISCOVERY_MAX_RAW_PROFILE_EVENTS) break;
+    }
+    if (page.length < DEFAULT_DISCOVERY_PROFILE_PAGE_SIZE) break;
+    if (rawProfiles.length === DEFAULT_DISCOVERY_MAX_RAW_PROFILE_EVENTS) {
+      profileQueryTruncated = true;
+      break;
+    }
+    const oldestTimestamp = page.reduce<number | undefined>(
+      (oldest, event) => oldest === undefined || event.created_at < oldest ? event.created_at : oldest,
+      undefined,
+    );
+    if (added === 0 || oldestTimestamp === undefined || oldestTimestamp <= 0) {
+      profileQueryTruncated = true;
+      break;
+    }
+    until = oldestTimestamp - 1;
   }
 
-  const groupedProfiles = groupProfilesByAddress(rawProfiles).slice(0, maxProfiles);
+  const groupedProfiles = groupProfilesByAddress(rawProfiles);
   const rejections: DiscoveryRejection[] = [];
+  if (profileQueryTruncated) {
+    rejections.push(
+      rejection(undefined, "discovery_truncated", "Discovery raw-profile scan was bounded"),
+    );
+  }
   const candidates: AuthorizedProviderCandidate[] = [];
   let resolutionsRemaining = maxResolutions;
+  let profilesRemaining = maxProfiles;
 
   for (const group of groupedProfiles) {
     let currentAuthentic: SignedNostrEvent | undefined;
@@ -519,13 +606,30 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
       continue;
     }
 
-    if (resolutionsRemaining < 2) {
+    if (profilesRemaining < 1) {
+      rejections.push(rejection(definition.event.pubkey, "discovery_truncated", "Discovery authenticated-profile budget exhausted before this provider"));
+      continue;
+    }
+    profilesRemaining -= 1;
+
+    if (resolutionsRemaining < 1) {
       rejections.push(rejection(definition.event.pubkey, "discovery_truncated", "Discovery resolution budget exhausted before this provider"));
       continue;
     }
-    resolutionsRemaining -= 2;
+    resolutionsRemaining -= 1;
 
-    const offerResult = await resolveOffer(definition, input.relay, input.options);
+    const remainingForOffer = deadline - Date.now();
+    const offerResult = await withinDiscoveryDeadline(
+      resolveOffer(definition, input.relay, {
+        ...input.options,
+        timeoutMs: Math.max(1, remainingForOffer),
+      }),
+      deadline,
+    );
+    if (offerResult === undefined) {
+      rejections.push(rejection(definition.event.pubkey, "discovery_truncated", "Discovery global deadline was exhausted"));
+      break;
+    }
     if ("rejection" in offerResult) {
       rejections.push(offerResult.rejection);
       continue;
@@ -544,14 +648,25 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
     }
     resolutionsRemaining -= 1;
 
-    const descriptorResult = await resolveDescriptor(definition, input.relay, input.options);
+    const remainingForDescriptor = deadline - Date.now();
+    const descriptorResult = await withinDiscoveryDeadline(
+      resolveDescriptor(definition, input.relay, {
+        ...input.options,
+        timeoutMs: Math.max(1, remainingForDescriptor),
+      }),
+      deadline,
+    );
+    if (descriptorResult === undefined) {
+      rejections.push(rejection(definition.event.pubkey, "discovery_truncated", "Discovery global deadline was exhausted"));
+      break;
+    }
     if ("rejection" in descriptorResult) {
       rejections.push(descriptorResult.rejection);
       continue;
     }
     const descriptor = descriptorResult;
 
-    const descriptorRejection = crossValidateDescriptor(descriptor);
+    const descriptorRejection = crossValidateDescriptor(descriptor, input.requesterPolicy);
     if (descriptorRejection) {
       rejections.push(descriptorRejection);
       continue;

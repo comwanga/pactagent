@@ -203,6 +203,7 @@ async function createDiscoverySelectionFixture(): Promise<{
     identifier: "discovered-cashu-summary",
     updatedAt: CREATED_AT - 10,
     referenceFormat: "opaque_service_reference",
+    timeoutSeconds: 300,
   });
   const offer = createPactServiceOffer({
     identity: provider,
@@ -427,6 +428,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       actor: fixture.provider.publicKey,
       actorRole: "provider",
       createdAt: CREATED_AT + 1,
+      validationTime: CREATED_AT + 1,
     });
     const signedAcceptance = await signAndPublishPactAgreementTransition({
       context,
@@ -434,6 +436,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       transition: acceptance,
       signer: providerSigner,
       relay,
+      validationTime: CREATED_AT + 1,
     });
 
     expect(root.event.pubkey).toBe(requesterSigner.publicKey);
@@ -481,6 +484,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       actor: fixture.provider.publicKey,
       actorRole: "provider",
       createdAt: CREATED_AT + 1,
+      validationTime: CREATED_AT + 1,
     });
     const signed = await signAndPublishPactAgreementTransition({
       context,
@@ -488,6 +492,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       transition: acceptance,
       signer: new RecordingSigner(fixture.providerKey),
       relay,
+      validationTime: CREATED_AT + 1,
     });
     const events = await retrievePactAgreementTransitions({ context, relay });
     const reconstructed = await retrieveAndReconstructPactAgreement({ context, relay });
@@ -512,6 +517,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       actor: fixture.provider.publicKey,
       actorRole: "provider",
       createdAt: CREATED_AT + 1,
+      validationTime: CREATED_AT + 1,
     });
     const invalidContent = {
       ...valid.content,
@@ -532,7 +538,13 @@ describe("PactAgent agreement signer and relay integration", () => {
     const signer = new RecordingSigner(fixture.escrowKey);
 
     await expect(
-      signPactAgreementTransition({ context, history: [], transition: invalid, signer }),
+      signPactAgreementTransition({
+        context,
+        history: [],
+        transition: invalid,
+        signer,
+        validationTime: CREATED_AT + 1,
+      }),
     ).rejects.toMatchObject({ code: "invalid_transition" });
     expect(signer.calls).toBe(0);
   });
@@ -557,6 +569,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       actor: fixture.provider.publicKey,
       actorRole: "provider",
       createdAt: CREATED_AT + 1,
+      validationTime: CREATED_AT + 1,
     });
     const transitionSigner = new RecordingSigner(fixture.requesterKey);
     await expect(
@@ -565,6 +578,7 @@ describe("PactAgent agreement signer and relay integration", () => {
         history: [],
         transition: acceptance,
         signer: transitionSigner,
+        validationTime: CREATED_AT + 1,
       }),
     ).rejects.toMatchObject({ code: "signer_not_authorized" });
     expect(transitionSigner.calls).toBe(0);
@@ -581,6 +595,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       actor: fixture.provider.publicKey,
       actorRole: "provider",
       createdAt: CREATED_AT + 1,
+      validationTime: CREATED_AT + 1,
     });
     const signed = await signAndPublishPactAgreementTransition({
       context,
@@ -588,6 +603,7 @@ describe("PactAgent agreement signer and relay integration", () => {
       transition: acceptance,
       signer: new RecordingSigner(fixture.providerKey),
       relay,
+      validationTime: CREATED_AT + 1,
     });
     relay.events.push(signed.event);
 

@@ -87,7 +87,7 @@ function countPages(buffer: Buffer): number {
   while (true) {
     const pageIndex = buffer.indexOf(TYPE_PAGE, from);
     if (pageIndex === -1) break;
-    if (buffer.indexOf(TYPE_PAGES, pageIndex) !== pageIndex) {
+    if (!buffer.subarray(pageIndex, pageIndex + TYPE_PAGES.length).equals(TYPE_PAGES)) {
       count += 1;
     }
     from = pageIndex + TYPE_PAGE.length;
@@ -106,9 +106,13 @@ interface ParsedDictionary {
 }
 
 /** Find the matching `<<` for the `>>` that closes just before the `stream` keyword. */
-function findStreamDictionaryBounds(buffer: Buffer, streamAt: number): { readonly start: number; readonly end: number } | null {
+function findStreamDictionaryBounds(
+  buffer: Buffer,
+  streamAt: number,
+  minimum: number,
+): { readonly start: number; readonly end: number } | null {
   let scan = streamAt;
-  while (scan > 0 && (buffer[scan - 1] === 0x20 || buffer[scan - 1] === 0x0d || buffer[scan - 1] === 0x0a || buffer[scan - 1] === 0x09)) {
+  while (scan > minimum && (buffer[scan - 1] === 0x20 || buffer[scan - 1] === 0x0d || buffer[scan - 1] === 0x0a || buffer[scan - 1] === 0x09)) {
     scan -= 1;
   }
   if (scan < DICT_CLOSE.length) return null;
@@ -117,7 +121,7 @@ function findStreamDictionaryBounds(buffer: Buffer, streamAt: number): { readonl
 
   let depth = 1;
   let pos = closeEnd - DICT_CLOSE.length;
-  while (pos > 0) {
+  while (pos > minimum) {
     if (pos >= DICT_CLOSE.length && buffer.subarray(pos - DICT_CLOSE.length, pos).equals(DICT_CLOSE)) {
       depth += 1;
       pos -= DICT_CLOSE.length;
@@ -135,8 +139,8 @@ function findStreamDictionaryBounds(buffer: Buffer, streamAt: number): { readonl
 }
 
 /** Parse /Length and /Filter from the stream's own dictionary. Fail closed on unsupported lengths. */
-function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictionary | null {
-  const bounds = findStreamDictionaryBounds(buffer, streamAt);
+function parseStreamDictionary(buffer: Buffer, streamAt: number, minimum: number): ParsedDictionary | null {
+  const bounds = findStreamDictionaryBounds(buffer, streamAt, minimum);
   if (bounds === null) return null;
   const dictText = buffer.subarray(bounds.start, bounds.end).toString("latin1");
 
@@ -159,13 +163,15 @@ function parseStreamDictionary(buffer: Buffer, streamAt: number): ParsedDictiona
 function findStreams(buffer: Buffer): RawStream[] {
   const streams: RawStream[] = [];
   let cursor = 0;
+  let dictionaryFloor = 0;
   while (cursor < buffer.length) {
     const streamAt = buffer.indexOf(STREAM_KEYWORD, cursor);
     if (streamAt === -1) break;
 
-    const dictionary = parseStreamDictionary(buffer, streamAt);
+    const dictionary = parseStreamDictionary(buffer, streamAt, dictionaryFloor);
     if (dictionary === null) {
       cursor = streamAt + STREAM_KEYWORD.length;
+      dictionaryFloor = cursor;
       continue;
     }
 
@@ -200,6 +206,7 @@ function findStreams(buffer: Buffer): RawStream[] {
       extractError("unsupported_pdf_structure", "PDF stream /Length does not align with endstream");
     }
     cursor = endstreamAt + ENDSTREAM_KEYWORD.length;
+    dictionaryFloor = cursor;
   }
   return streams;
 }

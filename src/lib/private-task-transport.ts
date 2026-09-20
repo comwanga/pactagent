@@ -65,6 +65,8 @@ import { isTimeoutError, operationOptions } from "./pontmore-publication-helpers
  */
 
 export const PRIVATE_TASK_RELAY_TIMEOUT_MS = 10_000;
+export const PRIVATE_TASK_GIFT_WRAP_PAGE_SIZE = 50;
+export const PRIVATE_TASK_GIFT_WRAP_MAX_PAGES = 20;
 
 export type PrivateTaskPublicationErrorCode =
   | "signing_failure"
@@ -541,11 +543,12 @@ export async function publishGiftWrap(
   return parsed;
 }
 
-function giftWrapFilter(recipient: NostrPublicKey): NostrFilter {
+function giftWrapFilter(recipient: NostrPublicKey, until?: number): NostrFilter {
   return {
     kinds: [NIP59_GIFT_WRAP_KIND],
     tags: { p: [recipient] },
-    limit: 50,
+    ...(until === undefined ? {} : { until }),
+    limit: PRIVATE_TASK_GIFT_WRAP_PAGE_SIZE,
   };
 }
 
@@ -561,35 +564,70 @@ export async function retrieveGiftWraps(
   relay: NostrRelayAdapter,
   options?: NostrRelayPublishOptions,
 ): Promise<SignedNostrEvent[]> {
-  const filter = giftWrapFilter(recipient);
-  let events: readonly SignedNostrEvent[];
+  const scan = await scanGiftWrapPages(recipient, relay, options, () => undefined);
+  if (scan.verified.length === 0) {
+    throw new PrivateTaskPublicationError("task_not_found", "No valid gift wraps were found");
+  }
+  return [...scan.verified].sort((left, right) => right.created_at - left.created_at);
+}
+
+async function scanGiftWrapPages<T>(
+  recipient: NostrPublicKey,
+  relay: NostrRelayAdapter,
+  options: NostrRelayPublishOptions | undefined,
+  visit: (event: SignedNostrEvent) => { readonly value: T } | undefined,
+): Promise<{
+  readonly verified: readonly SignedNostrEvent[];
+  readonly match?: { readonly value: T };
+}> {
+  const timeoutMs = options?.timeoutMs ?? PRIVATE_TASK_RELAY_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
+  const verified: SignedNostrEvent[] = [];
+  const seen = new Set<string>();
+  let until: number | undefined;
   try {
-    events = await relay.queryEvents(filter, operationOptions(PRIVATE_TASK_RELAY_TIMEOUT_MS, options));
+    for (let page = 0; page < PRIVATE_TASK_GIFT_WRAP_MAX_PAGES; page += 1) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new PrivateTaskPublicationError("timeout", "Gift wrap retrieval timed out");
+      }
+      const pageEvents = await relay.queryEvents(
+        giftWrapFilter(recipient, until),
+        operationOptions(remaining, { ...options, timeoutMs: remaining }),
+      );
+      const ordered = [...pageEvents].sort((left, right) => {
+        const timestampOrder = right.created_at - left.created_at;
+        return timestampOrder === 0 ? left.id.localeCompare(right.id) : timestampOrder;
+      });
+      for (const raw of ordered) {
+        if (seen.has(raw.id)) continue;
+        seen.add(raw.id);
+        try {
+          const parsed = parseSignedNostrEvent(raw);
+          verifySignedNostrEvent(parsed);
+          if (parsed.kind !== NIP59_GIFT_WRAP_KIND) continue;
+          verified.push(parsed);
+          const match = visit(parsed);
+          if (match !== undefined) {
+            return { verified, match };
+          }
+        } catch {
+          continue;
+        }
+      }
+      if (pageEvents.length < PRIVATE_TASK_GIFT_WRAP_PAGE_SIZE) break;
+      const oldestTimestamp = ordered.at(-1)?.created_at;
+      if (oldestTimestamp === undefined || oldestTimestamp < 1) break;
+      until = oldestTimestamp - 1;
+    }
   } catch (error) {
+    if (error instanceof PrivateTaskPublicationError) throw error;
     if (isTimeoutError(error)) {
       throw new PrivateTaskPublicationError("timeout", "Gift wrap retrieval timed out");
     }
     throw new PrivateTaskPublicationError("retrieval_failure", "Gift wrap retrieval failed");
   }
-
-  const verified: SignedNostrEvent[] = [];
-  for (const raw of events) {
-    try {
-      const parsed = parseSignedNostrEvent(raw);
-      verifySignedNostrEvent(parsed);
-      if (parsed.kind === NIP59_GIFT_WRAP_KIND) {
-        verified.push(parsed);
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  if (verified.length === 0) {
-    throw new PrivateTaskPublicationError("task_not_found", "No valid gift wraps were found");
-  }
-
-  return verified.sort((left, right) => right.created_at - left.created_at);
+  return { verified };
 }
 
 /*
@@ -604,14 +642,14 @@ export async function retrieveAndOpenPrivateTask(
   relay: NostrRelayAdapter,
   options?: NostrRelayPublishOptions,
 ): Promise<PrivateTaskPayload> {
-  const wraps = await retrieveGiftWraps(recipient, relay, options);
-  for (const wrap of wraps) {
+  const scan = await scanGiftWrapPages(recipient, relay, options, (wrap) => {
     try {
-      return openPrivateTask(wrap, recipientEncrypter, provenance);
+      return { value: openPrivateTask(wrap, recipientEncrypter, provenance) };
     } catch {
-      continue;
+      return undefined;
     }
-  }
+  });
+  if (scan.match) return scan.match.value;
   throw new PrivateTaskPublicationError("task_not_found", "No gift wrap matched the provenance and decrypted successfully");
 }
 
@@ -622,13 +660,13 @@ export async function retrieveAndOpenPrivateResult(
   relay: NostrRelayAdapter,
   options?: NostrRelayPublishOptions,
 ): Promise<PrivateResultPayload> {
-  const wraps = await retrieveGiftWraps(recipient, relay, options);
-  for (const wrap of wraps) {
+  const scan = await scanGiftWrapPages(recipient, relay, options, (wrap) => {
     try {
-      return openPrivateResult(wrap, recipientEncrypter, provenance);
+      return { value: openPrivateResult(wrap, recipientEncrypter, provenance) };
     } catch {
-      continue;
+      return undefined;
     }
-  }
+  });
+  if (scan.match) return scan.match.value;
   throw new PrivateTaskPublicationError("task_not_found", "No gift wrap matched the provenance and decrypted successfully");
 }

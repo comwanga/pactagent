@@ -7,6 +7,7 @@ import {
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 
 import { sats } from "../domain/money";
@@ -14,9 +15,11 @@ import { nostrPublicKey } from "../domain/nostr";
 import {
   CashuPrivateBackendError,
   CashuTestMintError,
+  CASHU_TEST_MINT_MAX_ACTIVE_KEYSETS,
   createCashuPrivateFundingSource,
   createCashuPrivateValueDelivery,
   createCashuTestMintAdapterWithBackend,
+  createCashuTestMintAdapter,
   createInMemoryCashuPrivateStore,
   createPrivateCashuBeneficiaryDestination,
   createPrivateCashuFunding,
@@ -29,6 +32,7 @@ import {
   type CashuMintPrivateBackend,
   type CashuPrivatePreparedSwap,
   type CashuPrivateProofState,
+  type CashuPrivateStore,
   type CashuPrivateSwapResult,
   type CashuTestMintPort,
 } from "./cashu-test-mint";
@@ -82,6 +86,7 @@ class FakeCashuBackend implements CashuMintPrivateBackend {
   states: readonly CashuPrivateProofState[] = [{ state: "unspent" }];
   restoreSucceeds = false;
   malformedSubmit = false;
+  malformedExposure = false;
   rawFailureMarker?: string;
   capabilityCalls = 0;
   prepareCalls = 0;
@@ -108,8 +113,14 @@ class FakeCashuBackend implements CashuMintPrivateBackend {
     readonly amountSats: bigint;
     readonly spendingKeyHex: string;
   }): Promise<CashuPrivatePreparedSwap> {
-    void input.spendingKeyHex;
-    return this.prepare("spend", input.proofs, input.amountSats);
+    const prepared = this.prepare("spend", input.proofs, input.amountSats);
+    return {
+      ...prepared,
+      opaque: Object.freeze({
+        privateBlindingMaterial: "private-blinding-marker",
+        spendingKeyHex: input.spendingKeyHex,
+      }),
+    };
   }
 
   private prepare(
@@ -125,6 +136,12 @@ class FakeCashuBackend implements CashuMintPrivateBackend {
       kind,
       inputProofs: proofs,
       requestedAmountSats: amountSats,
+      exposureAmountSats:
+        this.malformedExposure && kind === "lock"
+          ? amountSats - 1n
+          : kind === "lock"
+            ? amountSats + 1n
+            : amountSats,
       opaque: Object.freeze({ privateBlindingMaterial: "private-blinding-marker" }),
     };
   }
@@ -343,6 +360,58 @@ describe("Cashu private funding import and beneficiary delivery", () => {
     expect(backend.submitCalls).toBe(1);
     expect(() => JSON.stringify(imported)).toThrowError(CashuTestMintError);
     expect(() => JSON.stringify(source)).toThrowError(CashuTestMintError);
+  });
+
+  it("rejects excessive active keysets before retrieving any key material", async () => {
+    const request = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/v1/info")) {
+        return new Response(JSON.stringify({
+          name: "bounded-test-mint",
+          pubkey: CURVE_POINT,
+          version: "test",
+          description: "test",
+          contact: [],
+          nuts: {
+            "7": { supported: true },
+            "9": { supported: true },
+            "10": { supported: true },
+            "11": { supported: true },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.endsWith("/v1/keysets")) {
+        return new Response(JSON.stringify({
+          keysets: Array.from(
+            { length: CASHU_TEST_MINT_MAX_ACTIVE_KEYSETS + 1 },
+            (_value, index) => ({
+              id: index.toString(16).padStart(16, "0"),
+              unit: "sat",
+              active: true,
+              input_fee_ppk: 0,
+            }),
+          ),
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected key retrieval: ${url}`);
+    });
+    vi.stubGlobal("fetch", request);
+    try {
+      const adapter = createCashuTestMintAdapter({
+        configuration: {
+          testMintUrl: MINT_URL,
+          unit: "sat",
+          maximumExposureSats: sats(1_000n),
+        },
+        privateStore: createInMemoryCashuPrivateStore(),
+      });
+      await expect(adapter.inspectCapabilities()).rejects.toMatchObject({
+        code: "malformed_mint_response",
+      });
+      expect(request).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("rejects proof imports for another mint or unsupported keyset", async () => {
@@ -590,6 +659,40 @@ describe("Cashu test-mint private operations", () => {
     ).rejects.toMatchObject({ code: "invalid_spending_condition" });
   });
 
+  it("tombstones a spent source handle so it cannot be delivered as live value", async () => {
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const configuration = {
+      testMintUrl: MINT_URL,
+      unit: "sat" as const,
+      maximumExposureSats: sats(1_000n),
+    };
+    const adapter = createCashuTestMintAdapterWithBackend({ configuration, backend, privateStore });
+    const locked = await prepare(adapter, "source-tombstone-lock");
+    await adapter.spendLockedValue({
+      operationId: "source-tombstone-spend",
+      handle: locked.result.handle,
+      spendingKey: locked.lockKey,
+    });
+
+    let deliveries = 0;
+    const beneficiary = nostrPublicKey("ef".repeat(32));
+    const destination = createPrivateCashuBeneficiaryDestination({
+      beneficiary,
+      async deliver() {
+        deliveries += 1;
+      },
+    });
+    const delivery = createCashuPrivateValueDelivery({ configuration, privateStore });
+    await expect(delivery.deliver({
+      deliveryId: "spent-source-delivery",
+      handle: locked.result.handle,
+      expectedBeneficiary: beneficiary,
+      destination,
+    })).rejects.toMatchObject({ code: "operation_rejected" });
+    expect(deliveries).toBe(0);
+  });
+
   it("rejects insufficient value before submission", async () => {
     const { adapter, backend } = harness();
     const key = spendingKey();
@@ -722,6 +825,76 @@ describe("Cashu test-mint private operations", () => {
 });
 
 describe("Cashu test-mint retry and reconciliation", () => {
+  it("rejects understated prepared exposure before reserving or submitting", async () => {
+    const backend = new FakeCashuBackend();
+    backend.malformedExposure = true;
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(351n),
+      },
+      backend,
+      privateStore: createInMemoryCashuPrivateStore(),
+    });
+    const request = {
+      operationId: "understated-exposure",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+
+    await expect(adapter.prepareLockedValue(request)).rejects.toMatchObject({
+      code: "operation_rejected",
+      operationStatus: "not_submitted",
+    });
+    expect(backend.submitCalls).toBe(0);
+
+    backend.malformedExposure = false;
+    await expect(
+      adapter.prepareLockedValue({
+        ...request,
+        operationId: "valid-exposure-after-rejection",
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("accounts for fee-inclusive proof exposure at the exact cap boundary", async () => {
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(700n),
+      },
+      backend,
+      privateStore,
+    });
+    const first = await prepare(adapter, "fee-cap-first");
+    const secondRequest = {
+      operationId: "fee-cap-second",
+      funding: funding(),
+      amountSats: sats(349n),
+      spendingCondition: { lockPublicKey: spendingKey(REFUND_SECRET).publicKey },
+    };
+    await expect(adapter.prepareLockedValue(secondRequest)).rejects.toMatchObject({
+      code: "insufficient_value",
+      operationStatus: "not_submitted",
+    });
+    expect(backend.submitCalls).toBe(1);
+
+    await adapter.spendLockedValue({
+      operationId: "fee-cap-release-first",
+      handle: first.result.handle,
+      spendingKey: first.lockKey,
+    });
+    await expect(adapter.prepareLockedValue(secondRequest)).resolves.toMatchObject({
+      status: "succeeded",
+      facts: { outputAmountSats: 350n },
+    });
+  });
+
   it("enforces the configured cap across concurrently locked value", async () => {
     const backend = new FakeCashuBackend();
     const privateStore = createInMemoryCashuPrivateStore();
@@ -850,6 +1023,102 @@ describe("Cashu test-mint retry and reconciliation", () => {
     }
   }, 15_000);
 
+  it("fails closed when durable lock ownership cannot be verified at commit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-lock-loss-"));
+    const databasePath = join(directory, "cashu-private.sqlite");
+    const store = createSqliteCashuPrivateStore(databasePath);
+    try {
+      await expect(
+        store.withExclusiveLock(MINT_URL, "lock-loss", async () => {
+          store.close();
+          return "must-not-commit";
+        }),
+      ).rejects.toMatchObject({
+        code: "reconciliation_required",
+        operationStatus: "submitted_unknown",
+      });
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a durable write before it is made when its lock lease was stolen", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-stale-writer-"));
+    const databasePath = join(directory, "cashu-private.sqlite");
+    const store = createSqliteCashuPrivateStore(databasePath);
+    const competingConnection = new DatabaseSync(databasePath);
+    try {
+      await expect(
+        store.withExclusiveLock(MINT_URL, "stale-writer", async () => {
+          competingConnection
+            .prepare(
+              "UPDATE pact_cashu_private_locks SET owner = ?, expires_at_ms = ? WHERE lock_key = ?",
+            )
+            .run("new-owner", Date.now() + 30_000, `${MINT_URL}:stale-writer`);
+          await store.write(MINT_URL, "must-not-write", { secret: "private" });
+        }),
+      ).rejects.toMatchObject({
+        code: "reconciliation_required",
+        operationStatus: "submitted_unknown",
+      });
+      await expect(store.read(MINT_URL, "must-not-write")).resolves.toBeUndefined();
+    } finally {
+      competingConnection.close();
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers by operation identity when lock ownership is lost after mint success", async () => {
+    const base = createInMemoryCashuPrivateStore();
+    let loseOwnership = true;
+    const privateStore: CashuPrivateStore = {
+      read: (scope, key) => base.read(scope, key),
+      write: (scope, key, value) => base.write(scope, key, value),
+      withExclusiveLock(scope, key, operation) {
+        return base.withExclusiveLock(scope, key, async () => {
+          const value = await operation();
+          if (loseOwnership && key === "operation:lease-loss-after-submit") {
+            loseOwnership = false;
+            throw new CashuTestMintError(
+              "reconciliation_required",
+              "simulated lease ownership loss",
+              "submitted_unknown",
+              "lease-loss-after-submit",
+            );
+          }
+          return value;
+        });
+      },
+    };
+    const backend = new FakeCashuBackend();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(1_000n),
+      },
+      backend,
+      privateStore,
+    });
+    const request = {
+      operationId: "lease-loss-after-submit",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+
+    await expect(adapter.prepareLockedValue(request)).rejects.toMatchObject({
+      code: "reconciliation_required",
+      operationStatus: "submitted_unknown",
+    });
+    await expect(adapter.prepareLockedValue(request)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(backend.submitCalls).toBe(1);
+  });
+
   it("does not reset aggregate exposure when the private store is reopened", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-exposure-restart-"));
     const databasePath = join(directory, "cashu-private.sqlite");
@@ -939,6 +1208,119 @@ describe("Cashu test-mint retry and reconciliation", () => {
     expect(backend.submitCalls).toBe(1);
     expect(backend.inspectCalls).toBe(1);
     expect(backend.restoreCalls).toBe(0);
+  });
+
+  it("terminates reconciliation when spent inputs have none of this operation's outputs", async () => {
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    backend.states = [{ state: "spent" }];
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore,
+    });
+    const request = {
+      operationId: "lost-competing-spend",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+    await expect(adapter.prepareLockedValue(request)).resolves.toMatchObject({
+      status: "submitted_unknown",
+    });
+    await expect(adapter.prepareLockedValue(request)).rejects.toMatchObject({
+      code: "proof_already_spent",
+      operationStatus: "failed_definitively",
+    });
+    await expect(adapter.prepareLockedValue(request)).rejects.toMatchObject({
+      code: "proof_already_spent",
+      operationStatus: "failed_definitively",
+    });
+    expect(backend.submitCalls).toBe(1);
+    expect(backend.restoreCalls).toBe(1);
+
+    await expect(adapter.prepareLockedValue({
+      operationId: "after-lost-reservation",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey(REFUND_SECRET).publicKey },
+    })).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("reuses stable value handles when success persistence fails before reconciliation", async () => {
+    const base = createInMemoryCashuPrivateStore();
+    const valueWrites: string[] = [];
+    let failSuccess = true;
+    const privateStore: CashuPrivateStore = {
+      read: (scope, key) => base.read(scope, key),
+      async write(scope, key, value) {
+        if (key.startsWith("value:")) valueWrites.push(key);
+        if (
+          failSuccess &&
+          key === "operation:stable-completion" &&
+          (value as { status?: unknown }).status === "succeeded"
+        ) {
+          failSuccess = false;
+          throw new Error("fault after value persistence");
+        }
+        await base.write(scope, key, value);
+      },
+      withExclusiveLock: (scope, key, operation) => base.withExclusiveLock(scope, key, operation),
+    };
+    const backend = new FakeCashuBackend();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const request = {
+      operationId: "stable-completion",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+    await expect(adapter.prepareLockedValue(request)).resolves.toMatchObject({
+      status: "submitted_unknown",
+    });
+    backend.states = [{ state: "spent" }];
+    backend.restoreSucceeds = true;
+    await expect(adapter.prepareLockedValue(request)).resolves.toMatchObject({ status: "succeeded" });
+    expect(new Set(valueWrites).size).toBe(2);
+    expect(valueWrites).toHaveLength(4);
+  });
+
+  it("retains the NUT-11 key only while reconciliation requires it", async () => {
+    const privateStore = createInMemoryCashuPrivateStore();
+    const backend = new FakeCashuBackend();
+    const configuration = {
+      testMintUrl: MINT_URL,
+      unit: "sat" as const,
+      maximumExposureSats: sats(1_000n),
+    };
+    const adapter = createCashuTestMintAdapterWithBackend({ configuration, backend, privateStore });
+    const locked = await prepare(adapter, "key-lifecycle-lock");
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    const request = {
+      operationId: "key-lifecycle-spend",
+      handle: locked.result.handle,
+      spendingKey: locked.lockKey,
+    };
+    await expect(adapter.spendLockedValue(request)).resolves.toMatchObject({
+      status: "submitted_unknown",
+    });
+    expect(JSON.stringify(await privateStore.read(MINT_URL, "operation:key-lifecycle-spend")))
+      .toContain(LOCK_SECRET);
+
+    backend.states = [{ state: "spent" }];
+    backend.restoreSucceeds = true;
+    await expect(adapter.spendLockedValue(request)).resolves.toMatchObject({ status: "succeeded" });
+    expect(JSON.stringify(await privateStore.read(MINT_URL, "operation:key-lifecycle-spend")))
+      .not.toContain(LOCK_SECRET);
   });
 
   it("uses NUT-07 and NUT-09 to reconcile a submitted operation", async () => {
