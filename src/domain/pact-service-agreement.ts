@@ -61,6 +61,7 @@ export type PactServiceAgreementErrorCode =
   | "stale_predecessor"
   | "forked_history"
   | "terminal_state_transition"
+  | "timeout_not_reached"
   | "malformed_event"
   | "tag_content_mismatch"
   | "privacy_boundary_violation";
@@ -1435,6 +1436,17 @@ export function createPactAgreementTransition(
     history.transitions.at(-1)?.event.created_at ?? context.root.event.created_at;
   if (input.createdAt < predecessorCreatedAt) {
     agreementError("stale_predecessor", "PactAgent transition predates its predecessor");
+  }
+  if (input.nextState === "refund_authorized" && input.reasonCode === "timeout") {
+    const descriptor = parseCashuEscrowDescriptorEvent(context.references.escrowDescriptor);
+    const acceptedEvent = history.transitions.find((t) => t.content.state === "accepted")?.event;
+    if (!acceptedEvent) {
+      agreementError("invalid_transition", "Timeout refund authorization requires an accepted agreement");
+    }
+    const locktime = acceptedEvent.created_at + descriptor.content.dispute_rules.timeout.duration_seconds;
+    if (input.createdAt < locktime) {
+      agreementError("timeout_not_reached", "Timeout refund authorization cannot predate escrow locktime");
+    }
   }
   const actor = nostrPublicKey(input.actor);
   const completionDecision =
