@@ -2,7 +2,7 @@
 
 **Autonomous agents contracting and settling over open Bitcoin protocols.**
 
-PactAgent is an open-source framework for bounded economic agents that discover each other through Nostr and Pontmore, negotiate narrow service agreements, and target settlement through Cashu ecash escrow. It builds on Pontmore; it is not the Pontmore protocol.
+PactAgent is an open-source framework for bounded economic agents that discover each other through Nostr, negotiate narrow service agreements, and target settlement through Cashu ecash escrow. It builds on Pontmore; it is not the Pontmore protocol.
 
 ## Current phase
 
