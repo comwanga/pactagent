@@ -107,8 +107,9 @@ The selected-offer projection is available from durable acceptance onward. The
 requester-decision projection appears after the recommendation has passed
 deterministic policy and is restart-stable. `source` describes only the
 recommendation adapter; it never changes the deterministic authorization
-boundary. The local runtime currently emits `source: "deterministic"`; no hosted
-model adapter is configured.
+boundary. Deterministic mode emits `source: "deterministic"`; configured model
+mode emits `source: "model"`. The source is runtime-owned and persisted with the
+safe projection rather than inferred by the client.
 
 `availableActions` is computed by the runtime, including expiry and existing
 economic-operation recovery rules. Clients must not infer recovery actions from
@@ -162,6 +163,10 @@ to production or an arbitrary mint/relay.
 | `PACTAGENT_LIVE_FUNDING_REFERENCE` | opaque transaction reference authorized in private storage |
 | `PACTAGENT_LIVE_STATE_DIRECTORY` | durable SQLite state directory |
 | `PACTAGENT_RUNTIME_API_TOKEN` | bearer token for the API |
+| `PACTAGENT_REQUESTER_DECISION_MODE` | `deterministic` (default) or `model` |
+| `PACTAGENT_REQUESTER_MODEL_PROVIDER` | model provider; currently `openai` |
+| `PACTAGENT_REQUESTER_MODEL_NAME` | model name required in model mode |
+| `PACTAGENT_REQUESTER_MODEL_API_KEY` | provider credential required in model mode |
 
 The local startup wrapper additionally reads `PACTAGENT_RUNTIME_API_BASE` and
 `PACTAGENT_LOCAL_CA_PATH`. It supplies the resolved CA as `NODE_EXTRA_CA_CERTS`
@@ -187,6 +192,7 @@ npm run runtime:bootstrap   # drive bootstrap over HTTP and print safe readiness
 npm run runtime:start       # next start (requires a prior next build)
 npm run runtime:start:local # production-like runtime with the local Caddy CA injected before Node starts
 npm run local:doctor        # read-only Docker/TLS/relay/Testnut/SQLite preflight
+npm run requester:model:doctor # one bounded non-economic model request
 ```
 
 `runtime:bootstrap` is a thin Node wrapper (`scripts/runtime-bootstrap.mjs`)
@@ -220,3 +226,14 @@ runtime-owned action and resource availability, and safe references. The report 
 tokens, and keys never appear in a public DTO, event, log, or response. The
 private summary is retrievable only by the authorized requester through the
 NIP-59 result boundary.
+
+In model mode, the configured provider receives the bounded requester instruction,
+capability profile, maximum budget, and safe verified-candidate facts (provider
+public key, stable provider/offer/descriptor references, price, settlement network,
+and maximum duration). It does not receive the source document, complete result,
+funding reference, Cashu material, keys, API bearer token, settlement store, or
+database content. Provider errors and response bodies are reduced to existing safe
+requester-decision failure codes and never enter public DTOs or reports.
+The OpenAI request sets `store: false`, so PactAgent requests no stored response
+state and does not persist the provider response itself. Provider-side processing
+or retention remains governed by the configured provider and account data controls.

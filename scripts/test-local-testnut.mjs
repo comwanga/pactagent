@@ -27,7 +27,7 @@ async function jsonRequest(url, options) {
   return { response, body };
 }
 
-async function waitForTerminalStatus(baseUrl, authorization, transactionId) {
+async function waitForTerminalStatus(baseUrl, authorization, transactionId, expectedDecisionSource) {
   const deadline = Date.now() + 120_000;
   let activeObserved = false;
   let activeContractObserved = false;
@@ -46,7 +46,7 @@ async function waitForTerminalStatus(baseUrl, authorization, transactionId) {
         typeof body?.selectedOffer?.escrowDescriptorReference === "string" &&
         body?.selectedOffer?.amountSats === "350" &&
         body?.selectedOffer?.unit === "sat" &&
-        body?.requesterDecision?.source === "deterministic" &&
+        body?.requesterDecision?.source === expectedDecisionSource &&
         body?.requesterDecision?.authorized === true &&
         body?.requesterDecision?.policy?.selectedProviderMatchesDiscovery === true &&
         body?.requesterDecision?.policy?.stableReferencesMatch === true &&
@@ -119,6 +119,8 @@ async function failSafely(baseUrl, authorization, transactionId, startResult, be
 const baseEnvironment = loadLocalEnvironment();
 const caPath = resolveLocalCaPath(baseEnvironment);
 const environment = childEnvironmentWithCa(baseEnvironment, caPath);
+const expectedDecisionSource =
+  environment.PACTAGENT_REQUESTER_DECISION_MODE?.trim() === "model" ? "model" : "deterministic";
 const doctor = await runLocalDoctor({ environment });
 if (!doctor.ok) {
   console.error("Refusing Testnut acceptance because local:doctor is not green.");
@@ -186,7 +188,12 @@ try {
   } else {
     const transactionId = started.body?.transactionId;
     if (typeof transactionId !== "string") throw new Error("Runtime did not return a transaction ID");
-    const observed = await waitForTerminalStatus(baseUrl, authorization, transactionId);
+    const observed = await waitForTerminalStatus(
+      baseUrl,
+      authorization,
+      transactionId,
+      expectedDecisionSource,
+    );
     const status = observed.status;
     if (status.body?.operationalState !== "settled") {
       await failSafely(baseUrl, authorization, transactionId, status, before, stateDirectory);
@@ -247,7 +254,7 @@ try {
         status.response.ok && status.body?.phase === "settled",
         status.body?.operationalState === "settled",
         status.body?.selectedOffer?.amountSats === "350" && status.body?.selectedOffer?.unit === "sat",
-        status.body?.requesterDecision?.source === "deterministic",
+        status.body?.requesterDecision?.source === expectedDecisionSource,
         status.body?.requesterDecision?.authorized === true,
         status.body?.availableActions?.resume === false && status.body?.availableActions?.reconcile === false,
         status.body?.resultAvailable === true && status.body?.reportAvailable === true,
@@ -278,7 +285,7 @@ try {
         if (
           !reloadedStatus.response.ok ||
           reloadedStatus.body?.phase !== "settled" ||
-          reloadedStatus.body?.requesterDecision?.source !== "deterministic" ||
+          reloadedStatus.body?.requesterDecision?.source !== expectedDecisionSource ||
           reloadedStatus.body?.resultAvailable !== true ||
           reloadedStatus.body?.reportAvailable !== true ||
           !reloadedReport.response.ok ||
@@ -291,6 +298,7 @@ try {
             transactionId,
             agreementRootEventId: report.body.agreementRootEventId,
             offerSats: report.body.amountSats,
+            requesterDecisionSource: expectedDecisionSource,
             finalState: status.body.phase,
             fundingSubmissions,
             releaseSubmissions,

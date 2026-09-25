@@ -23,6 +23,12 @@ export const REQUIRED_LOCAL_VARIABLES = Object.freeze([
   "PACTAGENT_LIVE_STATE_DIRECTORY",
 ]);
 
+export const REQUIRED_REQUESTER_MODEL_VARIABLES = Object.freeze([
+  "PACTAGENT_REQUESTER_MODEL_PROVIDER",
+  "PACTAGENT_REQUESTER_MODEL_NAME",
+  "PACTAGENT_REQUESTER_MODEL_API_KEY",
+]);
+
 export function loadLocalEnvironment(base = process.env) {
   const loaded = { ...base };
   const path = resolve(PROJECT_ROOT, ".env");
@@ -54,6 +60,24 @@ export function childEnvironmentWithCa(environment, caPath = resolveLocalCaPath(
 
 export function missingRequiredVariables(environment) {
   return REQUIRED_LOCAL_VARIABLES.filter((name) => !environment[name]?.trim());
+}
+
+export function requesterModelConfigurationStatus(environment) {
+  const mode = environment.PACTAGENT_REQUESTER_DECISION_MODE?.trim() || "deterministic";
+  if (mode === "deterministic") return Object.freeze({ ok: true, mode, missing: Object.freeze([]) });
+  if (mode !== "model") {
+    return Object.freeze({ ok: false, mode, missing: Object.freeze([]) });
+  }
+  const missing = REQUIRED_REQUESTER_MODEL_VARIABLES.filter(
+    (name) => !environment[name]?.trim(),
+  );
+  const providerSupported = environment.PACTAGENT_REQUESTER_MODEL_PROVIDER?.trim() === "openai";
+  return Object.freeze({
+    ok: missing.length === 0 && providerSupported,
+    mode,
+    missing: Object.freeze(missing),
+    providerSupported,
+  });
 }
 
 export function runtimeBaseUrl(environment) {

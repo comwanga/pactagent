@@ -8,6 +8,7 @@ import {
   DEFAULT_CA_PATH,
   DEFAULT_STATE_PATH,
   missingRequiredVariables,
+  requesterModelConfigurationStatus,
   resolveLocalCaPath,
   resolveLocalStatePath,
 } from "./local-env.mjs";
@@ -61,6 +62,23 @@ describe("local developer tooling", () => {
     expect(resolveLocalStatePath({})).toBe(DEFAULT_STATE_PATH);
     expect(missingRequiredVariables({})).toContain("PACTAGENT_LIVE_FUNDING_TOKEN");
     expect(missingRequiredVariables({})).not.toContain("NODE_EXTRA_CA_CERTS");
+  });
+
+  it("requires model credentials only when model requester mode is explicit", () => {
+    expect(requesterModelConfigurationStatus({})).toEqual({
+      ok: true,
+      mode: "deterministic",
+      missing: [],
+    });
+    expect(requesterModelConfigurationStatus({
+      PACTAGENT_REQUESTER_DECISION_MODE: "model",
+      PACTAGENT_REQUESTER_MODEL_PROVIDER: "openai",
+    })).toMatchObject({
+      ok: false,
+      mode: "model",
+      missing: ["PACTAGENT_REQUESTER_MODEL_NAME", "PACTAGENT_REQUESTER_MODEL_API_KEY"],
+      providerSupported: true,
+    });
   });
 
   it("reports empty writable state as economically safe", async () => {

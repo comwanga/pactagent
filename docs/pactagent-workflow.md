@@ -270,23 +270,27 @@ npx vitest run src/lib/pactagent-workflow.test.ts -t "cross-boundary safety"
 
 ## AI/model boundary
 
-The requester-decision adapter is advisory only. The current local adapter is
-deterministic; no hosted AI/model adapter is configured. A future model-backed
-adapter would receive:
+The requester-decision adapter is advisory only. Deterministic mode remains the
+default; optional model mode uses the OpenAI Responses API behind the same
+provider-neutral `RequesterDecisionModel` interface. Model mode receives:
 
 - Safe discovery projection (public keys, stable references, amount, duration)
-- Private bounded instruction
+- Private bounded requester instruction (sent to the configured model provider)
 
 It does NOT receive:
 
 - Signer, relay, lifecycle, or Cashu capabilities
 - Private keys, tokens, proofs, or secrets
+- Source document, complete private result, funding reference, or database content
 - Signing, publication, lifecycle, or settlement authority
 
 The deterministic CI lane uses an injected `FakeRequesterDecisionModel`; the
-local live runtime uses an injected deterministic recommendation. Both are
-gated by the same deterministic requester policy. A future model adapter can
-plug into this recommendation boundary without receiving Nostr, Cashu,
-agreement, or settlement authority. This issue does not introduce a model
-vendor, SDK, credential management, model routing, or autonomous agent
-infrastructure.
+model-adapter tests use a fake transport, and the live runtime selects its adapter
+from explicit environment configuration. Model output is constrained to the
+existing recommend/decline contract, then parsed strictly and checked against the
+authoritative discovery snapshot and requester policy. Wrong providers,
+references, amounts, budgets, capabilities, settlement compatibility, and
+durations fail closed. Timeout, unavailability, malformed output, and decline do
+not create an agreement or economic operation. `npm run requester:model:doctor`
+performs one bounded synthetic provider request without creating a PactAgent
+transaction or touching Cashu/Nostr.

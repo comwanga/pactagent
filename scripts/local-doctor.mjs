@@ -14,6 +14,7 @@ import {
   childEnvironmentWithCa,
   loadLocalEnvironment,
   missingRequiredVariables,
+  requesterModelConfigurationStatus,
   resolveLocalCaPath,
   resolveLocalStatePath,
 } from "./local-env.mjs";
@@ -102,6 +103,19 @@ export async function runLocalDoctor(options = {}) {
     missing.length === 0
       ? "all required variable names are present"
       : `missing variable names: ${missing.join(", ")}`,
+  );
+  const requesterModel = requesterModelConfigurationStatus(environment);
+  add(
+    checks,
+    requesterModel.ok,
+    "requester decision mode",
+    requesterModel.ok
+      ? `${requesterModel.mode} mode configuration is present`
+      : requesterModel.mode === "model" && requesterModel.missing.length > 0
+        ? `missing variable names: ${requesterModel.missing.join(", ")}`
+        : requesterModel.mode === "model"
+          ? "configured model provider is unsupported"
+          : "PACTAGENT_REQUESTER_DECISION_MODE must be deterministic or model",
   );
 
   const docker = runSync("docker", ["version", "--format", "{{.Server.Version}}"]).status === 0;
