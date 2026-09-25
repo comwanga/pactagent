@@ -313,7 +313,12 @@ export interface BuiltRuntime {
 export function buildRuntimeConfig(
   fixture: RuntimeFixture,
   shared: SharedStores,
-  options: { relay?: MemoryRelay; cashu?: FakeCashuPort } = {},
+  options: {
+    relay?: MemoryRelay;
+    cashu?: FakeCashuPort;
+    decisionModel?: RequesterDecisionModel;
+    requesterDecisionSource?: "deterministic" | "model";
+  } = {},
 ): BuiltRuntime {
   const relay = options.relay ?? new MemoryRelay();
   if (options.relay === undefined) {
@@ -325,7 +330,7 @@ export function buildRuntimeConfig(
     relay,
     clock,
     requesterPolicy: fixture.requesterPolicy,
-    decisionModel: fixture.decisionModel,
+    decisionModel: options.decisionModel ?? fixture.decisionModel,
     decisionBounds: fixture.decisionBounds,
     cashu,
     privateDelivery: new FakePrivateDelivery(),
@@ -340,6 +345,7 @@ export function buildRuntimeConfig(
     privateStore: shared.privateStore,
     references: fixture.references,
     selectedReferences: fixture.selectedReferences,
+    requesterDecisionSource: options.requesterDecisionSource ?? "deterministic",
     resolveFunding: async (reference) => {
       if (reference !== "funding-reference-0001") throw new Error("Unknown funding reference");
       return privateFunding();

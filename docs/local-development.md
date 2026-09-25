@@ -38,6 +38,14 @@ single-use bearer value. Keep the live acceptance explicitly opt-in.
 7. Develop and run `npm test` plus `npm run test:process` normally.
 8. Stop the runtime with Ctrl-C, then run `npm run local:down`.
 
+Deterministic requester recommendations are the default. To opt into model mode,
+set `PACTAGENT_REQUESTER_DECISION_MODE=model` plus the provider, model-name, and
+API-key variables documented in `.env.example`, then run
+`npm run requester:model:doctor`. The doctor makes one bounded recommendation
+request but creates no transaction and performs no Nostr or Cashu operation.
+The private requester instruction is sent to the configured provider in model
+mode; the source document and economic credentials are not.
+
 `local:down` removes only Compose containers and their network. It preserves `.env`, the local CA,
 Strfry data, Testnut funding configuration, SQLite state, and diagnostic evidence.
 
@@ -57,6 +65,7 @@ PACTAGENT LOCAL ENVIRONMENT READY
 | `npm test` | Deterministic and non-economic |
 | `npm run test:process` | Deterministic separate-process recovery acceptance; non-economic |
 | `npm run local:doctor` | Live but read-only: Docker, WSS, relay, Testnut NUT-07, and SQLite inspection |
+| `npm run requester:model:doctor` | One bounded provider call; no PactAgent transaction or economic operation |
 | `npm run test:local:testnut` | Explicitly opt-in; consumes Testnut ecash in exactly one golden-path transaction |
 
 `test:local:testnut` must own port 3000, so stop a separately running local runtime first. It runs

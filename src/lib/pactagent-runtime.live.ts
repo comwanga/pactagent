@@ -49,6 +49,11 @@ import type { RequesterDecisionBounds, RequesterDecisionModel } from "./requeste
 import type { SelectedProviderReferences } from "./provider-discovery";
 import type { SignedNostrEvent } from "../domain/nostr";
 import type { NostrRelayAdapter } from "./nostr-relay";
+import { createModelBackedRequesterDecisionModel } from "./model-requester-decision";
+import {
+  createOpenAIRequesterRecommendationTransport,
+  readRequesterDecisionModeConfiguration,
+} from "./openai-requester-decision";
 
 /*
  * Opt-in live PactAgent runtime wiring (Issue #33).
@@ -82,6 +87,34 @@ export type PactAgentRuntimeWiringFactory = (
   config: PactAgentLiveDemoConfig,
   decisionModel: RequesterDecisionModel,
 ) => PactAgentRuntimeWiring;
+
+export interface LiveRequesterDecision {
+  readonly source: "deterministic" | "model";
+  readonly model: RequesterDecisionModel;
+}
+
+export function createLiveRequesterDecisionFromEnv(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  fetchImplementation: typeof fetch = fetch,
+): LiveRequesterDecision {
+  const configuration = readRequesterDecisionModeConfiguration(environment);
+  if (configuration.mode === "deterministic") {
+    return Object.freeze({
+      source: "deterministic",
+      model: createLiveDemoApprovalDecisionModel(),
+    });
+  }
+  return Object.freeze({
+    source: "model",
+    model: createModelBackedRequesterDecisionModel(
+      createOpenAIRequesterRecommendationTransport({
+        apiKey: configuration.apiKey,
+        modelName: configuration.modelName,
+        fetchImplementation,
+      }),
+    ),
+  });
+}
 
 export async function publishRuntimeRequesterDefinition(
   config: PactAgentLiveDemoConfig,
@@ -289,16 +322,17 @@ export async function createPactAgentRuntimeFromEnv(
   wiringFactory: PactAgentRuntimeWiringFactory = wireDependencies,
 ): Promise<PactAgentRuntimeEnv> {
   let config: PactAgentLiveDemoConfig;
+  let requesterDecision: LiveRequesterDecision;
   try {
     config = assertLiveDemoConfig(readLiveDemoConfigFromEnv());
+    requesterDecision = createLiveRequesterDecisionFromEnv();
   } catch (error) {
     throw new PactAgentRuntimeError(
       "invalid_configuration",
       error instanceof Error ? error.message : "Live runtime configuration is missing",
     );
   }
-  const decisionModel = createLiveDemoApprovalDecisionModel();
-  const wired = wiringFactory(config, decisionModel);
+  const wired = wiringFactory(config, requesterDecision.model);
 
   try {
     await wired.relay.connect();
@@ -327,7 +361,7 @@ export async function createPactAgentRuntimeFromEnv(
       privateStore: wired.privateStore,
       references,
       selectedReferences,
-      requesterDecisionSource: "deterministic",
+      requesterDecisionSource: requesterDecision.source,
       resolveFunding: async (reference) => {
         const lookupReference =
           reference === "legacy-configured-funding" ? config.fundingReference : reference;

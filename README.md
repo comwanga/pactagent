@@ -14,6 +14,7 @@ The integrated runtime executes the `document-summary@1` path end to end:
 Requester
   → Nostr provider discovery
   → signed 350-sat service offer
+  → deterministic or model-backed requester recommendation
   → deterministic requester authorization
   → service agreement
   → Cashu escrow funding
@@ -23,9 +24,10 @@ Requester
   → Cashu settlement
 ```
 
-The current local requester-decision adapter supplies a deterministic advisory recommendation; no
-hosted AI/model adapter is configured. The same decision boundary can accept a future model-backed
-recommendation without granting the model authority. Deterministic policy decides whether an
+The requester-decision adapter is configurable: deterministic mode remains the default for local
+development and CI, while model mode uses a configured OpenAI model for an advisory recommendation.
+The bounded requester instruction is sent to that provider in model mode. The model cannot sign,
+fund, release, reconcile, or authorize. Deterministic policy independently decides whether an
 economic action is authorized, and the runtime remains authoritative for lifecycle and recovery.
 Public agreement events and API projections are separated from private task, result, Cashu, key,
 and credential material.
@@ -139,6 +141,7 @@ must not be treated as production-money testing.
 |---|---|
 | `npm run local:up` | Start the Compose-owned Strfry and Caddy services and export the local CA root. |
 | `npm run local:doctor` | Run zero-economic Docker, TLS, relay, Testnut, funding, and durable-state checks. |
+| `npm run requester:model:doctor` | Make one bounded non-economic recommendation request to validate model configuration and structured output. |
 | `npm run runtime:start:local` | Start the production-like Next.js runtime with the local CA injected before Node starts. |
 | `npm test` | Run the deterministic, non-economic test suite. |
 | `npm run test:process` | Run deterministic separate-process restart and recovery acceptance. |
@@ -155,6 +158,7 @@ Copy [.env.example](.env.example) to `.env`. Configuration is grouped into:
 - independent requester, provider, and escrow-authority Nostr keys;
 - independent normal-spend and refund-spend Cashu keys;
 - a Testnut funding token and opaque local funding reference.
+- requester recommendation mode and, only for model mode, model provider, name, and API key.
 
 Never commit `.env`, bearer ecash, proofs, private keys, SQLite files, or generated certificates.
 Node reads extra CA roots during process initialization, so application code cannot safely set the
@@ -164,6 +168,8 @@ trust path after startup. `runtime:start:local` loads the configuration and supp
 ## Safety and trust boundaries
 
 - Signer and encryption boundaries retain private keys; the model receives no signing capability.
+- Model mode sends the bounded requester instruction and safe verified-candidate projection to the
+  configured provider; documents, results, wallet material, and runtime credentials are excluded.
 - Cashu tokens, proofs, witnesses, preimages, and spending keys remain private.
 - Public lifecycle/status/report objects are explicit allowlists.
 - Private results are available only through the authorized private-result boundary.
@@ -177,8 +183,9 @@ PactAgent remains an integrated proof-of-concept and test environment, not produ
 software. The runtime uses one explicitly configured Cashu test mint, has no production wallet or
 automatic Lightning acquisition of ecash, and has no real-sats/production mode. Developers provide
 their own isolated test keys, API token, and Testnut ecash. The requester-facing UI is the next
-application layer and is outside Issue #33. A hosted model adapter is also future work; the current
-local adapter is deterministic.
+application layer and is outside this runtime work. The initial optional model integration supports
+OpenAI's Responses API; generic provider routing, local-model hosting, and production credential
+management remain out of scope.
 
 ## Documentation
 

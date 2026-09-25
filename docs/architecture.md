@@ -6,6 +6,10 @@ PactAgent is an application built on Pontmore. The canonical Pontmore PIPs remai
 Human intent
      |
      v
+bounded requester recommendation
+ (deterministic or model-backed)
+     |
+     v
 P001 Requester ---------------- P002 Provider
      |                                |
      +-------- deterministic policy --+
@@ -100,10 +104,11 @@ test mint and can privately import already-acquired proofs and deliver confirmed
 outputs. Required tests remain deterministic and offline.
 
 Issue #33 provides the application composition, long-lived requester/provider
-runtime, and authenticated transaction HTTP API. A requester-facing UI and a
-hosted model adapter remain pending. The current live requester-decision adapter
-is deterministic, and deterministic policy remains the economic authorization
-boundary regardless of recommendation source. This is not a production wallet:
+runtime, and authenticated transaction HTTP API. A requester-facing UI remains
+separate. The live requester-decision boundary supports a deterministic adapter
+and an optional OpenAI Responses API adapter. The latter receives only the bounded
+instruction and safe verified-candidate projection. In both modes deterministic
+policy remains the economic authorization boundary. This is not a production wallet:
 Lightning mint-quote acquisition, generic accounts, multi-mint routing, and
 production custody operations remain out of scope. No generic marketplace,
 reputation, bidding, or dispute adjudication is provided.

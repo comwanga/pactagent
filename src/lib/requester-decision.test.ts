@@ -12,6 +12,11 @@ import {
 } from "../domain/pact-service-offer";
 import type { AuthorizedProviderCandidate, DiscoveryResult } from "./provider-discovery";
 import {
+  createModelBackedRequesterDecisionModel,
+  type RequesterRecommendationRequest,
+  type RequesterRecommendationTransport,
+} from "./model-requester-decision";
+import {
   RequesterDecisionModelFailure,
   runRequesterDecision,
   type RequesterDecisionModel,
@@ -140,6 +145,12 @@ function fakeModel(output: unknown, capture?: (input: SafeRequesterDecisionInput
       return output;
     },
   };
+}
+
+function transportModel(
+  complete: RequesterRecommendationTransport["complete"],
+): RequesterDecisionModel {
+  return createModelBackedRequesterDecisionModel({ complete });
 }
 
 function requestInput(overrides: Partial<RunRequesterDecisionInput> = {}): RunRequesterDecisionInput {
@@ -638,5 +649,141 @@ describe("bounded AI requester decision", () => {
       model: fakeModel(recommendationFor(input.discovery, { rationale: "long" })),
     });
     expect(result).toEqual({ status: "rejected", reason: "malformed_model_output" });
+  });
+});
+
+describe("model-backed requester adapter", () => {
+  it("sends only the bounded requester instruction, budget, capability, and verified candidates", async () => {
+    const input = requestInput();
+    let captured: RequesterRecommendationRequest | undefined;
+    const model = transportModel(async (request) => {
+      captured = request;
+      return recommendationFor(input.discovery);
+    });
+
+    expect(await runRequesterDecision({ ...input, model })).toMatchObject({
+      status: "approved",
+      reason: "approved",
+      amountSats: "350",
+    });
+    expect(captured).toEqual({
+      instruction: PRIVATE_INSTRUCTION,
+      capabilityProfile: DOCUMENT_SUMMARY_PROFILE_ID,
+      maximumBudgetSats: "500",
+      candidates: [{
+        providerPublicKey: input.discovery.selected!.selected.providerPublicKey,
+        providerDefinitionReference: input.discovery.selected!.selected.providerDefinitionReference,
+        offerReference: input.discovery.selected!.selected.offerReference,
+        escrowDescriptorReference: input.discovery.selected!.selected.escrowDescriptorReference,
+        amountSats: "350",
+        settlementNetwork: "cashu",
+        maximumExecutionSeconds: 120,
+      }],
+    });
+    const serialized = JSON.stringify(captured);
+    for (const forbidden of [
+      "proofs", "token", "privateKey", "secretKey", "fundingReference", "preimage",
+      "settlementStore", "sqlite", "privateResult", "sourceDocument",
+    ]) {
+      expect(serialized.toLowerCase()).not.toContain(forbidden.toLowerCase());
+    }
+  });
+
+  it.each([
+    ["higher amount", { proposedAmountSats: "450" }, "amount_mismatch"],
+    ["unknown provider", { providerPublicKey: "33".repeat(32) }, "unknown_provider"],
+    ["provider reference substitution", { providerDefinitionReference: `30360:${"44".repeat(32)}:other` }, "provider_definition_reference_mismatch"],
+    ["offer reference substitution", { offerReference: `30400:${"44".repeat(32)}:other` }, "offer_reference_mismatch"],
+    ["descriptor reference substitution", { escrowDescriptorReference: `30361:${"44".repeat(32)}:other` }, "escrow_reference_mismatch"],
+  ])("keeps deterministic authorization authoritative for %s", async (_label, overrides, reason) => {
+    const input = requestInput();
+    const model = transportModel(async () => recommendationFor(input.discovery, overrides));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({ status: "rejected", reason });
+  });
+
+  it("rejects an otherwise exact model recommendation above the human budget", async () => {
+    const candidate = createCandidate({ amountSats: sats(501n) });
+    const discovery = discoveryResult(candidate);
+    const input = requestInput({
+      discovery,
+      requesterPolicy: { ...REQUESTER_POLICY, maxBudgetSats: sats(1_000n), maximumProviderPriceSats: sats(1_000n) },
+      intent: {
+        capabilityProfile: DOCUMENT_SUMMARY_PROFILE_ID,
+        maximumBudgetSats: sats(500n),
+        instruction: PRIVATE_INSTRUCTION,
+      },
+    });
+    const model = transportModel(async () => recommendationFor(discovery));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({
+      status: "rejected",
+      reason: "human_budget_exceeded",
+    });
+  });
+
+  it("rejects a model recommendation for a selected unsupported capability", async () => {
+    const candidate = createCandidate();
+    const unsupported = {
+      ...candidate,
+      offer: {
+        ...candidate.offer,
+        content: {
+          ...candidate.offer.content,
+          capability_profile: { id: "unsupported-capability", version: 1 },
+        },
+      },
+    } as unknown as AuthorizedProviderCandidate;
+    const discovery = discoveryResult(unsupported);
+    const input = requestInput({ discovery });
+    const model = transportModel(async () => recommendationFor(discovery));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({
+      status: "rejected",
+      reason: "unsupported_capability_profile",
+    });
+  });
+
+  it.each([
+    ["Cashu-incompatible descriptor", createCandidate({ compatibleEscrow: false }), "cashu_incompatible"],
+    ["excessive execution duration", createCandidate({ maximumExecutionSeconds: 901 }), "duration_rejected"],
+  ])("rejects a model recommendation with %s", async (_label, candidate, reason) => {
+    const discovery = discoveryResult(candidate);
+    const input = requestInput({ discovery });
+    const model = transportModel(async () => recommendationFor(discovery));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({ status: "rejected", reason });
+  });
+
+  it("fails closed for malformed structured output", async () => {
+    const input = requestInput();
+    const model = transportModel(async () => ({ action: "recommend", amount: 350 }));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({
+      status: "rejected",
+      reason: "malformed_model_output",
+    });
+  });
+
+  it("maps model decline without creating economic authority", async () => {
+    const input = requestInput();
+    const model = transportModel(async () => ({ action: "decline", rationale: "No suitable offer." }));
+    expect(await runRequesterDecision({ ...input, model })).toEqual({
+      status: "rejected",
+      reason: "model_declined",
+    });
+  });
+
+  it("maps timeout and provider unavailability to existing safe failures", async () => {
+    const input = requestInput();
+    const timeoutModel = transportModel(() => new Promise(() => undefined));
+    expect(await runRequesterDecision({
+      ...input,
+      model: timeoutModel,
+      bounds: { ...input.bounds, modelTimeoutMilliseconds: 5 },
+    })).toEqual({ status: "rejected", reason: "model_timeout" });
+
+    const unavailableModel = transportModel(async () => {
+      throw new RequesterDecisionModelFailure("unavailable");
+    });
+    expect(await runRequesterDecision({ ...input, model: unavailableModel })).toEqual({
+      status: "rejected",
+      reason: "model_unavailable",
+    });
   });
 });

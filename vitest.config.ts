@@ -23,6 +23,7 @@ export default defineConfig({
             "src/**/*.live.test.ts",
             "src/**/*.blackbox.test.ts",
             "src/**/*.process.test.ts",
+            "src/**/*.model-doctor.test.ts",
             "src/lib/cashu-escrow-settlement.test.ts",
             "src/lib/pactagent-runtime-api.test.ts",
             "src/lib/pactagent-runtime.test.ts",

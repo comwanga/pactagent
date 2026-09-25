@@ -26,6 +26,7 @@
     "test:process": "vitest run --config vitest.process.config.ts",
     "test:blackbox": "next build && vitest run --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-runtime.blackbox.test.ts",
     "test:local:testnut": "node scripts/run-with-local-ca.mjs scripts/test-local-testnut.mjs",
+    "requester:model:doctor": "vitest run --config vitest.model.config.ts --configLoader runner --maxWorkers=1",
     "local:up": "node scripts/local-up.mjs",
     "local:doctor": "node scripts/run-with-local-ca.mjs scripts/local-doctor.mjs --allow-missing-ca",
     "local:down": "node scripts/local-down.mjs",
