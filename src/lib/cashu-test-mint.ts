@@ -566,12 +566,14 @@ export interface PrepareLockedValueInput {
   readonly funding: PrivateCashuFunding;
   readonly amountSats: Sats;
   readonly spendingCondition: CashuP2PKSpendingCondition;
+  readonly allowFreshPreparation?: boolean;
 }
 
 export interface SpendLockedValueInput {
   readonly operationId: string;
   readonly handle: CashuPrivateHandle;
   readonly spendingKey: PrivateCashuSpendingKey;
+  readonly allowFreshPreparation?: boolean;
 }
 
 export interface CashuTestMintPort {
@@ -1842,6 +1844,14 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       ) {
         return this.resumeExisting(operationId, fingerprint, existing);
       }
+      if (input.allowFreshPreparation === false) {
+        cashuError(
+          "operation_rejected",
+          "Escrow locktime has passed; fresh funding is not viable",
+          "not_submitted",
+          operationId,
+        );
+      }
       if (sumProofAmounts(funding.proofs) < input.amountSats) {
         const error = new CashuTestMintError(
           "insufficient_value",
@@ -1908,7 +1918,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         await this.writeOperation(operationId, {
           fingerprint,
           kind: "lock",
-          status: "not_submitted",
+          status: "submitted_unknown",
           prepared,
           allowedPublicKeys: condition.allowedPublicKeys,
         });
@@ -1984,6 +1994,14 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           await this.markValueConsumed(input.handle, value, operationId);
         }
         return resumed;
+      }
+      if (input.allowFreshPreparation === false) {
+        cashuError(
+          "operation_rejected",
+          "Fresh Cashu spending is not permitted during reconciliation",
+          "not_submitted",
+          operationId,
+        );
       }
       let prepared: CashuPrivatePreparedSwap;
       try {
@@ -2093,24 +2111,8 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         operationId,
       );
     }
-    // A prior not-submitted attempt can be prepared and submitted again safely.
     if (existing.prepared) {
-      if (existing.kind === "lock") {
-        await this.updateExposure(
-          operationId,
-          existing.prepared.exposureAmountSats,
-          "reserved",
-        );
-      }
-      return this.submitPrepared(
-        operationId,
-        existing.fingerprint,
-        existing.kind,
-        existing.prepared,
-        existing.allowedPublicKeys,
-        existing.spentExposureOperationId,
-        tombstone,
-      );
+      return this.reconcilePrepared(operationId, existing, tombstone);
     }
     cashuError(
       existing.errorCode ?? "operation_rejected",
@@ -2169,6 +2171,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         return reconciliationRequired(operationId);
       }
       const normalized = mapBackendError(error, operationId);
+      if (kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          prepared.exposureAmountSats,
+          "released",
+        );
+      }
       await this.writeOperation(operationId, {
         fingerprint,
         kind,
@@ -2177,13 +2186,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         allowedPublicKeys,
         spentExposureOperationId,
       });
-      if (kind === "lock") {
-        await this.updateExposure(
-          operationId,
-          prepared.exposureAmountSats,
-          "released",
-        );
-      }
       throw normalized;
     }
   }
@@ -2196,28 +2198,27 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     const prepared = operation.prepared;
     if (!prepared) return reconciliationRequired(operationId);
     let restored: CashuPrivateSwapResult | undefined;
+    let allUnspent = false;
     try {
       const states = await this.backend.inspectProofStates(prepared.inputProofs);
       if (
         states.length !== prepared.inputProofs.length ||
-        states.some((state) => !["unspent", "pending", "spent"].includes(state.state)) ||
-        !states.every((state) => state.state === "spent")
+        states.some((state) => !["unspent", "pending", "spent"].includes(state.state))
       ) {
         return reconciliationRequired(operationId);
       }
-      restored = await this.backend.restore(prepared);
+      if (states.every((state) => state.state === "unspent")) {
+        allUnspent = true;
+      } else {
+        if (!states.every((state) => state.state === "spent")) {
+          return reconciliationRequired(operationId);
+        }
+        restored = await this.backend.restore(prepared);
+      }
     } catch {
       return reconciliationRequired(operationId);
     }
-    if (!restored) {
-      await this.writeOperation(operationId, {
-        fingerprint: operation.fingerprint,
-        kind: operation.kind,
-        status: "failed_definitively",
-        errorCode: "proof_already_spent",
-        allowedPublicKeys: operation.allowedPublicKeys,
-        spentExposureOperationId: operation.spentExposureOperationId,
-      });
+    if (allUnspent) {
       if (operation.kind === "lock") {
         await this.updateExposure(
           operationId,
@@ -2231,6 +2232,43 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           "released",
         );
       }
+      await this.writeOperation(operationId, {
+        fingerprint: operation.fingerprint,
+        kind: operation.kind,
+        status: "not_submitted",
+        errorCode: "operation_rejected",
+        allowedPublicKeys: operation.allowedPublicKeys,
+        spentExposureOperationId: operation.spentExposureOperationId,
+      });
+      cashuError(
+        "operation_rejected",
+        "Cashu swap did not take effect",
+        "not_submitted",
+        operationId,
+      );
+    }
+    if (!restored) {
+      if (operation.kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          prepared.exposureAmountSats,
+          "released",
+        );
+      } else if (operation.spentExposureOperationId !== undefined) {
+        await this.updateExposure(
+          operation.spentExposureOperationId,
+          prepared.requestedAmountSats,
+          "released",
+        );
+      }
+      await this.writeOperation(operationId, {
+        fingerprint: operation.fingerprint,
+        kind: operation.kind,
+        status: "failed_definitively",
+        errorCode: "proof_already_spent",
+        allowedPublicKeys: operation.allowedPublicKeys,
+        spentExposureOperationId: operation.spentExposureOperationId,
+      });
       cashuError(
         "proof_already_spent",
         "Cashu inputs were spent by another operation",
@@ -2260,7 +2298,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     spentExposureOperationId?: string,
     tombstone?: SpendSourceTombstone,
   ): Promise<CashuOperationSucceeded> {
-    const inputAmount = sumProofAmounts(prepared.inputProofs);
+    const inputAmount = cashuAccountingInputAmount(prepared);
     const outputAmount = sumProofAmounts(result.sendProofs);
     const changeAmount = sumProofAmounts(result.keepProofs);
     const mintFee = inputAmount - outputAmount - changeAmount;
@@ -2450,6 +2488,27 @@ function endpointBelongsToMint(endpoint: string, mintUrl: string): boolean {
   }
 }
 
+/** @internal Serializes Cashu v1 request amounts as JSON integers. */
+export function serializeCashuRequestBody(value: unknown): string {
+  return JSON.stringify(value, (key, entry: unknown) => {
+    if (key === "amount" && typeof entry === "string") {
+      if (!/^(0|[1-9][0-9]*)$/.test(entry)) {
+        throw new BoundedCashuRequestError("malformed");
+      }
+      const amount = BigInt(entry);
+      if (amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new BoundedCashuRequestError("malformed");
+      }
+      return Number(amount);
+    }
+    if (typeof entry !== "bigint") return entry;
+    if (entry > BigInt(Number.MAX_SAFE_INTEGER) || entry < 0n) {
+      throw new BoundedCashuRequestError("malformed");
+    }
+    return Number(entry);
+  });
+}
+
 function createBoundedCashuRequest(
   configuration: NormalizedCashuTestMintConfiguration,
 ): RequestFn {
@@ -2462,13 +2521,7 @@ function createBoundedCashuRequest(
     const body =
       options.requestBody === undefined
         ? undefined
-        : JSON.stringify(options.requestBody, (_key, value: unknown) => {
-            if (typeof value !== "bigint") return value;
-            if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < 0n) {
-              throw new BoundedCashuRequestError("malformed");
-            }
-            return Number(value);
-          });
+        : serializeCashuRequestBody(options.requestBody);
     let response: Response;
     try {
       response = await fetch(options.endpoint, {
@@ -2529,6 +2582,13 @@ interface CashuTsPreparedOpaque {
 
 function isCashuTsPreparedOpaque(value: unknown): value is CashuTsPreparedOpaque {
   return typeof value === "object" && value !== null && "preview" in value && "unselectedProofs" in value;
+}
+
+/** @internal Includes cashu-ts proofs that were deliberately left out of the submitted swap. */
+export function cashuAccountingInputAmount(prepared: CashuPrivatePreparedSwap): bigint {
+  const selectedAmount = sumProofAmounts(prepared.inputProofs);
+  if (!isCashuTsPreparedOpaque(prepared.opaque)) return selectedAmount;
+  return selectedAmount + sumProofAmounts(deserializeProofs([...prepared.opaque.unselectedProofs]));
 }
 
 function backendFailure(

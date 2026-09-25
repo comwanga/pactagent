@@ -76,6 +76,7 @@ export interface PactAgentLiveDemoConfig {
   readonly normalSpendKeyHex: string;
   readonly refundSpendKeyHex: string;
   readonly fundingToken: string;
+  readonly fundingReference: string;
   readonly stateDirectory: string;
 }
 
@@ -88,6 +89,7 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
   const normalSpendKeyHex = process.env.PACTAGENT_LIVE_NORMAL_SPEND_KEY;
   const refundSpendKeyHex = process.env.PACTAGENT_LIVE_REFUND_SPEND_KEY;
   const fundingToken = process.env.PACTAGENT_LIVE_FUNDING_TOKEN;
+  const fundingReference = process.env.PACTAGENT_LIVE_FUNDING_REFERENCE;
   const stateDirectory = process.env.PACTAGENT_LIVE_STATE_DIRECTORY;
 
   if (
@@ -99,6 +101,7 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     !normalSpendKeyHex ||
     !refundSpendKeyHex ||
     !fundingToken ||
+    !fundingReference ||
     !stateDirectory
   ) {
     return undefined;
@@ -113,6 +116,7 @@ export function readLiveDemoConfigFromEnv(): PactAgentLiveDemoConfig | undefined
     normalSpendKeyHex,
     refundSpendKeyHex,
     fundingToken,
+    fundingReference,
     stateDirectory,
   };
 }
@@ -124,7 +128,8 @@ export function assertLiveDemoConfig(config: PactAgentLiveDemoConfig | undefined
         "PACTAGENT_CASHU_TEST_MINT_URL, PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY, " +
         "PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY, PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY, " +
         "PACTAGENT_LIVE_NORMAL_SPEND_KEY, PACTAGENT_LIVE_REFUND_SPEND_KEY, and " +
-        "PACTAGENT_LIVE_FUNDING_TOKEN, and PACTAGENT_LIVE_STATE_DIRECTORY. " +
+        "PACTAGENT_LIVE_FUNDING_TOKEN, PACTAGENT_LIVE_FUNDING_REFERENCE, and " +
+        "PACTAGENT_LIVE_STATE_DIRECTORY. " +
         "Missing configuration causes a clean skip — never a fallback to production.",
     );
   }

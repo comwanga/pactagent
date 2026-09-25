@@ -93,6 +93,7 @@ export type PactAgentWorkflowErrorCode =
   | "decision_rejected"
   | "agreement_publication_failed"
   | "escrow_failed"
+  | "reconciliation_required"
   | "private_transport_failed"
   | "execution_failed"
   | "completion_failed"
@@ -183,8 +184,23 @@ export interface PactAgentWorkflowTransactionInput {
   readonly privatePrompt?: string;
   readonly maximumBudgetSats: Sats;
   readonly agreementId?: string;
+  readonly createdAt?: number;
   readonly expiresAt?: number;
   readonly funding: PrivateCashuFunding;
+  /** Optional pre-computed commitment salt. When omitted a fresh salt is generated. */
+  readonly privateSalt?: PactPrivateCommitmentSalt;
+  /** Runtime-owned durable checkpoint after the requester decision is authorized. */
+  readonly onRequesterDecision?: (decision: ApprovedRequesterDecision) => Promise<void>;
+  /** Runtime-owned durable lifecycle checkpoint. It never receives private payloads. */
+  readonly onProgress?: (progress: PactAgentWorkflowProgress) => Promise<void>;
+}
+
+export interface PactAgentWorkflowProgress {
+  readonly phase: PactAgentWorkflowResumePhase;
+  readonly agreementRootEventId: string;
+  readonly escrowReference?: string;
+  readonly escrowVersion?: number;
+  readonly resultReference?: string;
 }
 
 /** Safe structured report returned by a completed workflow run. */
@@ -212,6 +228,50 @@ export interface PactAgentWorkflowReport {
   readonly settlementReference?: string;
   readonly refundReference?: string;
   readonly finalOutcome: "settled" | "refunded";
+}
+
+/**
+ * The lifecycle state at which a resumed transaction continues. A resume state
+ * records the exact point at which a prior workflow run was interrupted so a
+ * restarted workflow can continue without generating a second agreement, salt,
+ * transition, or economic operation.
+ */
+export type PactAgentWorkflowResumePhase =
+  | "proposed"
+  | "accepted"
+  | "escrow_funded"
+  | "task_delivered"
+  | "result_submitted"
+  | "result_verified"
+  | "release_authorized"
+  | "settled"
+  | "refund_authorized"
+  | "refunded";
+
+/**
+ * Minimum private workflow state required to resume a successful or refund
+ * transaction after a restart. The context, salt, terms, and decision are the
+ * same objects produced by the original run; the caller reconstructs them from
+ * its persisted transaction record plus relay/durable-store state.
+ */
+export interface PactAgentWorkflowResumeState {
+  readonly kind: "successful" | "refund";
+  readonly phase: PactAgentWorkflowResumePhase;
+  readonly privateTerms: DocumentSummaryPrivateTerms;
+  readonly privateSalt: PactPrivateCommitmentSalt;
+  readonly context: PactAgreementContext;
+  readonly decision: ApprovedRequesterDecision;
+  readonly funding?: PrivateCashuFunding;
+  readonly escrowReference?: string;
+  readonly escrowVersion?: number;
+  readonly resultReference?: string;
+  readonly completionDecision?: PactCompletionDecision;
+  readonly settlementReference?: string;
+  readonly refundReference?: string;
+}
+
+export interface PactAgentWorkflowResumeOptions {
+  readonly reconcileOnly?: boolean;
 }
 
 interface WorkflowState {
@@ -287,6 +347,67 @@ export class PactAgentWorkflow {
 
   get clock(): PactCashuClock {
     return this.#dependencies.clock;
+  }
+
+  /**
+   * Captures the current run's minimum resumable state. Only meaningful after
+   * a successful or refund transaction has reached a terminal outcome; the
+   * caller (runtime) persists it for restart recovery.
+   */
+  get resumeSnapshot(): PactAgentWorkflowResumeState {
+    if (
+      !this.#state.context ||
+      !this.#state.privateTerms ||
+      !this.#state.privateSalt ||
+      !this.#state.decision
+    ) {
+      workflowError("unexpected_state", "Workflow has no resumable state");
+    }
+    const outcome = this.#state.report?.finalOutcome;
+    if (outcome === "refunded") {
+      return Object.freeze({
+        kind: "refund",
+        phase: "refunded",
+        privateTerms: this.#state.privateTerms,
+        privateSalt: this.#state.privateSalt,
+        context: this.#state.context,
+        decision: this.#state.decision,
+        escrowReference: this.#state.escrowReference,
+        escrowVersion: this.#state.escrowVersion,
+        resultReference: this.#state.resultReference,
+        completionDecision: this.#state.completionDecision,
+        refundReference: this.#state.report!.refundReference,
+      });
+    }
+    if (outcome === "settled") {
+      return Object.freeze({
+        kind: "successful",
+        phase: "settled",
+        privateTerms: this.#state.privateTerms,
+        privateSalt: this.#state.privateSalt,
+        context: this.#state.context,
+        decision: this.#state.decision,
+        escrowReference: this.#state.escrowReference,
+        escrowVersion: this.#state.escrowVersion,
+        resultReference: this.#state.resultReference,
+        completionDecision: this.#state.completionDecision,
+        settlementReference: this.#state.report!.settlementReference,
+      });
+    }
+    workflowError("unexpected_state", "Workflow has not reached a terminal outcome");
+  }
+
+  /**
+   * Exposes the funded escrow coordinates (reference and the funded revision)
+   * captured at the escrow-funding checkpoint. Unlike resumeSnapshot this is
+   * available before a terminal outcome, so a runtime can persist the exact
+   * funded version needed to resume idempotently after an interrupted release.
+   */
+  get escrowCheckpoint(): Readonly<{ escrowReference?: string; escrowVersion?: number }> {
+    return Object.freeze({
+      ...(this.#state.escrowReference === undefined ? {} : { escrowReference: this.#state.escrowReference }),
+      ...(this.#state.escrowVersion === undefined ? {} : { escrowVersion: this.#state.escrowVersion }),
+    });
   }
 
   #now(): number {
@@ -373,6 +494,7 @@ export class PactAgentWorkflow {
     privateTerms: DocumentSummaryPrivateTerms,
     privateSalt: PactPrivateCommitmentSalt,
     agreementId: string,
+    createdAt: number,
     expiresAt: number,
   ): Promise<PactAgreementContext> {
     const termsCommitment = createPactTermsCommitment(
@@ -393,7 +515,7 @@ export class PactAgentWorkflow {
       agreementId,
       expiresAt,
       termsCommitment,
-      createdAt: this.#now(),
+      createdAt,
     });
 
     let signedRoot: PactServiceAgreementRoot<SignedNostrEvent>;
@@ -416,7 +538,7 @@ export class PactAgentWorkflow {
       root: signedRoot,
       references,
       authority: this.escrowAuthorityPublicKey,
-      createdAt: this.#now() + 1,
+      createdAt: signedRoot.event.created_at + 1,
     });
 
     let signedSource: SignedNostrEvent;
@@ -477,6 +599,7 @@ export class PactAgentWorkflow {
     context: PactAgreementContext,
     history: SignedNostrEvent[],
     funding: PrivateCashuFunding,
+    allowFreshEconomicAttempt = true,
   ): Promise<{ escrowReference: string; version: number }> {
     const coordinator = createPactCashuEscrowSettlementCoordinator({
       mintUrl: this.#dependencies.mintUrl,
@@ -504,6 +627,7 @@ export class PactAgentWorkflow {
         context,
         history,
         funding,
+        allowFreshEconomicAttempt,
       });
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
@@ -511,7 +635,7 @@ export class PactAgentWorkflow {
     }
 
     if (funded.outcome === "reconciliation_required") {
-      workflowError("escrow_failed", "Escrow funding requires reconciliation");
+      workflowError("reconciliation_required", "Transaction requires reconciliation");
     }
     if (funded.outcome !== "confirmed") {
       workflowError("escrow_failed", "Escrow funding was not confirmed");
@@ -681,11 +805,11 @@ export class PactAgentWorkflow {
     return resultReference;
   }
 
-  async #requesterVerifiesAndAuthorizesRelease(
+  async #verifyResult(
     context: PactAgreementContext,
     history: SignedNostrEvent[],
     resultReference: string,
-  ): Promise<void> {
+  ): Promise<PactAgreementContext> {
     const resultProvenance: PrivateTaskProvenance = {
       agreementId: context.root.content.agreement_id,
       agreementRoot: context.root.event.id,
@@ -720,12 +844,12 @@ export class PactAgentWorkflow {
       workflowError("completion_failed", "Completion verification failed");
     }
     this.#state.completionDecision = completionDecision;
-    this.#state.context = { ...context, completionDecisions: [completionDecision] };
 
     const verifiedContext: PactAgreementContext = {
       ...context,
       completionDecisions: [completionDecision],
     };
+    this.#state.context = verifiedContext;
 
     try {
       await signAndPublishPactAgreementTransition({
@@ -749,6 +873,10 @@ export class PactAgentWorkflow {
       workflowError("agreement_publication_failed", "Result verification transition failed");
     }
 
+    return verifiedContext;
+  }
+
+  async #authorizeRelease(verifiedContext: PactAgreementContext): Promise<void> {
     const verifiedHistory = await this.#collectHistoryEvents(verifiedContext);
     try {
       await signAndPublishPactAgreementTransition({
@@ -778,6 +906,7 @@ export class PactAgentWorkflow {
     resultReference: string,
     escrowReference: string,
     escrowVersion: number,
+    allowFreshEconomicAttempt = true,
   ): Promise<{ settlementReference: string; finalVersion: number }> {
     const coordinator = createPactCashuEscrowSettlementCoordinator({
       mintUrl: this.#dependencies.mintUrl,
@@ -807,6 +936,7 @@ export class PactAgentWorkflow {
         expectedVersion: authorized.escrow.version,
         context,
         history,
+        allowFreshEconomicAttempt,
       });
       if (settled.outcome === "publication_pending") {
         settled = await coordinator.releaseEscrow({
@@ -815,6 +945,7 @@ export class PactAgentWorkflow {
           expectedVersion: authorized.escrow.version,
           context,
           history,
+          allowFreshEconomicAttempt,
         });
       }
     } catch (error) {
@@ -823,7 +954,7 @@ export class PactAgentWorkflow {
     }
 
     if (settled.outcome === "reconciliation_required") {
-      workflowError("settlement_failed", "Cashu release requires reconciliation");
+      workflowError("reconciliation_required", "Transaction requires reconciliation");
     }
     if (settled.outcome !== "confirmed") {
       workflowError("settlement_failed", "Cashu release was not confirmed");
@@ -926,11 +1057,13 @@ export class PactAgentWorkflow {
     };
 
     const discovery = await this.#discoverProviders();
-    await this.#runRequesterDecision(intent, discovery);
+    const decision = await this.#runRequesterDecision(intent, discovery);
+    await input.onRequesterDecision?.(decision);
 
-    const privateSalt = new PactPrivateCommitmentSalt();
+    const privateSalt = input.privateSalt ?? new PactPrivateCommitmentSalt();
     const agreementId = input.agreementId ?? createPactAgreementId();
-    const expiresAt = input.expiresAt ?? this.#now() + 600;
+    const createdAt = input.createdAt ?? this.#now();
+    const expiresAt = input.expiresAt ?? createdAt + 600;
 
     const context = await this.#publishProposal(
       input.requesterDefinition,
@@ -938,17 +1071,32 @@ export class PactAgentWorkflow {
       privateTerms,
       privateSalt,
       agreementId,
+      createdAt,
       expiresAt,
     );
+    await input.onProgress?.({ phase: "proposed", agreementRootEventId: context.root.event.id });
 
     const acceptedEvent = await this.#providerAccepts(context, []);
     const fundingHistory = [acceptedEvent];
+    await input.onProgress?.({ phase: "accepted", agreementRootEventId: context.root.event.id });
 
     await this.#prepareAndFundEscrow(context, fundingHistory, input.funding);
+    await input.onProgress?.({
+      phase: "escrow_funded",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
+    });
     const fundedHistory = await this.#collectHistoryEvents(context);
 
     await this.#deliverPrivateTask(context, privateTerms);
     const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+    await input.onProgress?.({
+      phase: "task_delivered",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
+    });
 
     const taskDeliveredHistory = await this.#collectHistoryEvents(context);
     const resultReference = await this.#providerExecutesAndReturnsResult(
@@ -956,11 +1104,32 @@ export class PactAgentWorkflow {
       taskDeliveredHistory,
       task,
     );
+    await input.onProgress?.({
+      phase: "result_submitted",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
+      resultReference,
+    });
 
     const resultSubmittedHistory = await this.#collectHistoryEvents(context);
-    await this.#requesterVerifiesAndAuthorizesRelease(context, resultSubmittedHistory, resultReference);
+    const verifiedContext = await this.#verifyResult(context, resultSubmittedHistory, resultReference);
+    await input.onProgress?.({
+      phase: "result_verified",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
+      resultReference,
+    });
+    await this.#authorizeRelease(verifiedContext);
+    await input.onProgress?.({
+      phase: "release_authorized",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
+      resultReference,
+    });
 
-    const verifiedContext = this.#state.context!;
     const releaseAuthorizedHistory = await this.#collectHistoryEvents(verifiedContext);
     const { settlementReference } = await this.#releaseEscrow(
       verifiedContext,
@@ -971,27 +1140,7 @@ export class PactAgentWorkflow {
     );
 
     const finalHistory = await this.#reconstructHistory(verifiedContext);
-    if (finalHistory.status !== "ok") {
-      workflowError("reconstruction_failed", "Agreement history is forked");
-    }
-    const expectedStates: PactAgreementState[] = [
-      "accepted",
-      "escrow_funded",
-      "task_delivered",
-      "result_submitted",
-      "result_verified",
-      "release_authorized",
-      "settled",
-    ];
-    const actualStates = finalHistory.transitions.map((t) => t.content.state);
-    if (actualStates.length !== expectedStates.length || expectedStates.some((s, i) => actualStates[i] !== s)) {
-      workflowError(
-        "unexpected_state",
-        `Lifecycle does not match canonical order: ${actualStates.join(" -> ")}`,
-      );
-    }
-
-    return this.#buildReport(verifiedContext, finalHistory, settlementReference);
+    return this.#finishSuccessful(verifiedContext, finalHistory, settlementReference);
   }
 
   async runRefundTransaction(
@@ -1018,11 +1167,13 @@ export class PactAgentWorkflow {
     };
 
     const discovery = await this.#discoverProviders();
-    await this.#runRequesterDecision(intent, discovery);
+    const decision = await this.#runRequesterDecision(intent, discovery);
+    await input.onRequesterDecision?.(decision);
 
-    const privateSalt = new PactPrivateCommitmentSalt();
+    const privateSalt = input.privateSalt ?? new PactPrivateCommitmentSalt();
     const agreementId = input.agreementId ?? createPactAgreementId();
-    const expiresAt = input.expiresAt ?? this.#now() + 600;
+    const createdAt = input.createdAt ?? this.#now();
+    const expiresAt = input.expiresAt ?? createdAt + 600;
 
     const context = await this.#publishProposal(
       input.requesterDefinition,
@@ -1030,26 +1181,23 @@ export class PactAgentWorkflow {
       privateTerms,
       privateSalt,
       agreementId,
+      createdAt,
       expiresAt,
     );
+    await input.onProgress?.({ phase: "proposed", agreementRootEventId: context.root.event.id });
 
     const acceptedEvent = await this.#providerAccepts(context, []);
     const fundingHistory = [acceptedEvent];
+    await input.onProgress?.({ phase: "accepted", agreementRootEventId: context.root.event.id });
 
     await this.#prepareAndFundEscrow(context, fundingHistory, input.funding);
-    await this.#collectHistoryEvents(context);
-
-    const coordinator = createPactCashuEscrowSettlementCoordinator({
-      mintUrl: this.#dependencies.mintUrl,
-      cashu: this.#dependencies.cashu,
-      privateDelivery: this.#dependencies.privateDelivery,
-      store: this.#dependencies.settlementStore,
-      escrowAuthoritySigner: this.#identities.escrowAuthoritySigner,
-      normalSpendKey: this.#dependencies.normalSpendKey,
-      refundSpendKey: this.#dependencies.refundSpendKey,
-      relay: this.#dependencies.relay,
-      clock: this.#dependencies.clock,
+    await input.onProgress?.({
+      phase: "escrow_funded",
+      agreementRootEventId: context.root.event.id,
+      escrowReference: this.#state.escrowReference,
+      escrowVersion: this.#state.escrowVersion,
     });
+    await this.#collectHistoryEvents(context);
 
     const escrowRecord = await this.#dependencies.settlementStore.read(
       `escrow:${this.#state.escrowReference}`,
@@ -1072,6 +1220,63 @@ export class PactAgentWorkflow {
       this.#dependencies.clock.advanceTo(record.locktime!);
     }
 
+    const refundAuthorizedHistory = await this.#publishRefundAuthorization(context);
+    return this.#completeRefund(context, refundAuthorizedHistory);
+  }
+
+  #assertTerminalHistory(history: PactAgreementHistory, expected: readonly PactAgreementState[]): void {
+    if (history.status !== "ok") {
+      workflowError("reconstruction_failed", "Agreement history is forked");
+    }
+    const actualStates = history.transitions.map((t) => t.content.state);
+    if (actualStates.length !== expected.length || expected.some((s, i) => actualStates[i] !== s)) {
+      workflowError(
+        "unexpected_state",
+        `Lifecycle does not match canonical order: ${actualStates.join(" -> ")}`,
+      );
+    }
+  }
+
+  #finishSuccessful(
+    context: PactAgreementContext,
+    history: PactAgreementHistory,
+    settlementReference: string,
+  ): PactAgentWorkflowReport {
+    this.#assertTerminalHistory(history, [
+      "accepted",
+      "escrow_funded",
+      "task_delivered",
+      "result_submitted",
+      "result_verified",
+      "release_authorized",
+      "settled",
+    ]);
+    return this.#buildReport(context, history, settlementReference);
+  }
+
+  #finishRefund(
+    context: PactAgreementContext,
+    history: PactAgreementHistory,
+    refundReference: string,
+  ): PactAgentWorkflowReport {
+    this.#assertTerminalHistory(history, ["accepted", "escrow_funded", "refund_authorized", "refunded"]);
+    return this.#buildReport(context, history, undefined, refundReference);
+  }
+
+  #seedResumeState(state: PactAgentWorkflowResumeState): void {
+    this.#state.context = state.completionDecision
+      ? { ...state.context, completionDecisions: [state.completionDecision] }
+      : state.context;
+    this.#state.privateTerms = state.privateTerms;
+    this.#state.privateSalt = state.privateSalt;
+    this.#state.decision = state.decision;
+    this.#state.escrowReference = state.escrowReference;
+    this.#state.escrowVersion = state.escrowVersion;
+    this.#state.resultReference = state.resultReference;
+    this.#state.completionDecision = state.completionDecision;
+  }
+
+  async #publishRefundAuthorization(context: PactAgreementContext): Promise<SignedNostrEvent[]> {
     const historyBeforeRefundAuthorization = await this.#collectHistoryEvents(context);
     await signAndPublishPactAgreementTransition({
       context,
@@ -1089,7 +1294,25 @@ export class PactAgentWorkflow {
       signer: this.#identities.requesterSigner,
       relay: this.#dependencies.relay,
     });
-    const refundAuthorizedHistory = await this.#collectHistoryEvents(context);
+    return this.#collectHistoryEvents(context);
+  }
+
+  async #completeRefund(
+    context: PactAgreementContext,
+    refundAuthorizedHistory: SignedNostrEvent[],
+    allowFreshEconomicAttempt = true,
+  ): Promise<PactAgentWorkflowReport> {
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: this.#dependencies.mintUrl,
+      cashu: this.#dependencies.cashu,
+      privateDelivery: this.#dependencies.privateDelivery,
+      store: this.#dependencies.settlementStore,
+      escrowAuthoritySigner: this.#identities.escrowAuthoritySigner,
+      normalSpendKey: this.#dependencies.normalSpendKey,
+      refundSpendKey: this.#dependencies.refundSpendKey,
+      relay: this.#dependencies.relay,
+      clock: this.#dependencies.clock,
+    });
 
     let authorized, refunded;
     try {
@@ -1107,6 +1330,7 @@ export class PactAgentWorkflow {
         expectedVersion: authorized.escrow.version,
         context,
         history: refundAuthorizedHistory,
+        allowFreshEconomicAttempt,
       });
       if (refunded.outcome === "publication_pending") {
         refunded = await coordinator.refundEscrow({
@@ -1115,6 +1339,7 @@ export class PactAgentWorkflow {
           expectedVersion: authorized.escrow.version,
           context,
           history: refundAuthorizedHistory,
+          allowFreshEconomicAttempt,
         });
       }
     } catch (error) {
@@ -1123,35 +1348,182 @@ export class PactAgentWorkflow {
     }
 
     if (refunded.outcome === "reconciliation_required") {
-      workflowError("settlement_failed", "Cashu refund requires reconciliation");
+      workflowError("reconciliation_required", "Transaction requires reconciliation");
     }
     if (refunded.outcome !== "confirmed") {
       workflowError("settlement_failed", "Cashu refund was not confirmed");
     }
-
     if (!refunded.escrow.refundReference) {
       workflowError("settlement_failed", "Refund reference is missing");
     }
 
     const finalHistory = await this.#reconstructHistory(context);
-    if (finalHistory.status !== "ok") {
-      workflowError("reconstruction_failed", "Agreement history is forked");
+    return this.#finishRefund(context, finalHistory, refunded.escrow.refundReference);
+  }
+
+  /**
+   * Continues a previously interrupted successful transaction from a persisted
+   * resume state. It reconstructs the authoritative agreement state from the
+   * relay and advances from that state, re-invoking only the idempotent
+   * economic steps and never re-publishing a transition that is already present.
+   */
+  async resumeSuccessfulTransaction(
+    state: PactAgentWorkflowResumeState,
+    options: PactAgentWorkflowResumeOptions = {},
+  ): Promise<PactAgentWorkflowReport> {
+    if (state.kind !== "successful") {
+      workflowError("invalid_configuration", "Resume state is not a successful transaction");
     }
-    const expectedStates: PactAgreementState[] = [
-      "accepted",
-      "escrow_funded",
-      "refund_authorized",
-      "refunded",
-    ];
-    const actualStates = finalHistory.transitions.map((t) => t.content.state);
-    if (actualStates.length !== expectedStates.length || expectedStates.some((s, i) => actualStates[i] !== s)) {
+    return this.#runExclusive(async () => {
+      this.#resetState();
+      this.#seedResumeState(state);
+      const context = this.#state.context!;
+      const privateTerms = this.#state.privateTerms!;
+
+      let currentState = (await this.#reconstructHistory(context)).currentState;
+
+      if (currentState === "proposed") {
+        await this.#providerAccepts(context, []);
+        currentState = "accepted";
+      }
+
+      if (currentState === "accepted") {
+        const acceptedHistory = await this.#collectHistoryEvents(context);
+        await this.#prepareAndFundEscrow(
+          context,
+          acceptedHistory,
+          state.funding!,
+          options.reconcileOnly !== true,
+        );
+        currentState = "escrow_funded";
+      }
+
+      if (currentState === "escrow_funded") {
+        const fundedHistory = await this.#collectHistoryEvents(context);
+        await this.#deliverPrivateTask(context, privateTerms);
+        const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+        const taskDeliveredHistory = await this.#collectHistoryEvents(context);
+        await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        currentState = "result_submitted";
+      }
+
+      if (currentState === "task_delivered") {
+        const task = await retrieveAndOpenPrivateTask(
+          this.providerPublicKey,
+          this.#identities.providerEncrypter,
+          {
+            agreementId: context.root.content.agreement_id,
+            agreementRoot: context.root.event.id,
+            authorizedSender: this.requesterPublicKey,
+            recipient: this.providerPublicKey,
+          },
+          this.#dependencies.relay,
+        );
+        const taskDeliveredHistory = await this.#collectHistoryEvents(context);
+        await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        currentState = "result_submitted";
+      }
+
+      if (currentState === "result_submitted") {
+        const resultSubmittedHistory = await this.#collectHistoryEvents(context);
+        const verifiedContext = await this.#verifyResult(
+          context,
+          resultSubmittedHistory,
+          this.#state.resultReference!,
+        );
+        await this.#authorizeRelease(verifiedContext);
+        currentState = "release_authorized";
+      }
+
+      if (currentState === "result_verified") {
+        await this.#authorizeRelease(this.#state.context!);
+        currentState = "release_authorized";
+      }
+
+      if (currentState === "release_authorized") {
+        const verifiedContext = this.#state.context!;
+        const releaseAuthorizedHistory = await this.#collectHistoryEvents(verifiedContext);
+        const { settlementReference } = await this.#releaseEscrow(
+          verifiedContext,
+          releaseAuthorizedHistory,
+          this.#state.resultReference!,
+          this.#state.escrowReference!,
+          this.#state.escrowVersion!,
+          options.reconcileOnly !== true,
+        );
+        return this.#finishSuccessful(
+          verifiedContext,
+          await this.#reconstructHistory(verifiedContext),
+          settlementReference,
+        );
+      }
+
+      if (currentState === "settled") {
+        return this.#finishSuccessful(
+          context,
+          await this.#reconstructHistory(context),
+          state.settlementReference!,
+        );
+      }
+
       workflowError(
         "unexpected_state",
-        `Refund lifecycle does not match canonical order: ${actualStates.join(" -> ")}`,
+        `Cannot resume successful transaction from state ${currentState}`,
       );
-    }
+    });
+  }
 
-    return this.#buildReport(context, finalHistory, undefined, refunded.escrow.refundReference);
+  /**
+   * Continues a previously interrupted refund transaction from a persisted
+   * resume state. The requester publishes refund_authorized only after the
+   * timeout rule permits it, and the Cashu refund reuses the existing
+   * coordinator idempotency so a confirmed refund is never repeated.
+   */
+  async resumeRefundTransaction(
+    state: PactAgentWorkflowResumeState,
+    options: PactAgentWorkflowResumeOptions = {},
+  ): Promise<PactAgentWorkflowReport> {
+    if (state.kind !== "refund") {
+      workflowError("invalid_configuration", "Resume state is not a refund transaction");
+    }
+    return this.#runExclusive(async () => {
+      this.#resetState();
+      this.#seedResumeState(state);
+      const context = this.#state.context!;
+
+      const currentState = (await this.#reconstructHistory(context)).currentState;
+
+      if (currentState === "escrow_funded") {
+        const refundAuthorizedHistory = await this.#publishRefundAuthorization(context);
+        return this.#completeRefund(
+          context,
+          refundAuthorizedHistory,
+          options.reconcileOnly !== true,
+        );
+      }
+
+      if (currentState === "refund_authorized") {
+        const refundAuthorizedHistory = await this.#collectHistoryEvents(context);
+        return this.#completeRefund(
+          context,
+          refundAuthorizedHistory,
+          options.reconcileOnly !== true,
+        );
+      }
+
+      if (currentState === "refunded") {
+        return this.#finishRefund(
+          context,
+          await this.#reconstructHistory(context),
+          state.refundReference!,
+        );
+      }
+
+      workflowError(
+        "unexpected_state",
+        `Cannot resume refund transaction from state ${currentState}`,
+      );
+    });
   }
 
   async refundRejectedBeforeLocktime(

@@ -13,6 +13,7 @@ import {
   PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
   PACT_AGREEMENT_TRANSITION_TYPE,
   PACT_SERVICE_AGREEMENT_ROOT_TYPE,
+  PactPrivateCommitmentSalt,
   parsePactServiceAgreementRootEvent,
   reconstructPactAgreementHistory,
   type PactAgreementContext,
@@ -56,6 +57,7 @@ import {
   PactAgentWorkflowError,
   type PactAgentParticipantIdentities,
   type PactAgentWorkflowDependencies,
+  type PactAgentWorkflowResumeState,
 } from "./pactagent-workflow";
 import { publishSignedPactAgreementTransition } from "./pact-service-agreement-publication";
 import type { RequesterDecisionModel } from "./requester-decision";
@@ -157,6 +159,22 @@ class RejectingGiftWrapRelay extends MemoryRelay {
   }
 }
 
+class FailingTransitionRelay extends MemoryRelay {
+  private failedOnce = false;
+
+  constructor(private readonly stateTag: string) {
+    super();
+  }
+
+  async publish(event: SignedNostrEvent): Promise<void> {
+    if (!this.failedOnce && event.tags.some((t) => t[0] === "t" && t[1] === this.stateTag)) {
+      this.failedOnce = true;
+      throw new Error(`Simulated ${this.stateTag} publication failure`);
+    }
+    await super.publish(event);
+  }
+}
+
 function findRootEvent(relay: MemoryRelay): SignedNostrEvent | undefined {
   return relay.events.find(
     (e) =>
@@ -199,6 +217,8 @@ class FakeCashuPort implements CashuTestMintPort {
   private readonly outcomes = new Map<string, CashuMutationResult>();
   prepareCalls = 0;
   spendCalls = 0;
+  readonly spendOperationIds: string[] = [];
+  reconciliationSpend = false;
 
   async inspectCapabilities(): Promise<ValidatedMintCapabilities> {
     return {
@@ -229,8 +249,16 @@ class FakeCashuPort implements CashuTestMintPort {
 
   async spendLockedValue(input: SpendLockedValueInput): Promise<CashuMutationResult> {
     this.spendCalls += 1;
+    this.spendOperationIds.push(input.operationId);
     const prior = this.outcomes.get(input.operationId);
     if (prior?.status === "succeeded") return prior;
+    if (this.reconciliationSpend && !this.outcomes.has(input.operationId)) {
+      return {
+        status: "submitted_unknown",
+        outcome: "reconciliation_required",
+        operationId: input.operationId,
+      };
+    }
     const result: CashuMutationResult = {
       status: "succeeded", operationId: input.operationId,
       handle: { reference: "cashu_private_22222222-2222-4222-8222-222222222222" },
@@ -434,6 +462,89 @@ function buildWorkflow(options: { timeout?: number; relay?: MemoryRelay; store?:
     requesterPolicy, decisionBounds, escrowTimeoutSeconds: timeoutSeconds,
     identities, dependencies, recommendation,
   };
+}
+
+function buildWorkflowWithDeps(
+  shared: ReturnType<typeof buildWorkflow>,
+  deps: { relay: MemoryRelay; store: PactCashuEscrowSettlementStore; cashu: FakeCashuPort },
+) {
+  return createPactAgentWorkflow({
+    identities: shared.identities,
+    dependencies: {
+      ...shared.dependencies,
+      relay: deps.relay,
+      cashu: deps.cashu,
+      settlementStore: deps.store,
+    },
+  });
+}
+
+function relayAtAccepted(relay: MemoryRelay): MemoryRelay {
+  const filtered = new MemoryRelay();
+  for (const event of relay.events) {
+    if (event.kind === 1059) continue;
+    if (event.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND) {
+      const isTransition = event.tags.some(
+        (t) => t[0] === "t" && t[1] === PACT_AGREEMENT_TRANSITION_TYPE,
+      );
+      if (isTransition && !event.tags.some((t) => t[0] === "t" && t[1] === "accepted")) {
+        continue;
+      }
+    }
+    filtered.events.push(event);
+  }
+  return filtered;
+}
+
+function relayAtProposed(relay: MemoryRelay): MemoryRelay {
+  const filtered = new MemoryRelay();
+  for (const event of relay.events) {
+    if (event.kind === 1059) continue;
+    if (event.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND) {
+      const isTransition = event.tags.some(
+        (t) => t[0] === "t" && t[1] === PACT_AGREEMENT_TRANSITION_TYPE,
+      );
+      if (isTransition) continue;
+    }
+    filtered.events.push(event);
+  }
+  return filtered;
+}
+
+function relayWithReferences(shared: ReturnType<typeof buildWorkflow>): MemoryRelay {
+  const relay = new MemoryRelay();
+  for (const event of shared.relay.events) {
+    if (event.kind === 1059) continue;
+    if (event.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND) continue;
+    relay.events.push(event);
+  }
+  return relay;
+}
+
+function failingTransitionRelay(
+  shared: ReturnType<typeof buildWorkflow>,
+  stateTag: string,
+): FailingTransitionRelay {
+  const relay = new FailingTransitionRelay(stateTag);
+  relay.events.push(...relayWithReferences(shared).events);
+  return relay;
+}
+
+async function readEscrowReferenceAndVersion(
+  store: PactCashuEscrowSettlementStore,
+  rootEventId: string,
+): Promise<{ reference: string; revision: number }> {
+  const binding = (await store.read(`agreement-escrow:${rootEventId}`)) as
+    | { escrowReference?: string }
+    | undefined;
+  if (!binding?.escrowReference) throw new Error("Agreement escrow binding not found");
+  const record = (await store.read(`escrow:${binding.escrowReference}`)) as
+    | { reference?: string; revision?: number }
+    | undefined;
+  if (!record?.reference || typeof record.revision !== "number") {
+    throw new Error("Escrow record not found");
+  }
+  return { reference: record.reference, revision: record.revision };
 }
 
 describe("PactAgent end-to-end workflow integration", () => {
@@ -1008,6 +1119,353 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(report.finalOutcome).toBe("refunded");
       expect(report.resultReference).toBeUndefined();
       expect(scanForSecrets(report)).toEqual([]);
+    }, 30_000);
+  });
+
+  describe("restart and resume", () => {
+    it("resuming a settled successful transaction is idempotent", async () => {
+      const s = buildWorkflow();
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Resume idempotency document.",
+        mediaType: "text/plain" as const,
+        privatePrompt: "PRIVATE-PROMPT Resume.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      expect(report.finalOutcome).toBe("settled");
+      expect(s.cashu.prepareCalls).toBe(1);
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const snapshot = s.workflow.resumeSnapshot;
+      const resumed = buildWorkflowWithDeps(s, { relay: s.relay, store: s.store, cashu: s.cashu });
+      const resumedReport = await resumed.resumeSuccessfulTransaction(snapshot);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(s.cashu.prepareCalls).toBe(1);
+      expect(s.cashu.spendCalls).toBe(1);
+      expect(resumedReport.lifecycle).toHaveLength(7);
+    }, 30_000);
+
+    it("resuming a settled refund transaction is idempotent", async () => {
+      const s = buildWorkflow({ timeout: 300 });
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Refund resume document.",
+        mediaType: "text/plain" as const,
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      };
+      const report = await s.workflow.runRefundTransaction(input);
+      expect(report.finalOutcome).toBe("refunded");
+
+      const snapshot = s.workflow.resumeSnapshot;
+      const resumed = buildWorkflowWithDeps(s, { relay: s.relay, store: s.store, cashu: s.cashu });
+      const resumedReport = await resumed.resumeRefundTransaction(snapshot);
+
+      expect(resumedReport.finalOutcome).toBe("refunded");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(s.cashu.spendCalls).toBe(1);
+    }, 30_000);
+
+    it("resuming from release_authorized does not repeat the confirmed release", async () => {
+      const s = buildWorkflow();
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Release-authorized resume document.",
+        mediaType: "text/plain" as const,
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      expect(report.finalOutcome).toBe("settled");
+      expect(s.cashu.spendCalls).toBe(1);
+
+      const snapshot = s.workflow.resumeSnapshot;
+      const releaseAuthorizedState: PactAgentWorkflowResumeState = {
+        ...snapshot,
+        phase: "release_authorized",
+      };
+      const resumed = buildWorkflowWithDeps(s, { relay: s.relay, store: s.store, cashu: s.cashu });
+      const resumedReport = await resumed.resumeSuccessfulTransaction(releaseAuthorizedState);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(s.cashu.spendCalls).toBe(1);
+    }, 30_000);
+
+    it("resuming from accepted funds and settles exactly once without a second agreement", async () => {
+      const s = buildWorkflow();
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Accepted-resume document.",
+        mediaType: "text/plain" as const,
+        privatePrompt: "PRIVATE-PROMPT Accepted resume.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      expect(report.finalOutcome).toBe("settled");
+
+      const snapshot = s.workflow.resumeSnapshot;
+      const acceptedRelay = relayAtAccepted(s.relay);
+      const freshStore = createInMemoryPactCashuEscrowSettlementStore();
+      const freshCashu = new FakeCashuPort();
+      const resumed = buildWorkflowWithDeps(s, {
+        relay: acceptedRelay,
+        store: freshStore,
+        cashu: freshCashu,
+      });
+
+      const context = await reconstructContextFromRelay(
+        acceptedRelay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const resumeState: PactAgentWorkflowResumeState = {
+        kind: "successful",
+        phase: "accepted",
+        privateTerms: snapshot.privateTerms,
+        privateSalt: snapshot.privateSalt,
+        context,
+        decision: snapshot.decision,
+        funding: privateFunding(),
+      };
+
+      const resumedReport = await resumed.resumeSuccessfulTransaction(resumeState);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(freshCashu.prepareCalls).toBe(1);
+      expect(freshCashu.spendCalls).toBe(1);
+      expect(resumedReport.lifecycle).toHaveLength(7);
+    }, 30_000);
+
+    it("resuming from proposed accepts without republishing the root", async () => {
+      const s = buildWorkflow();
+      const salt = new PactPrivateCommitmentSalt(new Uint8Array(32).fill(0x5a));
+      const agreementId = "12345678-1234-4234-9234-123456789abc";
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Proposed-resume document.",
+        mediaType: "text/plain" as const,
+        privatePrompt: "PRIVATE-PROMPT Proposed resume.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+        agreementId,
+        privateSalt: salt,
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      const snapshot = s.workflow.resumeSnapshot;
+
+      const proposedRelay = relayAtProposed(s.relay);
+      const freshStore = createInMemoryPactCashuEscrowSettlementStore();
+      const freshCashu = new FakeCashuPort();
+      const context = await reconstructContextFromRelay(
+        proposedRelay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const resumed = buildWorkflowWithDeps(s, {
+        relay: proposedRelay,
+        store: freshStore,
+        cashu: freshCashu,
+      });
+      const resumeState: PactAgentWorkflowResumeState = {
+        kind: "successful",
+        phase: "proposed",
+        privateTerms: snapshot.privateTerms,
+        privateSalt: snapshot.privateSalt,
+        context,
+        decision: snapshot.decision,
+        funding: privateFunding(),
+      };
+
+      const resumedReport = await resumed.resumeSuccessfulTransaction(resumeState);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(freshCashu.prepareCalls).toBe(1);
+      expect(freshCashu.spendCalls).toBe(1);
+      expect(resumedReport.lifecycle).toHaveLength(7);
+      const roots = proposedRelay.events.filter(
+        (e) =>
+          e.kind === PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND &&
+          e.tags.some((t) => t[0] === "t" && t[1] === PACT_SERVICE_AGREEMENT_ROOT_TYPE),
+      );
+      expect(roots).toHaveLength(1);
+    }, 30_000);
+
+    it("resuming from escrow_funded does not fund again", async () => {
+      const s = buildWorkflow();
+      const salt = new PactPrivateCommitmentSalt(new Uint8Array(32).fill(0x5a));
+      const agreementId = "12345678-1234-4234-9234-123456789abc";
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Funded-resume document.",
+        mediaType: "text/plain" as const,
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+        agreementId,
+        privateSalt: salt,
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      const snapshot = s.workflow.resumeSnapshot;
+
+      const failingRelay = failingTransitionRelay(s, "task_delivered");
+      const storeA = createTrackingStore();
+      const cashuA = new FakeCashuPort();
+      const interrupted = buildWorkflowWithDeps(s, { relay: failingRelay, store: storeA, cashu: cashuA });
+      await expect(interrupted.runSuccessfulTransaction(input)).rejects.toThrow(
+        "Task delivered transition failed",
+      );
+      expect(cashuA.prepareCalls).toBe(1);
+      expect(cashuA.spendCalls).toBe(0);
+
+      const escrow = await readEscrowReferenceAndVersion(storeA, report.agreementRootEventId);
+      const context = await reconstructContextFromRelay(
+        failingRelay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const resumed = buildWorkflowWithDeps(s, { relay: failingRelay, store: storeA, cashu: cashuA });
+      const resumeState: PactAgentWorkflowResumeState = {
+        kind: "successful",
+        phase: "escrow_funded",
+        privateTerms: snapshot.privateTerms,
+        privateSalt: snapshot.privateSalt,
+        context,
+        decision: snapshot.decision,
+        escrowReference: escrow.reference,
+        escrowVersion: escrow.revision,
+      };
+
+      const resumedReport = await resumed.resumeSuccessfulTransaction(resumeState);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(cashuA.prepareCalls).toBe(1);
+      expect(cashuA.spendCalls).toBe(1);
+      expect(resumedReport.lifecycle).toHaveLength(7);
+    }, 30_000);
+
+    it("resuming from result_verified completes only the remaining authorization and release", async () => {
+      const s = buildWorkflow();
+      const salt = new PactPrivateCommitmentSalt(new Uint8Array(32).fill(0x5a));
+      const agreementId = "12345678-1234-4234-9234-123456789abc";
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Verified-resume document.",
+        mediaType: "text/plain" as const,
+        privatePrompt: "PRIVATE-PROMPT Verified resume.",
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+        agreementId,
+        privateSalt: salt,
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      const snapshot = s.workflow.resumeSnapshot;
+
+      const failingRelay = failingTransitionRelay(s, "release_authorized");
+      const storeA = createTrackingStore();
+      const cashuA = new FakeCashuPort();
+      const interrupted = buildWorkflowWithDeps(s, { relay: failingRelay, store: storeA, cashu: cashuA });
+      await expect(interrupted.runSuccessfulTransaction(input)).rejects.toThrow(
+        "Release authorization transition failed",
+      );
+      expect(cashuA.prepareCalls).toBe(1);
+      expect(cashuA.spendCalls).toBe(0);
+
+      const escrow = await readEscrowReferenceAndVersion(storeA, report.agreementRootEventId);
+      const context = await reconstructContextFromRelay(
+        failingRelay,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const resumed = buildWorkflowWithDeps(s, { relay: failingRelay, store: storeA, cashu: cashuA });
+      const resumeState: PactAgentWorkflowResumeState = {
+        kind: "successful",
+        phase: "result_verified",
+        privateTerms: snapshot.privateTerms,
+        privateSalt: snapshot.privateSalt,
+        context,
+        decision: snapshot.decision,
+        escrowReference: escrow.reference,
+        escrowVersion: escrow.revision,
+        resultReference: snapshot.resultReference,
+        completionDecision: snapshot.completionDecision,
+      };
+
+      const resumedReport = await resumed.resumeSuccessfulTransaction(resumeState);
+
+      expect(resumedReport.finalOutcome).toBe("settled");
+      expect(resumedReport.agreementRootEventId).toBe(report.agreementRootEventId);
+      expect(cashuA.prepareCalls).toBe(1);
+      expect(cashuA.spendCalls).toBe(1);
+      const states = resumedReport.lifecycle.map((l) => l.state);
+      expect(states.filter((st) => st === "result_submitted")).toHaveLength(1);
+      expect(states.filter((st) => st === "result_verified")).toHaveLength(1);
+      expect(states.filter((st) => st === "release_authorized")).toHaveLength(1);
+    }, 30_000);
+
+    it("resuming an ambiguous release surfaces reconciliation without a blind spend", async () => {
+      const s = buildWorkflow();
+      const salt = new PactPrivateCommitmentSalt(new Uint8Array(32).fill(0x5a));
+      const agreementId = "12345678-1234-4234-9234-123456789abc";
+      const input = {
+        requesterDefinition: s.requesterDefinition,
+        privateDocument: "PRIVATE-DOCUMENT Ambiguous-resume document.",
+        mediaType: "text/plain" as const,
+        maximumBudgetSats: sats(500n),
+        funding: privateFunding(),
+        agreementId,
+        privateSalt: salt,
+      };
+      const report = await s.workflow.runSuccessfulTransaction(input);
+      const snapshot = s.workflow.resumeSnapshot;
+
+      const relayA = relayWithReferences(s);
+      const storeA = createTrackingStore();
+      const cashuA = new FakeCashuPort();
+      cashuA.reconciliationSpend = true;
+      const interrupted = buildWorkflowWithDeps(s, { relay: relayA, store: storeA, cashu: cashuA });
+      await expect(interrupted.runSuccessfulTransaction(input)).rejects.toMatchObject({
+        code: "reconciliation_required",
+      });
+      expect(cashuA.prepareCalls).toBe(1);
+      expect(cashuA.spendCalls).toBe(1);
+
+      const escrow = await readEscrowReferenceAndVersion(storeA, report.agreementRootEventId);
+      const context = await reconstructContextFromRelay(
+        relayA,
+        report.agreementRootEventId,
+        s.identities.escrowAuthoritySigner.publicKey,
+        s.identities.providerSigner,
+      );
+      const resumed = buildWorkflowWithDeps(s, { relay: relayA, store: storeA, cashu: cashuA });
+      const resumeState: PactAgentWorkflowResumeState = {
+        kind: "successful",
+        phase: "release_authorized",
+        privateTerms: snapshot.privateTerms,
+        privateSalt: snapshot.privateSalt,
+        context,
+        decision: snapshot.decision,
+        escrowReference: escrow.reference,
+        escrowVersion: escrow.revision,
+        resultReference: snapshot.resultReference,
+        completionDecision: snapshot.completionDecision,
+      };
+
+      await expect(resumed.resumeSuccessfulTransaction(resumeState)).rejects.toMatchObject({
+        code: "reconciliation_required",
+      });
+      expect(new Set(cashuA.spendOperationIds).size).toBe(1);
     }, 30_000);
   });
 });
