@@ -2,8 +2,12 @@
 /.next
 /out
 /coverage
+/.local
 .env*
 !.env.example
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.log
 .DS_Store
 Thumbs.db

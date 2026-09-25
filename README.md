@@ -1,118 +1,196 @@
 # PactAgent
 
-**Autonomous agents contracting and settling over open Bitcoin protocols.**
+**Bounded economic agents contracting and settling over open Bitcoin protocols.**
 
-PactAgent is an open-source framework for bounded economic agents that discover each other through Nostr and Pontmore, negotiate narrow service agreements, and target settlement through Cashu ecash escrow. It builds on Pontmore; it is not the Pontmore protocol.
+PactAgent is an open-source framework for bounded economic agents that discover each other through
+Nostr, form service agreements, exchange private work, and settle using Cashu. It builds on open
+protocols and Pontmore concepts; PactAgent is not itself the Pontmore protocol.
 
-## Current phase
+## What PactAgent currently does
 
-The first pivot phase provides a local, deterministic open-protocol foundation:
+The integrated runtime executes the `document-summary@1` path end to end:
 
-- independent public Nostr identities for P001 Requester and P002 Provider;
-- independently signed PIP-00 agent definitions and relay-backed capability discovery;
-- deterministic pricing, budget, duration, network, and escrow compatibility checks;
-- a bounded requester-model interface whose untrusted recommendation is gated
-  by deterministic policy (no hosted model adapter is configured);
-- a PIP-01 `cashu_escrow` descriptor alongside the existing swap-specific PIP-03 timeout plan;
-- a relay-backed PactAgent service-agreement lifecycle for `document-summary@1`;
-- NIP-59 private task/result transport and a deterministic document-summary executor;
-- a private, explicitly configured Cashu test-mint adapter with narrow proof
-  import, NUT-11 locking, safe recovery, and beneficiary delivery;
-- a durable, idempotent Cashu escrow settlement coordinator for the 350-sat PoC;
-- one bounded `document-summary` fixture and a transparent UI walkthrough.
+```text
+Requester
+  → Nostr provider discovery
+  → signed 350-sat service offer
+  → deterministic requester authorization
+  → service agreement
+  → Cashu escrow funding
+  → NIP-59 private task/result exchange
+  → completion verification
+  → release authorization
+  → Cashu settlement
+```
 
-The PIP-01 path now constructs a kind `30361` descriptor, signs it through the
-isolated `NostrSigner` boundary, verifies its NIP-01 signature, publishes and
-retrieves it through a narrow relay port, and resolves the PIP-00 `a`-tag
-reference. Deterministic tests use an in-memory relay and synthetic signing key.
-Live transport uses the `NostrRelayAdapter` delivered by issue #4. Event signing
-uses the isolated `NostrSigner` boundary delivered by issue #6; private keys are
-not accepted by the publication layers.
+The current local requester-decision adapter supplies a deterministic advisory recommendation; no
+hosted AI/model adapter is configured. The same decision boundary can accept a future model-backed
+recommendation without granting the model authority. Deterministic policy decides whether an
+economic action is authorized, and the runtime remains authoritative for lifecycle and recovery.
+Public agreement events and API projections are separated from private task, result, Cashu, key,
+and credential material.
 
-Provider discovery resolves and verifies current signed PIP-00 definitions,
-provider-owned service offers, and compatible PIP-01 descriptors through the
-relay adapter. It returns stable authenticated references without creating an
-agreement or implying provider consent. The issue #10 integration revalidates
-that selection and derives the proposal price and execution bound from the
-selected offer before the requester signs or publishes the immutable root.
+PactAgent currently exposes a runtime and authenticated HTTP API. A requester-facing UI is a future
+layer and is not part of Issue #33.
 
-The service-agreement path publishes immutable requester proposals and separately
-signed participant transitions as provisional PactAgent kind `3921` regular events.
-This unregistered application-owned kind is not a Pontmore PIP or Nostr standard. It validates
-the referenced PIP-00 identities and PIP-01 descriptor, reconstructs history from
-predecessor event IDs, and refuses unauthorized, stale, forked, or terminal-state
-advancement. It does not synthesize a PIP-02 kind `7300` swap for document-summary.
+## Verified proof of operation
 
-Issue #16 delivers end-to-end application composition that sequences the
-existing #9–#15 boundaries into one executable document-summary transaction.
-The workflow is reusable application/runtime code, not test-only logic, and
-both deterministic and opt-in live verification lanes exercise the same
-composition. See the [PactAgent workflow documentation](docs/pactagent-workflow.md).
+The local integration has been exercised end to end with a local Strfry relay, a local Caddy WSS
+proxy, the Testnut Cashu test mint, and durable SQLite state. The verified proof-of-concept uses an
+exact 350-sat service offer and demonstrates:
 
-The Cashu adapter is network-capable for one explicitly configured test
-mint and now imports already-acquired proofs and privately delivers confirmed
-outputs, but it does not acquire ecash through Lightning or provide a production
-wallet. Required tests remain deterministic and offline. Cashu tokens, proofs,
-credentials, preimages, payout instructions, and key material remain private
-and are not part of public models.
+- exactly-once funding and release;
+- a final `settled` lifecycle;
+- authorized private-result retrieval and safe terminal reporting;
+- durable restart and reload without repeating economic work.
 
-## Technology
+Testnut is test infrastructure and bearer test ecash is still single-use. It is not a production
+mint or production-money environment.
+
+## Architecture
+
+```text
+HTTP API / future requester UI
+        │
+        ▼
+PactAgent runtime
+        │
+        ├── Nostr → local WSS relay → Strfry
+        ├── private task/result → NIP-59 boundary
+        ├── Cashu → configured test mint
+        └── durable state → SQLite
+```
+
+See the [architecture](docs/architecture.md), [runtime/API](docs/pactagent-runtime.md), and
+[workflow](docs/pactagent-workflow.md) documentation for the detailed boundaries.
+
+## Requirements
 
 - Node.js 22 or newer
-- Next.js 16 and React 19
-- strict TypeScript 5.9
-- Vitest and ESLint
+- npm
+- Docker Desktop or Docker Engine with Compose for the local relay stack
+- fresh Testnut ecash only when running the opt-in economic acceptance
 
-## Local setup
+## Quick local development
 
-```powershell
+```sh
 npm install
-npm run dev
+
+# Copy .env.example to .env and supply local secrets and Testnut funding.
+npm run local:up
+npm run local:doctor
+npm run runtime:start:local
 ```
 
-No credentials or external services are needed for the deterministic fixtures and tests.
-
-## Commands
+Run the non-economic verification lanes separately:
 
 ```sh
-npm run dev
-npm run lint
-npm run typecheck
 npm test
-npm run test:e2e
-npm run build -- --webpack
-npm start
+npm run test:process
 ```
 
-### End-to-end workflow verification
+The Testnut acceptance is explicitly opt-in and economic:
 
 ```sh
-npm run test:e2e
+npm run test:local:testnut
 ```
 
-### Opt-in live demonstration
+Shut down the local relay stack without deleting state:
 
-The live demonstration requires explicit configuration and skips cleanly
-when configuration is missing. See
-[docs/pactagent-workflow.md](docs/pactagent-workflow.md) for details.
+```sh
+npm run local:down
+```
 
-## Trust boundary
+See [Local PactAgent development](docs/local-development.md) for setup, TLS, funding, doctor, and
+state-reset details.
 
-AI will be a proposal layer, not the trust root. Deterministic policy authorizes
-economic actions, and the isolated signer boundary supplied by issue #6 signs
-events without exposing private keys to the model. PactAgent application
-events are authoritative for the service-agreement lifecycle; private task,
-result, and settlement payloads remain outside public events.
+## Test lanes
 
-See the [architecture](docs/architecture.md), [domain model](docs/domain-model.md), and [pivot record](docs/pivot.md).
-The public descriptor wire shape and boundary are documented in the
-[PIP-01 Cashu descriptor flow](docs/pip01-cashu-descriptor.md).
-The application event shape and lifecycle are documented in
-[PactAgent service agreements](docs/pact-service-agreements.md).
-The private mint boundary and opt-in live check are documented in the
-[Cashu test-mint adapter](docs/cashu-test-mint-adapter.md).
-The application settlement contract and coordinator are documented in
-[Cashu escrow settlement](docs/cashu-escrow-settlement.md).
+### Deterministic
+
+```sh
+npm test
+```
+
+Uses in-memory/deterministic fixtures. It performs no relay or mint economic activity.
+
+### Process and recovery
+
+```sh
+npm run test:process
+```
+
+Starts real child processes and durable fixture stores to exercise crashes, restarts,
+reconciliation, privacy, and signal handling without external funds or mint submissions.
+
+### Local Testnut acceptance
+
+```sh
+npm run test:local:testnut
+```
+
+Runs the doctor first, then attempts exactly one 350-sat golden-path transaction using Testnut test
+ecash. It never blindly retries an ambiguous Cashu submission. This lane consumes Testnut ecash and
+must not be treated as production-money testing.
+
+## Local developer commands
+
+| Command | Purpose |
+|---|---|
+| `npm run local:up` | Start the Compose-owned Strfry and Caddy services and export the local CA root. |
+| `npm run local:doctor` | Run zero-economic Docker, TLS, relay, Testnut, funding, and durable-state checks. |
+| `npm run runtime:start:local` | Start the production-like Next.js runtime with the local CA injected before Node starts. |
+| `npm test` | Run the deterministic, non-economic test suite. |
+| `npm run test:process` | Run deterministic separate-process restart and recovery acceptance. |
+| `npm run test:local:testnut` | Opt in to one guarded economic Testnut acceptance. |
+| `npm run local:down` | Remove only the Compose-owned local relay infrastructure while preserving data. |
+| `npm run local:reset-state -- --force` | Archive safe project-local state and create a fresh directory; refuse risky state. |
+
+## Environment
+
+Copy [.env.example](.env.example) to `.env`. Configuration is grouped into:
+
+- runtime API URL and bearer token;
+- local relay, Testnut mint, state-directory, and CA paths;
+- independent requester, provider, and escrow-authority Nostr keys;
+- independent normal-spend and refund-spend Cashu keys;
+- a Testnut funding token and opaque local funding reference.
+
+Never commit `.env`, bearer ecash, proofs, private keys, SQLite files, or generated certificates.
+Node reads extra CA roots during process initialization, so application code cannot safely set the
+trust path after startup. `runtime:start:local` loads the configuration and supplies
+`NODE_EXTRA_CA_CERTS` when it creates the actual Next.js child process.
+
+## Safety and trust boundaries
+
+- Signer and encryption boundaries retain private keys; the model receives no signing capability.
+- Cashu tokens, proofs, witnesses, preimages, and spending keys remain private.
+- Public lifecycle/status/report objects are explicit allowlists.
+- Private results are available only through the authorized private-result boundary.
+- Ambiguous economic submissions enter reconciliation and are never blindly retried.
+- The requester-decision recommendation is distinct from authorization; deterministic policy
+  authorizes economic execution.
+
+## Current limitations
+
+PactAgent remains an integrated proof-of-concept and test environment, not production financial
+software. The runtime uses one explicitly configured Cashu test mint, has no production wallet or
+automatic Lightning acquisition of ecash, and has no real-sats/production mode. Developers provide
+their own isolated test keys, API token, and Testnut ecash. The requester-facing UI is the next
+application layer and is outside Issue #33. A hosted model adapter is also future work; the current
+local adapter is deterministic.
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Local development](docs/local-development.md)
+- [Runtime and HTTP API](docs/pactagent-runtime.md)
+- [End-to-end workflow](docs/pactagent-workflow.md)
+- [Service agreements](docs/pact-service-agreements.md)
+- [Cashu test-mint adapter](docs/cashu-test-mint-adapter.md)
+- [Cashu escrow settlement](docs/cashu-escrow-settlement.md)
+- [PIP-01 Cashu descriptor](docs/pip01-cashu-descriptor.md)
+- [Private task/result transport boundaries](docs/pactagent-workflow.md#publicprivate-data-boundaries)
 
 ## Collaboration
 

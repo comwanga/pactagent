@@ -21,7 +21,18 @@
     "test": "vitest run",
     "test:integration": "vitest run --maxWorkers=1 src/domain/pact-service-agreement.test.ts src/domain/private-task-transport.test.ts src/lib/provider-discovery.test.ts src/lib/pact-service-agreement-publication.test.ts src/lib/private-task-transport.test.ts src/lib/cashu-escrow-settlement.test.ts",
     "test:e2e": "vitest run --maxWorkers=1 src/lib/pactagent-workflow.test.ts",
-    "test:live": "vitest run --maxWorkers=1 src/lib/pactagent-workflow.live.test.ts"
+    "test:live": "vitest run --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-workflow.live.test.ts",
+    "test:runtime": "vitest run --maxWorkers=1 src/lib/pactagent-runtime.test.ts src/lib/pactagent-runtime-api.test.ts",
+    "test:process": "vitest run --config vitest.process.config.ts",
+    "test:blackbox": "next build && vitest run --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-runtime.blackbox.test.ts",
+    "test:local:testnut": "node scripts/run-with-local-ca.mjs scripts/test-local-testnut.mjs",
+    "local:up": "node scripts/local-up.mjs",
+    "local:doctor": "node scripts/run-with-local-ca.mjs scripts/local-doctor.mjs --allow-missing-ca",
+    "local:down": "node scripts/local-down.mjs",
+    "local:reset-state": "node scripts/local-reset-state.mjs",
+    "runtime:start": "next start",
+    "runtime:start:local": "node scripts/runtime-start-local.mjs",
+    "runtime:bootstrap": "node scripts/runtime-bootstrap.mjs"
   },
   "dependencies": {
     "@cashu/cashu-ts": "4.10.1",

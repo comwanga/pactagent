@@ -36,6 +36,7 @@ describe("PactAgent live workflow demonstration", () => {
       normalSpendKeyHex: "04".repeat(32),
       refundSpendKeyHex: "05".repeat(32),
       fundingToken: tokenMarker,
+      fundingReference: "funding-reference-live-test",
       stateDirectory: ".test-live-state",
     };
     const cashu = {

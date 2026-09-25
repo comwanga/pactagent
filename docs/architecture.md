@@ -67,7 +67,7 @@ signed event is checked against the original draft and its NIP-01 id and Schnorr
 signature are verified before publication. Retrieval repeats signature and
 descriptor validation before returning domain data. The repository provides an
 isolated local signer for development and tests; deployment-specific key custody
-is not claimed. The requester model has no signing or wallet authority.
+is not claimed. The requester-decision adapter has no signing or wallet authority.
 
 The PIP-01 workflow uses issue #4's `NostrRelayAdapter` and its typed
 `publish(event)` and `queryEvents(filter)` operations directly. Connection
@@ -99,8 +99,11 @@ components. The Cashu layer can inspect and swap against one configured HTTPS
 test mint and can privately import already-acquired proofs and deliver confirmed
 outputs. Required tests remain deterministic and offline.
 
-Issue #16 application composition, requester/provider runtime hosting, a hosted
-model adapter, and a live transaction frontend/API remain pending. This is not a
-production wallet: Lightning mint-quote acquisition, generic accounts,
-multi-mint routing, and production custody operations remain out of scope. No
-generic marketplace, reputation, bidding, or dispute adjudication is provided.
+Issue #33 provides the application composition, long-lived requester/provider
+runtime, and authenticated transaction HTTP API. A requester-facing UI and a
+hosted model adapter remain pending. The current live requester-decision adapter
+is deterministic, and deterministic policy remains the economic authorization
+boundary regardless of recommendation source. This is not a production wallet:
+Lightning mint-quote acquisition, generic accounts, multi-mint routing, and
+production custody operations remain out of scope. No generic marketplace,
+reputation, bidding, or dispute adjudication is provided.

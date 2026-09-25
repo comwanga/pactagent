@@ -34,7 +34,7 @@ human intent + private document
   ↓
 #9 validated discovery → deterministic provider selection
   ↓
-#15 bounded model recommendation → deterministic requester policy
+#15 bounded requester recommendation → deterministic requester policy
   ↓
 #10 requester-signed proposal (proposed)
   ↓
@@ -99,26 +99,23 @@ Run only the end-to-end workflow integration tests:
 npx vitest run src/lib/pactagent-workflow.test.ts
 ```
 
-### Opt-in live demonstration
+### Opt-in local Testnut acceptance
 
-The live demonstration requires explicit configuration and skips cleanly
-when configuration is missing:
+Use the guarded local workflow rather than invoking the component live test
+directly:
 
 ```sh
-PACTAGENT_LIVE_RELAY_URL=wss://relay.example \
-PACTAGENT_CASHU_TEST_MINT_URL=https://testmint.example/cashu \
-PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY=<hex> \
-PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY=<hex> \
-PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY=<hex> \
-PACTAGENT_LIVE_NORMAL_SPEND_KEY=<hex> \
-PACTAGENT_LIVE_REFUND_SPEND_KEY=<hex> \
-PACTAGENT_LIVE_FUNDING_TOKEN=<cashuA...> \
-PACTAGENT_LIVE_STATE_DIRECTORY=/private/path/pactagent-live-state \
-npx vitest run src/lib/pactagent-workflow.live.test.ts
+npm run local:up
+npm run local:doctor
+npm run test:local:testnut
+npm run local:down
 ```
 
-Missing live configuration causes a clean skip, never a fallback to
-production or an arbitrary mint/relay.
+Configuration names and safe local defaults are documented in `.env.example`
+and [the local-development guide](local-development.md). The doctor performs
+only read-only relay, mint, proof-state, capability, and durable-state checks.
+The acceptance command refuses to run unless the doctor is green, attempts one
+transaction, and never blindly retries ambiguous economic work.
 
 ## Test identity creation
 
@@ -130,7 +127,7 @@ function key(seed: number): Uint8Array {
 }
 ```
 
-For the live demonstration, generate five independent 32-byte keys (requester,
+For the local live runtime, generate five independent 32-byte keys (requester,
 provider, escrow authority, normal spend, and refund spend), for example by
 running this command five times:
 
@@ -154,19 +151,19 @@ repository.**
 - Deterministic clock
 - No network, credentials, live mint, or funds
 
-### Live lane (opt-in)
+### Local Testnut lane (opt-in)
 
 - Existing `WebSocketNostrRelayAdapter`
 - One explicitly configured Cashu test mint
 - Unit `sat`
 - Separately configured requester, provider, and escrow-authority identities
-- Pre-acquired test ecash supplied as a Cashu token (`PACTAGENT_LIVE_FUNDING_TOKEN`)
+- Pre-acquired test ecash supplied as a Cashu token and an opaque local funding reference
 - Durable private Cashu and escrow recovery state under `PACTAGENT_LIVE_STATE_DIRECTORY`
 - Real signed PIP-00 provider definition, PactAgent service offer, and PIP-01 escrow descriptor published to and discovered from the configured relay
 - Bounded operation timeouts
 - Test ecash only; no production funds
 
-Both lanes exercise the same `PactAgentWorkflow` application composition
+All lanes exercise the same `PactAgentWorkflow` application composition
 and component boundaries.
 
 ## Public/private data boundaries
@@ -273,7 +270,9 @@ npx vitest run src/lib/pactagent-workflow.test.ts -t "cross-boundary safety"
 
 ## AI/model boundary
 
-The requester model is advisory only. It receives:
+The requester-decision adapter is advisory only. The current local adapter is
+deterministic; no hosted AI/model adapter is configured. A future model-backed
+adapter would receive:
 
 - Safe discovery projection (public keys, stable references, amount, duration)
 - Private bounded instruction
@@ -284,7 +283,10 @@ It does NOT receive:
 - Private keys, tokens, proofs, or secrets
 - Signing, publication, lifecycle, or settlement authority
 
-The deterministic CI lane uses an injected `FakeRequesterDecisionModel`.
-A separately configured external model adapter may be used by the optional
-live demonstration, but this issue does not introduce a model vendor, SDK,
-credential management, model routing, or autonomous agent infrastructure.
+The deterministic CI lane uses an injected `FakeRequesterDecisionModel`; the
+local live runtime uses an injected deterministic recommendation. Both are
+gated by the same deterministic requester policy. A future model adapter can
+plug into this recommendation boundary without receiving Nostr, Cashu,
+agreement, or settlement authority. This issue does not introduce a model
+vendor, SDK, credential management, model routing, or autonomous agent
+infrastructure.

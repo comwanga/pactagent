@@ -538,8 +538,6 @@ function fingerprint(value: Readonly<Record<string, unknown>>): string {
 function operationFingerprint(input: {
   readonly record: StoredEscrowRecord;
   readonly type: SettlementOperationType;
-  readonly expectedVersion: number;
-  readonly expectedState: PactCashuEscrowOperationalState;
   readonly actor: string;
   readonly authorizationReference?: string;
   readonly resultReference?: string;
@@ -549,8 +547,6 @@ function operationFingerprint(input: {
     escrow_reference: input.record.reference,
     agreement_id: input.record.agreementId,
     operation_type: input.type,
-    expected_state: input.expectedState,
-    expected_version: input.expectedVersion,
     actor: input.actor,
     amount_sats: input.record.amountSats,
     authorization_reference: input.authorizationReference ?? null,
@@ -751,6 +747,7 @@ export interface FundPactCashuEscrowInput {
   readonly context: PactAgreementContext;
   readonly history: readonly SignedNostrEvent[];
   readonly funding: PrivateCashuFunding;
+  readonly allowFreshEconomicAttempt?: boolean;
 }
 
 export interface SubmitReleaseAuthorizationInput {
@@ -768,6 +765,7 @@ export interface ReleasePactCashuEscrowInput {
   readonly expectedVersion: number;
   readonly context: PactAgreementContext;
   readonly history: readonly SignedNostrEvent[];
+  readonly allowFreshEconomicAttempt?: boolean;
 }
 
 export interface SubmitRefundAuthorizationInput {
@@ -785,6 +783,7 @@ export interface RefundPactCashuEscrowInput {
   readonly expectedVersion: number;
   readonly context: PactAgreementContext;
   readonly history: readonly SignedNostrEvent[];
+  readonly allowFreshEconomicAttempt?: boolean;
 }
 
 export interface DeliverProviderPayoutInput {
@@ -923,9 +922,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const now = safeTime(this.dependencies.clock.now());
       assertNotFutureDated(history, now, PACT_CASHU_ESCROW_CLOCK_SKEW_SECONDS);
       const root = input.context.root;
-      if (now >= root.content.expires_at) {
-        settlementError("agreement_mismatch", "Expired agreement cannot enter escrow funding");
-      }
       if (
         root.content.capability_profile !== DOCUMENT_SUMMARY_PROFILE_ID ||
         root.content.amount_sats !== "350"
@@ -955,7 +951,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const descriptor = parseCashuEscrowDescriptorEvent(input.context.references.escrowDescriptor);
       const accepted = history.transitions.at(-1)!;
       const locktime = accepted.event.created_at + descriptor.content.dispute_rules.timeout.duration_seconds;
-      if (!Number.isSafeInteger(locktime) || locktime <= now) {
+      if (!Number.isSafeInteger(locktime)) {
         settlementError("invalid_request", "Escrow locktime is invalid");
       }
       let capabilities;
@@ -1034,6 +1030,12 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       }
       const existing = await this.dependencies.store.read(this.escrowKey(escrowReference));
       if (isStoredEscrowRecord(existing)) return result(existing, "confirmed");
+      if (now >= root.content.expires_at) {
+        settlementError("agreement_mismatch", "Expired agreement cannot enter escrow funding");
+      }
+      if (locktime <= now) {
+        settlementError("invalid_request", "Escrow locktime is invalid");
+      }
       const operationFingerprintValue = fingerprint({
         request_fingerprint: requestFingerprint,
         escrow_reference: escrowReference,
@@ -1199,8 +1201,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const operationFingerprintValue = operationFingerprint({
         record,
         type: "fund",
-        expectedVersion: input.expectedVersion,
-        expectedState: "prepared",
         actor: record.escrowAuthority,
       });
       const existing = this.operation(record, key, "fund", operationFingerprintValue, input.expectedVersion);
@@ -1230,6 +1230,9 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         return result(published.record, published.published ? "confirmed" : "publication_pending");
       }
       assertState(history, "accepted");
+      const now = safeTime(this.dependencies.clock.now());
+      const allowFreshPreparation =
+        input.allowFreshEconomicAttempt !== false && now < record.locktime;
       let cashuResult: CashuMutationResult;
       try {
         cashuResult = await this.dependencies.cashu.prepareLockedValue({
@@ -1237,6 +1240,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
           funding: input.funding,
           amountSats: PACT_CASHU_ESCROW_DOCUMENT_SUMMARY_AMOUNT_SATS,
           spendingCondition: record.spendingCondition,
+          allowFreshPreparation,
         });
       } catch (error) {
         if (cashuFailureNeedsReconciliation(error)) {
@@ -1330,8 +1334,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const operationFingerprintValue = operationFingerprint({
         record,
         type: "authorize_release",
-        expectedVersion: input.expectedVersion,
-        expectedState: "funded",
         actor: authorization.event.pubkey,
         authorizationReference: authorization.event.id,
         resultReference,
@@ -1409,8 +1411,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const operationFingerprintValue = operationFingerprint({
         record,
         type: "authorize_refund",
-        expectedVersion: input.expectedVersion,
-        expectedState: "funded",
         actor: authorization.event.pubkey,
         authorizationReference: authorization.event.id,
       });
@@ -1481,8 +1481,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const operationFingerprintValue = operationFingerprint({
         record,
         type,
-        expectedVersion: input.expectedVersion,
-        expectedState: requiredState,
         actor: direction === "provider" ? record.provider : record.requester,
       });
       const existing = this.operation(
@@ -1612,8 +1610,6 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       const operationFingerprintValue = operationFingerprint({
         record,
         type,
-        expectedVersion: input.expectedVersion,
-        expectedState: type === "release" ? "release_authorized" : "refund_authorized",
         actor: authorization.authorizer,
         authorizationReference: authorization.eventId,
         resultReference: type === "release" ? record.releaseAuthorization?.resultReference : undefined,
@@ -1638,11 +1634,13 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       }
       const now = safeTime(this.dependencies.clock.now());
       assertNotFutureDated(history, now, record.clockSkewSeconds);
-      const reconcilingRelease =
+      const recoveringExistingRelease =
         type === "release" &&
-        existing?.status === "reconciliation_required" &&
-        record.state === "release_reconciliation_required";
-      if (type === "release" && now >= record.locktime && !reconcilingRelease) {
+        existing !== undefined &&
+        ((existing.status === "pending" && record.state === "release_pending") ||
+          (existing.status === "reconciliation_required" &&
+            record.state === "release_reconciliation_required"));
+      if (type === "release" && now >= record.locktime && !recoveringExistingRelease) {
         settlementError("completion_not_authorized", "Release authorization has expired");
       }
       if (type === "refund" && record.refundAuthorization?.basis === "timeout" && now < record.locktime) {
@@ -1688,6 +1686,9 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
           operationId: cashuOperationId(record, type, key),
           handle: record.fundingHandle,
           spendingKey,
+          allowFreshPreparation:
+            input.allowFreshEconomicAttempt !== false &&
+            !(type === "release" && now >= record.locktime),
         });
       } catch (error) {
         if (cashuFailureNeedsReconciliation(error)) {

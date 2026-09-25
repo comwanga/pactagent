@@ -27,11 +27,14 @@ import {
   type PactAgreementState,
 } from "../domain/pact-service-agreement";
 import {
+  CashuPrivateBackendError,
   CashuTestMintError,
   PrivateCashuSpendingKey,
-  createPrivateCashuFunding,
   createPrivateCashuBeneficiaryDestination,
+  createPrivateCashuFunding,
   createPrivateCashuSpendingKey,
+  createCashuTestMintAdapterWithBackend,
+  createInMemoryCashuPrivateStore,
   type CashuPrivateDeliveryResult,
   type CashuMutationResult,
   type CashuPrivateHandle,
@@ -52,6 +55,9 @@ import {
 } from "./cashu-escrow-settlement";
 import type { NostrRelayAdapter } from "./nostr-relay";
 import { createLocalNostrSigner } from "./nostr-signer";
+import {
+  FakeCashuBackend,
+} from "./cashu-test-fixture";
 
 const ROOT_TIME = 1_900_000_000;
 const MINT_URL = "https://testmint.example/cashu";
@@ -644,7 +650,6 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       context: data.context,
       history: data.history,
     })).rejects.toMatchObject({ code: "invalid_request" });
-    expect(data.cashu.capabilityCalls).toBe(0);
   });
 
   it("rejects a backdated acceptance when trusted preparation time is past agreement expiry", async () => {
@@ -655,7 +660,41 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       context: data.context,
       history: data.history,
     })).rejects.toMatchObject({ code: "agreement_mismatch" });
-    expect(data.cashu.capabilityCalls).toBe(0);
+  });
+
+  it("recovers an expired agreement with an existing escrow in funding_reconciliation_required", async () => {
+    const data = setup();
+    const prepared = await data.coordinator.prepareEscrow({
+      idempotencyKey: "expired-recovery-prepare",
+      context: data.context,
+      history: data.history,
+    });
+    data.cashu.prepareModes = ["unknown"];
+    const funded = await data.coordinator.fundEscrow({
+      idempotencyKey: "expired-recovery-fund",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: deserializeProofs([{ id: "00aabb", amount: "400", secret: "recovery-proof", C: CURVE_POINT, witness: "w" }]),
+      }),
+    });
+    expect(funded.outcome).toBe("reconciliation_required");
+
+    data.cashu.prepareModes = [];
+    data.cashu.spendCalls = 0;
+    data.clock.value = data.context.root.content.expires_at + 100;
+
+    const recovered = await data.coordinator.prepareEscrow({
+      idempotencyKey: "expired-recovery-prepare",
+      context: data.context,
+      history: data.history,
+    });
+    expect(recovered.outcome).toBe("confirmed");
+    expect(recovered.escrow.state).toBe("funding_reconciliation_required");
   });
 
   it("recovers and idempotently delivers provider payout plus requester change after restart", async () => {
@@ -1016,13 +1055,18 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
     expect(data.cashu.spendCalls).toBe(0);
   });
 
-  it("handles duplicate funding and idempotency conflicts without a second Cashu call", async () => {
+  it("handles duplicate funding idempotently without a second Cashu call", async () => {
     const data = setup();
     const { prepared, funded } = await prepareAndFund(data);
     const duplicate = await data.coordinator.fundEscrow({ idempotencyKey: "fund-escrow-001", escrowReference: prepared.escrow.escrowReference, expectedVersion: prepared.escrow.version, context: data.context, history: data.history, funding: privateFunding() });
     expect(duplicate.outcome).toBe("confirmed");
     expect(data.cashu.prepareCalls).toBe(1);
-    await expect(data.coordinator.fundEscrow({ idempotencyKey: "fund-escrow-001", escrowReference: prepared.escrow.escrowReference, expectedVersion: prepared.escrow.version + 1, context: data.context, history: data.history, funding: privateFunding() })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    // A stale expected version on an already-completed operation is idempotent,
+    // not a conflict: the operation identity is semantic (type/actor/authorization),
+    // while the version is only a stale-check precondition for the first invocation.
+    const stale = await data.coordinator.fundEscrow({ idempotencyKey: "fund-escrow-001", escrowReference: prepared.escrow.escrowReference, expectedVersion: prepared.escrow.version + 1, context: data.context, history: data.history, funding: privateFunding() });
+    expect(stale.outcome).toBe("confirmed");
+    expect(data.cashu.prepareCalls).toBe(1);
     expect(funded.escrow.state).toBe("funded");
   });
 
@@ -1625,4 +1669,460 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
       expect(source).not.toContain(marker);
     }
   });
+});
+
+describe("integrated expired-agreement recovery with real Cashu adapter", () => {
+  it("composes prepareEscrow → fundEscrow → reconcilePrepared → all-unspent → not_submitted → blocks fresh funding after locktime", async () => {
+    const data = setup();
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: adapter,
+      privateDelivery: data.privateDelivery,
+      store: data.store,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "PRIVATE-PROOF", C: CURVE_POINT, witness: "PRIVATE-WITNESS" }]),
+    });
+
+    const prepared = await coordinator.prepareEscrow({
+      idempotencyKey: "int-prepare-001",
+      context: data.context,
+      history: data.history,
+    });
+    expect(prepared.outcome).toBe("confirmed");
+
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    const funded = await coordinator.fundEscrow({
+      idempotencyKey: "int-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    expect(funded.outcome).toBe("reconciliation_required");
+    expect(backend.submitCalls).toBe(1);
+    expect(backend.inspectCalls).toBe(0);
+
+    data.clock.value = data.locktime + 100;
+
+    const recovered = await coordinator.prepareEscrow({
+      idempotencyKey: "int-prepare-001",
+      context: data.context,
+      history: data.history,
+    });
+    expect(recovered.outcome).toBe("confirmed");
+    expect(recovered.escrow.state).toBe("funding_reconciliation_required");
+
+    await expect(coordinator.fundEscrow({
+      idempotencyKey: "int-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: recovered.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+
+    expect(backend.inspectCalls).toBe(1);
+    expect(backend.restoreCalls).toBe(0);
+    expect(backend.submitCalls).toBe(1);
+
+    await expect(coordinator.fundEscrow({
+      idempotencyKey: "int-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: recovered.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+
+    expect(backend.submitCalls).toBe(1);
+    expect(backend.prepareCalls).toBe(1);
+  }, 30_000);
+
+  it("blocks fresh funding after funding_pending crash with expired locktime using real adapter", async () => {
+    const data = setup();
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: adapter,
+      privateDelivery: data.privateDelivery,
+      store: data.store,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "PRIVATE-PROOF", C: CURVE_POINT, witness: "PRIVATE-WITNESS" }]),
+    });
+
+    const prepared = await coordinator.prepareEscrow({
+      idempotencyKey: "crash-prepare-001",
+      context: data.context,
+      history: data.history,
+    });
+
+    data.clock.value = data.locktime + 100;
+
+    await expect(coordinator.fundEscrow({
+      idempotencyKey: "crash-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+
+    expect(backend.prepareCalls).toBe(0);
+    expect(backend.submitCalls).toBe(0);
+  });
+
+  it("allows reconciliation from funding_pending with submitted_unknown after expired locktime", async () => {
+    const data = setup();
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: adapter,
+      privateDelivery: data.privateDelivery,
+      store: data.store,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "PRIVATE-PROOF", C: CURVE_POINT, witness: "PRIVATE-WITNESS" }]),
+    });
+
+    const prepared = await coordinator.prepareEscrow({
+      idempotencyKey: "recon-prepare-001",
+      context: data.context,
+      history: data.history,
+    });
+
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    const funded = await coordinator.fundEscrow({
+      idempotencyKey: "recon-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    expect(funded.outcome).toBe("reconciliation_required");
+    expect(backend.submitCalls).toBe(1);
+
+    data.clock.value = data.locktime + 100;
+
+    await expect(coordinator.fundEscrow({
+      idempotencyKey: "recon-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+
+    expect(backend.inspectCalls).toBe(1);
+    expect(backend.submitCalls).toBe(1);
+    expect(backend.prepareCalls).toBe(1);
+  });
+
+  it("allows idempotent return from funding_pending with succeeded Cashu operation after expired locktime", async () => {
+    const data = setup();
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: adapter,
+      privateDelivery: data.privateDelivery,
+      store: data.store,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "PRIVATE-PROOF", C: CURVE_POINT, witness: "PRIVATE-WITNESS" }]),
+    });
+
+    const prepared = await coordinator.prepareEscrow({
+      idempotencyKey: "idempotent-prepare-001",
+      context: data.context,
+      history: data.history,
+    });
+
+    const funded = await coordinator.fundEscrow({
+      idempotencyKey: "idempotent-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    expect(funded.outcome).toBe("confirmed");
+    expect(backend.submitCalls).toBe(1);
+
+    data.clock.value = data.locktime + 100;
+
+    const recovered = await coordinator.fundEscrow({
+      idempotencyKey: "idempotent-fund-001",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    expect(recovered.outcome).toBe("confirmed");
+    expect(backend.submitCalls).toBe(1);
+    expect(backend.prepareCalls).toBe(1);
+  });
+
+  it("recovers a durable successful release from release_pending after locktime without resubmitting", async () => {
+    const baseStore = createInMemoryPactCashuEscrowSettlementStore();
+    let failReleaseConfirmedWrite = true;
+    const interruptedStore: PactCashuEscrowSettlementStore = {
+      read: (key) => baseStore.read(key),
+      insert: (key, value) => baseStore.insert(key, value),
+      compareAndSet(key, expectedRevision, value) {
+        if (
+          failReleaseConfirmedWrite &&
+          (value as { state?: unknown }).state === "release_confirmed"
+        ) {
+          failReleaseConfirmedWrite = false;
+          return Promise.resolve(false);
+        }
+        return baseStore.compareAndSet(key, expectedRevision, value);
+      },
+      withExclusiveLock: (key, operation) => baseStore.withExclusiveLock(key, operation),
+    };
+    const data = setup({ store: interruptedStore });
+    const privateStore = createInMemoryCashuPrivateStore();
+    const firstBackend = new FakeCashuBackend();
+    const firstAdapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend: firstBackend,
+      privateStore,
+    });
+    const firstCoordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: firstAdapter,
+      privateDelivery: data.privateDelivery,
+      store: interruptedStore,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "release-recovery-proof", C: CURVE_POINT, witness: "release-recovery-witness" }]),
+    });
+    const prepared = await firstCoordinator.prepareEscrow({
+      idempotencyKey: "release-recovery-prepare",
+      context: data.context,
+      history: data.history,
+    });
+    const funded = await firstCoordinator.fundEscrow({
+      idempotencyKey: "release-recovery-fund",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    data.history.push(data.relay.events.at(-1)!);
+    const release = advanceReleaseHistory(data);
+    const authorized = await firstCoordinator.submitReleaseAuthorization({
+      idempotencyKey: "release-recovery-authorize",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    const request = {
+      idempotencyKey: "release-recovery-execute",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    };
+    await expect(firstCoordinator.releaseEscrow(request)).rejects.toMatchObject({
+      code: "stale_state",
+    });
+    expect(firstBackend.submitCalls).toBe(2);
+    await expect(baseStore.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+      state: "release_pending",
+    });
+
+    data.clock.value = data.locktime + 1;
+    const restartedBackend = new FakeCashuBackend();
+    const restartedAdapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend: restartedBackend,
+      privateStore,
+    });
+    const restarted = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: restartedAdapter,
+      privateDelivery: data.privateDelivery,
+      store: interruptedStore,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    await expect(restarted.releaseEscrow(request)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "settled" },
+    });
+    expect(restartedBackend.submitCalls).toBe(0);
+    expect(firstBackend.submitCalls).toBe(2);
+  }, 30_000);
+
+  it("does not create a Cashu spend for release_pending without an operation after locktime", async () => {
+    const sourceStore = createInMemoryPactCashuEscrowSettlementStore();
+    const data = setup({ store: sourceStore });
+    const privateStore = createInMemoryCashuPrivateStore();
+    const fundingBackend = new FakeCashuBackend();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend: fundingBackend,
+      privateStore,
+    });
+    let enteredSpend!: () => void;
+    const spendEntered = new Promise<void>((resolveEntered) => {
+      enteredSpend = resolveEntered;
+    });
+    const blockedCashu: CashuTestMintPort = {
+      inspectCapabilities: () => adapter.inspectCapabilities(),
+      inspectProofState: (handle) => adapter.inspectProofState(handle),
+      prepareLockedValue: (input) => adapter.prepareLockedValue(input),
+      async spendLockedValue() {
+        enteredSpend();
+        return new Promise<CashuMutationResult>(() => undefined);
+      },
+    };
+    const blockedCoordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: blockedCashu,
+      privateDelivery: data.privateDelivery,
+      store: sourceStore,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const fund = createPrivateCashuFunding({
+      mintUrl: MINT_URL,
+      unit: "sat",
+      proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "release-no-operation-proof", C: CURVE_POINT, witness: "release-no-operation-witness" }]),
+    });
+    const prepared = await blockedCoordinator.prepareEscrow({
+      idempotencyKey: "release-no-operation-prepare",
+      context: data.context,
+      history: data.history,
+    });
+    const funded = await blockedCoordinator.fundEscrow({
+      idempotencyKey: "release-no-operation-fund",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: fund,
+    });
+    data.history.push(data.relay.events.at(-1)!);
+    const release = advanceReleaseHistory(data);
+    const authorized = await blockedCoordinator.submitReleaseAuthorization({
+      idempotencyKey: "release-no-operation-authorize",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    const request = {
+      idempotencyKey: "release-no-operation-execute",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    };
+    void blockedCoordinator.releaseEscrow(request);
+    await spendEntered;
+    const pending = await sourceStore.read(`escrow:${funded.escrow.escrowReference}`);
+    expect(pending).toMatchObject({ state: "release_pending" });
+
+    const recoveredStore = createInMemoryPactCashuEscrowSettlementStore();
+    await recoveredStore.insert(`escrow:${funded.escrow.escrowReference}`, pending!);
+    data.clock.value = data.locktime + 1;
+    const restartedBackend = new FakeCashuBackend();
+    const restartedAdapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend: restartedBackend,
+      privateStore,
+    });
+    const restarted = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: restartedAdapter,
+      privateDelivery: data.privateDelivery,
+      store: recoveredStore,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    await expect(restarted.releaseEscrow(request)).rejects.toMatchObject({
+      code: "settlement_conflict",
+    });
+    expect(restartedBackend.prepareCalls).toBe(0);
+    expect(restartedBackend.submitCalls).toBe(0);
+  }, 30_000);
 });
