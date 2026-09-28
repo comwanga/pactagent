@@ -4,6 +4,7 @@ import { sats } from "@/domain/money";
 import { DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES } from "@/domain/pact-service-agreement";
 import { PRIVATE_TASK_MAX_PROMPT_BYTES } from "@/domain/private-task-transport";
 import {
+  apiStatusForError,
   getPactAgentRuntime,
   isAuthorized,
   toApiError,
@@ -21,8 +22,18 @@ function apiToken(): string | undefined {
   return process.env.PACTAGENT_RUNTIME_API_TOKEN;
 }
 
+function fundingReferenceFromCookie(request: Request): string | undefined {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) return undefined;
+  for (const part of cookieHeader.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === "pactagent_funding_ref") return decodeURIComponent(rest.join("="));
+  }
+  return undefined;
+}
+
 function jsonError(error: unknown): NextResponse {
-  return transactionJson(toApiError(error), { status: 500 });
+  return transactionJson(toApiError(error), { status: apiStatusForError(error) });
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -56,7 +67,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     candidate.privateDocument.length === 0 ||
     (candidate.mediaType !== "text/plain" && candidate.mediaType !== "application/pdf") ||
     (candidate.privatePrompt !== undefined && typeof candidate.privatePrompt !== "string") ||
-    typeof candidate.fundingReference !== "string" ||
+    (candidate.fundingReference !== undefined && typeof candidate.fundingReference !== "string") ||
     (typeof candidate.maximumBudgetSats !== "number" && typeof candidate.maximumBudgetSats !== "string")
   ) {
     return transactionJson({ error: "Request body is invalid", code: "invalid_request" }, { status: 400 });
@@ -78,9 +89,16 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   try {
     const runtime = await getPactAgentRuntime();
+    const fundingReference =
+      typeof candidate.fundingReference === "string"
+        ? candidate.fundingReference
+        : fundingReferenceFromCookie(request);
+    if (!fundingReference) {
+      return transactionJson({ error: "Request body is invalid", code: "invalid_request" }, { status: 400 });
+    }
     const { transactionId } = await runtime.acceptTransaction({
       idempotencyKey,
-      fundingReference: candidate.fundingReference,
+      fundingReference,
       privateDocument: candidate.privateDocument as string,
       mediaType: candidate.mediaType as "text/plain" | "application/pdf",
       privatePrompt: candidate.privatePrompt as string | undefined,

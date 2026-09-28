@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import {
-  getPactAgentRuntime,
+  getPactAgentRuntimeOrReset,
   isAuthorized,
   toApiError,
 } from "@/lib/pactagent-runtime-singleton";
@@ -19,7 +19,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ error: "Unauthorized", code: "unauthorized" }, { status: 401 });
   }
   try {
-    const runtime = await getPactAgentRuntime();
+    const runtime = await getPactAgentRuntimeOrReset();
     const readiness = await runtime.bootstrap();
     return NextResponse.json(readiness, { headers: NO_STORE });
   } catch (error) {

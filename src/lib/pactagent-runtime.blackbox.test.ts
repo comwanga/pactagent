@@ -8,7 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
-import { readLiveDemoConfigFromEnv } from "./pactagent-workflow.live";
+import { readLiveDemoConfigFromEnv } from "./pactagent-live-config";
 
 /*
  * Issue #33 black-box acceptance layer (opt-in, live only).

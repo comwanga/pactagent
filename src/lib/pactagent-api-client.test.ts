@@ -55,11 +55,42 @@ describe("PactAgent API client", () => {
     expect(client).toBeInstanceOf(PactAgentApiClient);
   });
 
+  it("sends the token-mode funding reference to the session endpoint", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: unknown;
+    globalThis.fetch = async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ authenticated: true, demoAvailable: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    try {
+      await new PactAgentApiClient(undefined, "http://localhost").startSession({
+        token: "runtime-token",
+        fundingReference: "opaque-funding-reference",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(requestBody).toEqual({
+      token: "runtime-token",
+      fundingReference: "opaque-funding-reference",
+    });
+  });
+
   it("PactAgentApiClientError carries code and status", () => {
     const error = new PactAgentApiClientError("not_found", "Transaction not found", 404);
     expect(error.code).toBe("not_found");
     expect(error.status).toBe(404);
     expect(error.message).toBe("Transaction not found");
     expect(error.name).toBe("PactAgentApiClientError");
+  });
+
+  it("redacts unknown runtime error messages", async () => {
+    const response = await import("./pactagent-api-client");
+    expect(response.friendlyErrorMessage(
+      new response.PactAgentApiClientError("unexpected", "private runtime details", 500),
+    )).toBe("The runtime could not complete that request.");
   });
 });

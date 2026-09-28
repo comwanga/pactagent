@@ -127,12 +127,13 @@ export class PactAgentApiClientError extends Error {
   }
 }
 
-function authHeaders(apiToken: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${apiToken}`,
-    "Content-Type": "application/json",
-  };
+function authHeaders(apiToken?: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
+  return headers;
 }
+
+const SAME_ORIGIN: RequestCredentials = "same-origin";
 
 async function parseResponse<T>(response: Response): Promise<T> {
   if (response.status === 204) return undefined as T;
@@ -148,19 +149,88 @@ async function parseResponse<T>(response: Response): Promise<T> {
   return body as T;
 }
 
+export function isWorkflowReport(value: unknown): value is WorkflowReport {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { workflowVersion?: unknown }).workflowVersion === 1 &&
+    typeof (value as { finalOutcome?: unknown }).finalOutcome === "string"
+  );
+}
+
+export function isTransactionStatus(value: unknown): value is TransactionStatus {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { transactionId?: unknown }).transactionId === "string" &&
+    typeof (value as { operationalState?: unknown }).operationalState === "string"
+  );
+}
+
 export class PactAgentApiClient {
   readonly #baseURL: string;
-  readonly #apiToken: string;
+  readonly #apiToken?: string;
 
-  constructor(apiToken: string, baseURL?: string) {
+  /**
+   * @param apiToken Optional bearer token for non-browser API consumers.
+   *   The browser UI does NOT pass a token; it authenticates via an httpOnly
+   *   session cookie minted by POST /api/session, so the secret never reaches
+   *   client-side JavaScript.
+   * @param baseURL Optional API base; defaults to NEXT_PUBLIC_PACTAGENT_API_BASE.
+   */
+  constructor(apiToken?: string, baseURL?: string) {
     this.#apiToken = apiToken;
-    this.#baseURL = baseURL ?? "";
+    this.#baseURL =
+      baseURL ??
+      (typeof process !== "undefined"
+        ? process.env.NEXT_PUBLIC_PACTAGENT_API_BASE ?? ""
+        : "");
+  }
+
+  async getSession(): Promise<SessionInfo> {
+    const response = await fetch(`${this.#baseURL}/api/session`, {
+      method: "GET",
+      headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
+      cache: "no-store",
+    });
+    return parseResponse<SessionInfo>(response);
+  }
+
+  async startSession(input: {
+    readonly token?: string;
+    readonly demoCode?: string;
+    readonly fundingReference?: string;
+  }): Promise<SessionInfo> {
+    const response = await fetch(`${this.#baseURL}/api/session`, {
+      method: "POST",
+      headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
+      cache: "no-store",
+      body: JSON.stringify({
+        ...(input.token ? { token: input.token } : {}),
+        ...(input.demoCode ? { demoCode: input.demoCode } : {}),
+        ...(input.fundingReference ? { fundingReference: input.fundingReference } : {}),
+      }),
+    });
+    return parseResponse<SessionInfo>(response);
+  }
+
+  async endSession(): Promise<void> {
+    const response = await fetch(`${this.#baseURL}/api/session`, {
+      method: "DELETE",
+      headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
+      cache: "no-store",
+    });
+    await parseResponse<void>(response);
   }
 
   async bootstrap(): Promise<RuntimeBootstrap> {
     const response = await fetch(`${this.#baseURL}/api/runtime/bootstrap`, {
       method: "POST",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<RuntimeBootstrap>(response);
@@ -168,7 +238,7 @@ export class PactAgentApiClient {
 
   async startTransaction(input: {
     readonly idempotencyKey: string;
-    readonly fundingReference: string;
+    readonly fundingReference?: string;
     readonly privateDocument: string;
     readonly mediaType: "text/plain" | "application/pdf";
     readonly privatePrompt?: string;
@@ -180,12 +250,13 @@ export class PactAgentApiClient {
         ...authHeaders(this.#apiToken),
         "Idempotency-Key": input.idempotencyKey,
       },
+      credentials: SAME_ORIGIN,
       body: JSON.stringify({
         privateDocument: input.privateDocument,
         mediaType: input.mediaType,
         ...(input.privatePrompt ? { privatePrompt: input.privatePrompt } : {}),
         maximumBudgetSats: input.maximumBudgetSats,
-        fundingReference: input.fundingReference,
+        ...(input.fundingReference ? { fundingReference: input.fundingReference } : {}),
       }),
       cache: "no-store",
     });
@@ -196,6 +267,7 @@ export class PactAgentApiClient {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}`, {
       method: "GET",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<TransactionStatus>(response);
@@ -205,6 +277,7 @@ export class PactAgentApiClient {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}/report`, {
       method: "GET",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<WorkflowReport>(response);
@@ -214,6 +287,7 @@ export class PactAgentApiClient {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}/result`, {
       method: "GET",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<PrivateResult>(response);
@@ -223,6 +297,7 @@ export class PactAgentApiClient {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}/resume`, {
       method: "POST",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<WorkflowReport>(response);
@@ -232,6 +307,7 @@ export class PactAgentApiClient {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}/reconcile`, {
       method: "POST",
       headers: authHeaders(this.#apiToken),
+      credentials: SAME_ORIGIN,
       cache: "no-store",
     });
     return parseResponse<WorkflowReport | TransactionStatus>(response);
@@ -239,6 +315,19 @@ export class PactAgentApiClient {
 }
 
 const STORAGE_KEY = "pactagent:txn";
+const IDEMPOTENCY_KEY = "pactagent:idem";
+
+/*
+ * Reload-recovery state. Only the transaction id and the client-generated
+ * idempotency key (a random value, not private material) are retained in
+ * sessionStorage. Per the issue privacy rule, the source document, prompt,
+ * private summary, credentials, AND the funding reference are NEVER stored in
+ * JS-accessible browser storage; the funding reference lives in an httpOnly
+ * cookie managed by /api/session, and the auth token never reaches the client.
+ */
+export interface RetainedSession {
+  readonly fundingReference: string;
+}
 
 export function retainTransactionId(transactionId: string): void {
   if (typeof window === "undefined" || !window.sessionStorage) return;
@@ -256,8 +345,62 @@ export function clearRetainedTransactionId(): void {
   window.sessionStorage.removeItem(STORAGE_KEY);
 }
 
+export function retainIdempotencyKey(key: string): void {
+  if (typeof window === "undefined" || !window.sessionStorage) return;
+  window.sessionStorage.setItem(IDEMPOTENCY_KEY, key);
+}
+
+export function loadRetainedIdempotencyKey(): string | undefined {
+  if (typeof window === "undefined" || !window.sessionStorage) return undefined;
+  return window.sessionStorage.getItem(IDEMPOTENCY_KEY) ?? undefined;
+}
+
+export function clearRetainedIdempotencyKey(): void {
+  if (typeof window === "undefined" || !window.sessionStorage) return;
+  window.sessionStorage.removeItem(IDEMPOTENCY_KEY);
+}
+
+export function clearAllRetained(): void {
+  clearRetainedTransactionId();
+  clearRetainedIdempotencyKey();
+}
+
 export function generateIdempotencyKey(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * SessionInfo is returned by /api/session. The runtime bearer token is NEVER
+ * in this object — it lives only in an httpOnly cookie. `demoAvailable`
+ * indicates whether the server will mint a one-click demo session.
+ */
+export interface SessionInfo {
+  readonly authenticated: boolean;
+  readonly demoAvailable: boolean;
+  readonly fundingReference?: string;
+}
+
+const FRIENDLY_ERROR_MESSAGES: Record<string, string> = {
+  unauthorized: "Authorization failed — check your runtime token.",
+  transaction_not_found: "This transaction no longer exists on the runtime.",
+  transaction_in_progress: "The agent is already executing this transaction.",
+  result_not_available: "The private result isn't available yet.",
+  report_not_available: "The terminal report isn't available yet.",
+  reconciliation_required: "This transaction needs reconciliation.",
+  invalid_request: "The request was rejected by the runtime.",
+  internal_error: "The runtime hit an internal error.",
+};
+
+export function friendlyErrorMessage(error: unknown): string {
+  if (error instanceof PactAgentApiClientError) {
+    return FRIENDLY_ERROR_MESSAGES[error.code] ?? "The runtime could not complete that request.";
+  }
+  if (error instanceof Error && error.message === "Failed to fetch") return "The runtime is unavailable.";
+  return "Something went wrong.";
+}
+
+export function isNotFoundError(error: unknown): boolean {
+  return error instanceof PactAgentApiClientError && error.status === 404;
 }

@@ -63,6 +63,16 @@ export async function getPactAgentRuntime(): Promise<PactAgentRuntime> {
   return runtime;
 }
 
+export async function getPactAgentRuntimeOrReset(): Promise<PactAgentRuntime> {
+  try {
+    return await getPactAgentRuntime();
+  } catch (error) {
+    await runBoundedRuntimeShutdown();
+    resetPactAgentRuntime();
+    throw error;
+  }
+}
+
 export async function shutdownPactAgentRuntime(): Promise<void> {
   if (shutdownInFlight) return shutdownInFlight;
   shutdownInFlight = (async () => {
@@ -158,5 +168,17 @@ export function apiStatusForError(error: unknown): number {
 export function isAuthorized(request: Request, token: string | undefined): boolean {
   if (!token) return false;
   const header = request.headers.get("authorization");
-  return header === `Bearer ${token}`;
+  if (header === `Bearer ${token}`) return true;
+  // httpOnly session cookie minted by /api/session (browser UI). The cookie
+  // value is the runtime token itself, so equality proves a valid session.
+  const cookieHeader = request.headers.get("cookie");
+  if (cookieHeader) {
+    for (const part of cookieHeader.split(";")) {
+      const [name, ...rest] = part.trim().split("=");
+      if (name === SESSION_COOKIE_NAME && rest.join("=") === token) return true;
+    }
+  }
+  return false;
 }
+
+export const SESSION_COOKIE_NAME = "pactagent_session";
