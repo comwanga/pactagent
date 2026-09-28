@@ -78,7 +78,6 @@ describe.skipIf(!liveConfig)("PactAgent browser acceptance (live)", () => {
   it("authenticates to the runtime via session cookie", async () => {
     const session = await cookieClient.startSession({ token: server.apiToken });
     expect(session.authenticated).toBe(true);
-    expect(session.fundingReference).toBeTruthy();
   }, 15_000);
 
   it("bootstraps the runtime and verifies test mint readiness", async () => {

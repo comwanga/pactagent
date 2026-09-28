@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getPactAgentRuntime, SESSION_COOKIE_NAME } from "@/lib/pactagent-runtime-singleton";
+import { SESSION_COOKIE_NAME } from "@/lib/pactagent-runtime-singleton";
 
 export const dynamic = "force-dynamic";
 
@@ -184,7 +184,3 @@ export async function DELETE(request: Request): Promise<NextResponse> {
   clearFundingCookie(response, request);
   return response;
 }
-
-// Reference the runtime singleton import to avoid dead-code elimination of the
-// shared auth helper; the session route coordinates with the same token source.
-void getPactAgentRuntime;

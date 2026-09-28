@@ -325,10 +325,6 @@ const IDEMPOTENCY_KEY = "pactagent:idem";
  * JS-accessible browser storage; the funding reference lives in an httpOnly
  * cookie managed by /api/session, and the auth token never reaches the client.
  */
-export interface RetainedSession {
-  readonly fundingReference: string;
-}
-
 export function retainTransactionId(transactionId: string): void {
   if (typeof window === "undefined" || !window.sessionStorage) return;
   window.sessionStorage.setItem(STORAGE_KEY, transactionId);
@@ -379,7 +375,6 @@ export function generateIdempotencyKey(): string {
 export interface SessionInfo {
   readonly authenticated: boolean;
   readonly demoAvailable: boolean;
-  readonly fundingReference?: string;
 }
 
 const FRIENDLY_ERROR_MESSAGES: Record<string, string> = {
