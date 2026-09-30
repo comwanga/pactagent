@@ -2,3 +2,8 @@ localhost:8443 {
     tls internal
     reverse_proxy strfry:7777
 }
+
+localhost:8444 {
+    tls internal
+    reverse_proxy mint:3338
+}

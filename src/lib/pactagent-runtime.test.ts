@@ -56,6 +56,7 @@ import {
   type PactAgentWorkflowDependencies,
 } from "./pactagent-workflow";
 import type { RequesterDecisionModel } from "./requester-decision";
+import { createLocalDocumentSummaryModel } from "./document-summary-model";
 import type { SelectedProviderReferences } from "./provider-discovery";
 import {
   createPactAgentRuntimeFromEnv,
@@ -374,6 +375,7 @@ function buildRuntime(
     mintUrl: fixture.mintUrl,
     normalSpendKey: fixture.normalSpendKey,
     refundSpendKey: fixture.refundSpendKey,
+    documentSummaryModel: createLocalDocumentSummaryModel(),
   };
   const runtime = createPactAgentRuntime({
     identities: fixture.identities,
@@ -489,6 +491,7 @@ describe("PactAgent runtime", () => {
       mintUrl: fixture.mintUrl,
       normalSpendKey: fixture.normalSpendKey,
       refundSpendKey: fixture.refundSpendKey,
+      documentSummaryModel: createLocalDocumentSummaryModel(),
     };
     const environment = {
       PACTAGENT_LIVE_RELAY_URL: relay.url,

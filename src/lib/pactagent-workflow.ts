@@ -25,6 +25,7 @@ import {
   type PactTermsCommitment,
 } from "../domain/pact-service-agreement";
 import { summarizeDocument } from "../domain/document-summary-service";
+import type { DocumentSummaryModel, DocumentSummaryRequest } from "./document-summary-model";
 import type { RequesterPolicy } from "../domain/pact-agents";
 import type { NostrRelayAdapter } from "./nostr-relay";
 import type { NostrSigner } from "../domain/nostr";
@@ -170,6 +171,7 @@ export interface PactAgentWorkflowDependencies {
   readonly mintUrl: string;
   readonly normalSpendKey: PrivateCashuSpendingKey;
   readonly refundSpendKey: PrivateCashuSpendingKey;
+  readonly documentSummaryModel: DocumentSummaryModel;
 }
 
 export interface PactAgentWorkflowConfig {
@@ -733,14 +735,30 @@ export class PactAgentWorkflow {
     history: SignedNostrEvent[],
     task: PrivateTaskPayload,
   ): Promise<string> {
-    const outcome = summarizeDocument({
+    const summaryRequest: DocumentSummaryRequest = {
       source_document: task.source_document,
       input_media_type: task.input_media_type,
       ...(task.private_prompt !== undefined
         ? { private_prompt: task.private_prompt }
         : {}),
       agreementRoot: context.root.event.id,
-    });
+    };
+
+    let outcome;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 110_000);
+      timeout.unref?.();
+      try {
+        outcome = await this.#dependencies.documentSummaryModel.summarize(summaryRequest, {
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      outcome = summarizeDocument(summaryRequest);
+    }
 
     if (outcome.status !== "completed") {
       workflowError(

@@ -60,6 +60,7 @@ import {
   type PactAgentWorkflowResumeState,
 } from "./pactagent-workflow";
 import { publishSignedPactAgreementTransition } from "./pact-service-agreement-publication";
+import { createLocalDocumentSummaryModel } from "./document-summary-model";
 import type { RequesterDecisionModel } from "./requester-decision";
 import type { RequesterPolicy } from "../domain/pact-agents";
 
@@ -451,6 +452,7 @@ function buildWorkflow(options: { timeout?: number; relay?: MemoryRelay; store?:
     mintUrl: MINT_URL,
     normalSpendKey: createPrivateCashuSpendingKey({ purpose: "cashu-nut11", secretKeyHex: hex(key(21)) }),
     refundSpendKey: createPrivateCashuSpendingKey({ purpose: "cashu-nut11", secretKeyHex: hex(key(22)) }),
+    documentSummaryModel: createLocalDocumentSummaryModel(),
   };
 
   const workflow = createPactAgentWorkflow({ identities, dependencies });

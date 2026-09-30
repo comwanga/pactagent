@@ -17,6 +17,26 @@ services:
       timeout: 3s
       retries: 12
 
+  mint:
+    image: cashubtc/nutshell:0.21.0
+    container_name: pactagent-local-mint
+    command: ["poetry", "run", "mint"]
+    restart: unless-stopped
+    environment:
+      MINT_BACKEND_BOLT11_SAT: FakeWallet
+      MINT_PRIVATE_KEY: TEST_PRIVATE_KEY
+      MINT_LISTEN_HOST: 0.0.0.0
+      MINT_LISTEN_PORT: "3338"
+      MINT_DATABASE: data/mint
+      TOR: "FALSE"
+    volumes:
+      - ./.local/mint-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "-o", "/dev/null", "http://localhost:3338/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   caddy:
     image: caddy@sha256:14a9c00d4e833ebc2b65d36515b37bde3b73f0b323a2663aaafc88953d8c4e3f
     container_name: pactagent-local-caddy
@@ -27,6 +47,7 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8443:8443"
+      - "127.0.0.1:8444:8444"
     volumes:
       - ./.local/caddy-data:/data
       - ./local/Caddyfile:/etc/caddy/Caddyfile:ro

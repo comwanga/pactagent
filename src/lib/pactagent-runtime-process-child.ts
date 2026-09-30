@@ -37,6 +37,7 @@ import {
   ROOT_TIME,
 } from "./pactagent-runtime-test-fixture";
 import { createPactAgentRuntime, type PactAgentRuntimeConfig } from "./pactagent-runtime";
+import { createLocalDocumentSummaryModel } from "./document-summary-model";
 import { DeterministicPactAgentClock } from "./pactagent-workflow";
 
 type Checkpoint = "none" | "after_root" | "after_funding_success" | "after_ambiguous";
@@ -374,6 +375,7 @@ async function buildRuntimeConfig(): Promise<{
         mintUrl: fixture.mintUrl,
         normalSpendKey: fixture.normalSpendKey,
         refundSpendKey: fixture.refundSpendKey,
+        documentSummaryModel: createLocalDocumentSummaryModel(),
       },
     },
     closeStores() {
