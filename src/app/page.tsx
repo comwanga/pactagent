@@ -27,7 +27,7 @@ import { ConnectPanel, type ConnectResult } from "./components/connect-panel";
 import { TransactionForm, type TransactionFormInput } from "./components/transaction-form";
 import { TransactionDetail } from "./components/transaction-detail";
 import { ToastViewport, useToast } from "./components/use-toast";
-import { PactAgentLogo } from "./pactagent-logo";
+import Link from "next/link";
 
 const POLL_INTERVAL_MS = 1_000;
 const POLL_BACKOFF_MAX_MS = 4_000;
@@ -40,7 +40,7 @@ export default function Home(): React.ReactElement {
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | undefined>();
   const [bootstrap, setBootstrap] = useState<RuntimeBootstrap | undefined>();
   const [transactionId, setTransactionId] = useState<string | undefined>(() => loadRetainedTransactionId());
-  const [idempotencyKey, setIdempotencyKey] = useState<string | undefined>(() => loadRetainedIdempotencyKey());
+  const [, setIdempotencyKey] = useState<string | undefined>(() => loadRetainedIdempotencyKey());
   const [status, setStatus] = useState<TransactionStatus | undefined>();
   const [report, setReport] = useState<WorkflowReport | undefined>();
   const [privateResult, setPrivateResult] = useState<PrivateResult | undefined>();
@@ -53,11 +53,11 @@ export default function Home(): React.ReactElement {
   const [lastUpdatedMs, setLastUpdatedMs] = useState<number | undefined>();
   const [bootstrapping, setBootstrapping] = useState(true);
   const toast = useToast();
+  const { push: toastPush } = toast;
   const pollRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const backoffRef = useRef(POLL_INTERVAL_MS);
   const lastPhaseRef = useRef<RuntimePhase | undefined>(undefined);
 
-  // On mount, probe for an existing httpOnly session so refresh survives.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -77,8 +77,18 @@ export default function Home(): React.ReactElement {
             if (cancelled) return;
             setError(friendlyErrorMessage(err));
           }
-          if (loadRetainedTransactionId()) {
-            setView("transaction");
+          const retainedTxn = loadRetainedTransactionId();
+          if (retainedTxn) {
+            try {
+              await probe.getStatus(retainedTxn);
+              if (cancelled) return;
+              setView("transaction");
+            } catch {
+              clearRetainedTransactionId();
+              clearRetainedIdempotencyKey();
+              setTransactionId(undefined);
+              setView("form");
+            }
           } else {
             setView("form");
           }
@@ -89,20 +99,17 @@ export default function Home(): React.ReactElement {
         if (!cancelled) setBootstrapping(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   const recordActivity = useCallback((phase: RuntimePhase): void => {
     setActivity((current) => {
       if (current.length > 0 && current[current.length - 1].phase === phase) return current;
-      const entry: ActivityEntry = {
+      return [...current, {
         id: `${phase}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         phase,
         timestamp: Date.now(),
-      };
-      return [...current, entry];
+      }];
     });
   }, []);
 
@@ -117,11 +124,7 @@ export default function Home(): React.ReactElement {
       } catch (err) {
         setError(friendlyErrorMessage(err));
       }
-      if (loadRetainedTransactionId()) {
-        setView("transaction");
-      } else {
-        setView("form");
-      }
+      setView(loadRetainedTransactionId() ? "transaction" : "form");
     },
     [],
   );
@@ -148,16 +151,16 @@ export default function Home(): React.ReactElement {
         setReport(undefined);
         setPrivateResult(undefined);
         setView("transaction");
-        toast.push("Transaction submitted — agent is starting", "success");
+        toastPush("Transaction submitted — agent is starting", "success");
       } catch (err) {
         const message = friendlyErrorMessage(err);
         setError(message);
-        toast.push(message, "error");
+        toastPush(message, "error");
       } finally {
         setSubmitting(false);
       }
     },
-    [client, toast],
+    [client, toastPush],
   );
 
   const handleResume = useCallback(async (): Promise<void> => {
@@ -166,18 +169,17 @@ export default function Home(): React.ReactElement {
     setError(undefined);
     try {
       const r = await client.resume(transactionId);
-      setReport(r);
+      if (isWorkflowReport(r)) setReport(r);
       setStatus(await client.getStatus(transactionId));
-      setPollGeneration((generation) => generation + 1);
-      toast.push("Resumed — agent is continuing", "success");
+      setPollGeneration((g) => g + 1);
+      toastPush("Resumed — agent is continuing", "success");
     } catch (err) {
-      const message = friendlyErrorMessage(err);
-      setError(message);
-      toast.push(message, "error");
+      setError(friendlyErrorMessage(err));
+      toastPush(friendlyErrorMessage(err), "error");
     } finally {
       setActionInFlight(false);
     }
-  }, [client, transactionId, toast]);
+  }, [client, transactionId, toastPush]);
 
   const handleReconcile = useCallback(async (): Promise<void> => {
     if (!client || !transactionId) return;
@@ -187,50 +189,43 @@ export default function Home(): React.ReactElement {
       const result = await client.reconcile(transactionId);
       if (isWorkflowReport(result)) setReport(result);
       setStatus(await client.getStatus(transactionId));
-      setPollGeneration((generation) => generation + 1);
-      toast.push("Reconciliation complete", "success");
+      setPollGeneration((g) => g + 1);
+      toastPush("Reconciliation complete", "success");
     } catch (err) {
-      const message = friendlyErrorMessage(err);
-      setError(message);
-      toast.push(message, "error");
+      setError(friendlyErrorMessage(err));
+      toastPush(friendlyErrorMessage(err), "error");
     } finally {
       setActionInFlight(false);
     }
-  }, [client, transactionId, toast]);
+  }, [client, transactionId, toastPush]);
 
   const handleFetchReport = useCallback(async (): Promise<void> => {
     if (!client || !transactionId) return;
     setActionInFlight(true);
-    setError(undefined);
     try {
       const r = await client.getReport(transactionId);
       setReport(r);
-      toast.push("Safe report retrieved", "success");
+      toastPush("Report retrieved", "success");
     } catch (err) {
-      const message = friendlyErrorMessage(err);
-      setError(message);
-      toast.push(message, "error");
+      toastPush(friendlyErrorMessage(err), "error");
     } finally {
       setActionInFlight(false);
     }
-  }, [client, transactionId, toast]);
+  }, [client, transactionId, toastPush]);
 
   const handleFetchResult = useCallback(async (): Promise<void> => {
     if (!client || !transactionId) return;
     setActionInFlight(true);
-    setError(undefined);
     try {
       const r = await client.getPrivateResult(transactionId);
       setPrivateResult(r);
-      toast.push("Private summary retrieved", "success");
+      toastPush("Summary retrieved", "success");
     } catch (err) {
-      const message = friendlyErrorMessage(err);
-      setError(message);
-      toast.push(message, "error");
+      toastPush(friendlyErrorMessage(err), "error");
     } finally {
       setActionInFlight(false);
     }
-  }, [client, transactionId, toast]);
+  }, [client, transactionId, toastPush]);
 
   const handleCloseTransaction = useCallback((): void => {
     clearRetainedTransactionId();
@@ -242,21 +237,12 @@ export default function Home(): React.ReactElement {
     setPrivateResult(undefined);
     setActivity([]);
     lastPhaseRef.current = undefined;
-    if (pollRef.current) {
-      clearTimeout(pollRef.current);
-      pollRef.current = undefined;
-    }
+    if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = undefined; }
     setView("form");
   }, []);
 
   const handleSignOut = useCallback(async (): Promise<void> => {
-    if (client) {
-      try {
-        await client.endSession();
-      } catch {
-        // Best-effort cookie clear.
-      }
-    }
+    if (client) { try { await client.endSession(); } catch { /* best-effort */ } }
     clearAllRetained();
     setClient(undefined);
     setSessionInfo(undefined);
@@ -268,15 +254,12 @@ export default function Home(): React.ReactElement {
     setPrivateResult(undefined);
     setActivity([]);
     lastPhaseRef.current = undefined;
-    if (pollRef.current) {
-      clearTimeout(pollRef.current);
-      pollRef.current = undefined;
-    }
+    if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = undefined; }
     setView("landing");
-    toast.push("Signed out", "info");
-  }, [client, toast]);
+    toastPush("Signed out", "info");
+  }, [client, toastPush]);
 
-  // Poll status; diff phase transitions into the activity log.
+  // Poll status
   useEffect(() => {
     if (!client || !transactionId) return;
     let cancelled = false;
@@ -301,11 +284,19 @@ export default function Home(): React.ReactElement {
           s.finalOutcome === "refunded" ||
           s.operationalState === "failed" ||
           s.operationalState === "reconciliation_required";
+
         if (terminal) {
           setPolling(false);
-          if (s.finalOutcome === "settled") toast.push("Pact settled — complete", "success");
-          else if (s.finalOutcome === "refunded") toast.push("Pact refunded", "info");
-          else if (s.operationalState === "reconciliation_required") toast.push("Reconciliation required", "error");
+          if (s.finalOutcome === "settled" && !privateResult && s.resultAvailable) {
+            // Auto-fetch result on settle
+            try {
+              const r = await client.getPrivateResult(transactionId);
+              if (!cancelled) setPrivateResult(r);
+            } catch { /* non-critical */ }
+          }
+          if (s.finalOutcome === "settled") toastPush("Pact settled — complete", "success");
+          else if (s.finalOutcome === "refunded") toastPush("Pact refunded", "info");
+          else if (s.operationalState === "reconciliation_required") toastPush("Reconciliation required", "error");
           return;
         }
         pollRef.current = setTimeout(() => void doPoll(), backoffRef.current);
@@ -313,12 +304,10 @@ export default function Home(): React.ReactElement {
         if (cancelled) return;
         setPolling(false);
         if (isNotFoundError(err)) {
-          // Transaction gone (runtime reset) — recover gracefully.
-          toast.push("This transaction no longer exists on the runtime.", "error");
+          toastPush("Transaction no longer exists.", "error");
           handleCloseTransaction();
           return;
         }
-        // Transient error: back off and keep trying without a sticky banner.
         backoffRef.current = Math.min(backoffRef.current * 2, POLL_BACKOFF_MAX_MS);
         pollRef.current = setTimeout(() => void doPoll(), backoffRef.current);
       }
@@ -327,108 +316,75 @@ export default function Home(): React.ReactElement {
     void doPoll();
     return () => {
       cancelled = true;
-      if (pollRef.current) {
-        clearTimeout(pollRef.current);
-        pollRef.current = undefined;
-      }
+      if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = undefined; }
     };
-  }, [client, transactionId, pollGeneration, recordActivity, toast, handleCloseTransaction]);
+  }, [client, transactionId, pollGeneration, recordActivity, toastPush, handleCloseTransaction, privateResult]);
 
   const demoAvailable = useMemo(() => sessionInfo?.demoAvailable ?? false, [sessionInfo]);
 
   return (
-    <main>
-      <section className="hero">
-        <nav aria-label="Project identity">
-          <PactAgentLogo />
-        </nav>
-        <div className="heroCopy">
-          <p className="eyebrow">Application-level machine economy</p>
-          <h1>Agents make pacts.<br /><em>Protocols keep the truth.</em></h1>
-          <p className="lede">
-            Submit a private document. An autonomous agent discovers a provider, signs a service agreement,
-            funds Cashu escrow, executes the summary, and settles — all over Nostr and Cashu.
-          </p>
-        </div>
-      </section>
+    <div className="appShell">
+      <header className="topBar">
+        <Link href="/" className="brandLink" aria-label="PactAgent home">
+          <svg className="brandMark" viewBox="0 0 36 36" aria-hidden="true" focusable="false">
+            <path className="brandGlyph" d="M18 2L33 11v14L18 34L3 25V11L18 2z" />
+            <path className="brandRibbon" d="M18 8L27 13v10L18 28L9 23V13L18 8z" />
+            <circle className="brandJoint" cx="18" cy="18" r="3" />
+          </svg>
+          <span className="brandWordmark"><strong>PACT</strong>AGENT</span>
+        </Link>
+        <span className="topBarTag">Open protocols · Machine money</span>
+        {view !== "landing" && (
+          <button type="button" className="signOutLink" onClick={handleSignOut}>Sign out</button>
+        )}
+      </header>
 
-      {view === "landing" && (
-        bootstrapping ? (
-          <section className="section">
-            <p role="status" aria-live="polite">Checking for an existing session…</p>
-          </section>
-        ) : (
-          <ConnectPanel
-            demoAvailable={demoAvailable}
-            onConnected={handleConnected}
-            busy={false}
+      <div className="viewContainer">
+        {view === "landing" && (
+          bootstrapping ? (
+            <div className="loadingState">Checking for an existing session…</div>
+          ) : (
+            <ConnectPanel demoAvailable={demoAvailable} onConnected={handleConnected} busy={false} />
+          )
+        )}
+
+        {view === "form" && bootstrap && client && (
+          <TransactionForm bootstrap={bootstrap} submitting={submitting} onSubmit={handleSubmit} error={error} />
+        )}
+
+        {view === "form" && !bootstrap && client && (
+          <div className="loadingState">
+            <div>
+              <p>Contacting the runtime…</p>
+              {error && <p className="errorBanner" style={{ marginTop: 12 }}>{error}</p>}
+            </div>
+          </div>
+        )}
+
+        {view === "transaction" && status && (
+          <TransactionDetail
+            status={status}
+            report={report}
+            privateResult={privateResult}
+            actionInFlight={actionInFlight}
+            polling={polling}
+            activity={activity}
+            lastUpdatedMs={lastUpdatedMs}
+            error={error}
+            onResume={handleResume}
+            onReconcile={handleReconcile}
+            onFetchReport={handleFetchReport}
+            onFetchResult={handleFetchResult}
+            onClose={handleCloseTransaction}
           />
-        )
-      )}
+        )}
 
-      {view === "form" && bootstrap && client && (
-        <TransactionForm
-          bootstrap={bootstrap}
-          submitting={submitting}
-          onSubmit={handleSubmit}
-          error={error}
-        />
-      )}
-
-      {view === "form" && !bootstrap && client && (
-        <section className="section">
-          <p role="status" aria-live="polite">Contacting the runtime…</p>
-          {error && (
-            <>
-              <p role="alert" className="errorText">{error}</p>
-              <button
-                type="button"
-                className="primaryBtn"
-                onClick={() => {
-                  if (!client) return;
-                  setError(undefined);
-                  client.bootstrap().then(setBootstrap).catch((err) => setError(friendlyErrorMessage(err)));
-                }}
-              >
-                Retry
-              </button>
-            </>
-          )}
-        </section>
-      )}
-
-      {view === "transaction" && status && (
-        <TransactionDetail
-          status={status}
-          report={report}
-          privateResult={privateResult}
-          idempotencyKey={idempotencyKey}
-          actionInFlight={actionInFlight}
-          polling={polling}
-          activity={activity}
-          lastUpdatedMs={lastUpdatedMs}
-          error={error}
-          onResume={handleResume}
-          onReconcile={handleReconcile}
-          onFetchReport={handleFetchReport}
-          onFetchResult={handleFetchResult}
-          onClose={handleCloseTransaction}
-          onSignOut={handleSignOut}
-        />
-      )}
-
-      {view === "transaction" && !status && (
-        <section className="section">
-          <p role="status" aria-live="polite">Loading transaction status…</p>
-        </section>
-      )}
-
-      <footer>
-        <span>PactAgent</span>
-        <span>BOSS Battle 2026 · Freedom Stack + Machine Money</span>
-      </footer>
+        {view === "transaction" && !status && (
+          <div className="loadingState">Loading transaction…</div>
+        )}
+      </div>
 
       <ToastViewport {...toast} />
-    </main>
+    </div>
   );
 }

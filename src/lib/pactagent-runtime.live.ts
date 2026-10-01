@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { createNostrIdentity, type NostrPublicKey } from "../domain/nostr";
@@ -22,7 +23,7 @@ import {
   type CashuTestMintPort,
 } from "./cashu-test-mint";
 import { createLocalNostrSigner } from "./nostr-signer";
-import { WebSocketNostrRelayAdapter } from "./nostr-relay";
+import { WebSocketNostrRelayAdapter, type RelayWebSocketFactory } from "./nostr-relay";
 import { createLocalNostrEncrypter } from "./private-task-transport";
 import {
   createPactAgentRuntime,
@@ -54,6 +55,14 @@ import {
   createOpenAIRequesterRecommendationTransport,
   readRequesterDecisionModeConfiguration,
 } from "./openai-requester-decision";
+import {
+  createLocalDocumentSummaryModel,
+  type DocumentSummaryModel,
+} from "./document-summary-model";
+import {
+  createOpenAIDocumentSummaryModel,
+  readDocumentSummaryModeConfiguration,
+} from "./openai-document-summary";
 
 /*
  * Opt-in live PactAgent runtime wiring (Issue #33).
@@ -86,6 +95,7 @@ export interface PactAgentRuntimeWiring {
 export type PactAgentRuntimeWiringFactory = (
   config: PactAgentLiveDemoConfig,
   decisionModel: RequesterDecisionModel,
+  documentSummaryModel: DocumentSummaryModel,
 ) => PactAgentRuntimeWiring;
 
 export interface LiveRequesterDecision {
@@ -113,6 +123,26 @@ export function createLiveRequesterDecisionFromEnv(
         fetchImplementation,
       }),
     ),
+  });
+}
+
+export function createLiveDocumentSummaryModelFromEnv(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  fetchImplementation: typeof fetch = fetch,
+): DocumentSummaryModel {
+  const configuration = readDocumentSummaryModeConfiguration(environment);
+  if (configuration.mode === "local") {
+    return createLocalDocumentSummaryModel();
+  }
+  const endpoint =
+    configuration.provider === "openrouter"
+      ? "https://openrouter.ai/api/v1/chat/completions"
+      : undefined;
+  return createOpenAIDocumentSummaryModel({
+    apiKey: configuration.apiKey,
+    modelName: configuration.modelName,
+    endpoint,
+    fetchImplementation,
   });
 }
 
@@ -205,13 +235,36 @@ export async function publishRuntimeBootstrapArtifacts(
   });
 }
 
+function resolveLocalCaPath(): string | undefined {
+  const caPath = process.env.PACTAGENT_LOCAL_CA_PATH;
+  if (!caPath) return undefined;
+  try {
+    if (existsSync(caPath)) {
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+      return caPath;
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+function createLocalTlsWebSocketFactory(): RelayWebSocketFactory {
+  return (url: string) =>
+    new WebSocket(url) as unknown as import("./nostr-relay").RelayWebSocket;
+}
+
+const localCaPath = resolveLocalCaPath();
+
 function wireDependencies(
   config: PactAgentLiveDemoConfig,
   decisionModel: RequesterDecisionModel,
+  documentSummaryModel: DocumentSummaryModel,
 ): PactAgentRuntimeWiring {
   const relay = new WebSocketNostrRelayAdapter(config.relayUrl, {
     connectTimeoutMs: 10_000,
     defaultTimeoutMs: 15_000,
+    ...(localCaPath ? { webSocketFactory: createLocalTlsWebSocketFactory() } : {}),
   });
 
   const identities: PactAgentParticipantIdentities = {
@@ -285,6 +338,7 @@ function wireDependencies(
     mintUrl: config.testMintUrl,
     normalSpendKey,
     refundSpendKey,
+    documentSummaryModel,
   };
 
   return {
@@ -323,16 +377,18 @@ export async function createPactAgentRuntimeFromEnv(
 ): Promise<PactAgentRuntimeEnv> {
   let config: PactAgentLiveDemoConfig;
   let requesterDecision: LiveRequesterDecision;
+  let documentSummaryModel: DocumentSummaryModel;
   try {
     config = assertLiveDemoConfig(readLiveDemoConfigFromEnv());
     requesterDecision = createLiveRequesterDecisionFromEnv();
+    documentSummaryModel = createLiveDocumentSummaryModelFromEnv();
   } catch (error) {
     throw new PactAgentRuntimeError(
       "invalid_configuration",
       error instanceof Error ? error.message : "Live runtime configuration is missing",
     );
   }
-  const wired = wiringFactory(config, requesterDecision.model);
+  const wired = wiringFactory(config, requesterDecision.model, documentSummaryModel);
 
   try {
     await wired.relay.connect();

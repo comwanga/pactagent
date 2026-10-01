@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface Toast {
   readonly id: number;
@@ -18,6 +18,16 @@ const AUTO_DISMISS_MS = 4_000;
 
 export function useToast(): UseToast {
   const [toasts, setToasts] = useState<readonly Toast[]>([]);
+  const idRef = useRef(0);
+  const timersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  useEffect(
+    () => () => {
+      for (const timer of timersRef.current) clearTimeout(timer);
+      timersRef.current.clear();
+    },
+    [],
+  );
 
   const dismiss = useCallback((id: number) => {
     setToasts((current) => current.filter((toast) => toast.id !== id));
@@ -25,9 +35,13 @@ export function useToast(): UseToast {
 
   const push = useCallback(
     (message: string, tone: Toast["tone"] = "info") => {
-      const id = Date.now() + Math.random();
+      const id = ++idRef.current;
       setToasts((current) => [...current, { id, message, tone }]);
-      window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+      const timer = setTimeout(() => {
+        dismiss(id);
+        timersRef.current.delete(timer);
+      }, AUTO_DISMISS_MS);
+      timersRef.current.add(timer);
     },
     [dismiss],
   );
@@ -36,10 +50,6 @@ export function useToast(): UseToast {
 }
 
 export function ToastViewport({ toasts, dismiss }: UseToast): React.ReactElement {
-  useEffect(() => {
-    // Toasts are ephemeral; nothing to sync on mount.
-  }, [toasts]);
-
   return (
     <div className="toastViewport" role="region" aria-label="Notifications" aria-live="polite">
       {toasts.map((toast) => (

@@ -4,6 +4,7 @@ import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import {
   PactAgentApiClient,
   PactAgentApiClientError,
+  isWorkflowReport,
   type TransactionStatus,
 } from "./pactagent-api-client";
 import { readLiveDemoConfigFromEnv } from "./pactagent-live-config";
@@ -191,8 +192,11 @@ describe.skipIf(!liveConfig)("PactAgent browser acceptance (live)", () => {
 
   it("resume on a terminal transaction is idempotent (no blind retry)", async () => {
     const r = await client.resume(transactionId);
-    expect(r.finalOutcome).toBe("settled");
-    expect(r.amountSats).toBe("350");
+    expect(isWorkflowReport(r)).toBe(true);
+    if (isWorkflowReport(r)) {
+      expect(r.finalOutcome).toBe("settled");
+      expect(r.amountSats).toBe("350");
+    }
   }, 15_000);
 
   it("unauthorized requester cannot access transaction status", async () => {

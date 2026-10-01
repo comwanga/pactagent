@@ -1,4 +1,11 @@
 localhost:8443 {
     tls internal
-    reverse_proxy strfry:7777
+    reverse_proxy strfry:7777 {
+        flush_interval -1
+    }
+}
+
+localhost:8444 {
+    tls internal
+    reverse_proxy mint:3338
 }

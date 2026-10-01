@@ -45,6 +45,7 @@ import {
   type PactAgentParticipantIdentities,
   type PactAgentWorkflowDependencies,
 } from "./pactagent-workflow";
+import { createLocalDocumentSummaryModel } from "./document-summary-model";
 import type { RequesterDecisionModel } from "./requester-decision";
 import type { SelectedProviderReferences } from "./provider-discovery";
 
@@ -338,6 +339,7 @@ export function buildRuntimeConfig(
     mintUrl: fixture.mintUrl,
     normalSpendKey: fixture.normalSpendKey,
     refundSpendKey: fixture.refundSpendKey,
+    documentSummaryModel: createLocalDocumentSummaryModel(),
   };
   const config: PactAgentRuntimeConfig = {
     identities: fixture.identities,

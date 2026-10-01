@@ -47,6 +47,7 @@ import type {
   RequesterDecisionModel,
   SafeRequesterDecisionInput,
 } from "./requester-decision";
+import { createLocalDocumentSummaryModel } from "./document-summary-model";
 
 /*
  * Opt-in live PactAgent workflow demonstration (Issue #16).
@@ -179,6 +180,7 @@ export function createLiveDemoWorkflow(
     mintUrl: config.testMintUrl,
     normalSpendKey,
     refundSpendKey,
+    documentSummaryModel: createLocalDocumentSummaryModel(),
   };
 
   return {

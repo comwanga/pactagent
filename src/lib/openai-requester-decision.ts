@@ -22,7 +22,7 @@ export type RequesterDecisionModeConfiguration =
   | Readonly<{ mode: "deterministic" }>
   | Readonly<{
       mode: "model";
-      provider: "openai";
+      provider: "openai" | "openrouter";
       modelName: string;
       apiKey: string;
     }>;
@@ -54,9 +54,9 @@ export function readRequesterDecisionModeConfiguration(
     );
   }
   const provider = requiredEnvironmentValue(environment, "PACTAGENT_REQUESTER_MODEL_PROVIDER");
-  if (provider !== "openai") {
+  if (provider !== "openai" && provider !== "openrouter") {
     throw new RequesterModelConfigurationError(
-      "PACTAGENT_REQUESTER_MODEL_PROVIDER must be openai",
+      "PACTAGENT_REQUESTER_MODEL_PROVIDER must be openai or openrouter",
     );
   }
   return Object.freeze({

@@ -22,14 +22,14 @@ export interface RequesterDecisionProjection {
     amountSats: string;
   }>;
   readonly policy: Readonly<{
-    selectedProviderMatchesDiscovery: true;
-    stableReferencesMatch: true;
-    withinRequesterBudget: true;
-    cashuCompatible: true;
-    priceAllowed: true;
-    executionDurationAllowed: true;
+    selectedProviderMatchesDiscovery: boolean;
+    stableReferencesMatch: boolean;
+    withinRequesterBudget: boolean;
+    cashuCompatible: boolean;
+    priceAllowed: boolean;
+    executionDurationAllowed: boolean;
   }>;
-  readonly authorized: true;
+  readonly authorized: boolean;
 }
 
 export type RuntimePhase =
@@ -155,15 +155,6 @@ export function isWorkflowReport(value: unknown): value is WorkflowReport {
     value !== null &&
     (value as { workflowVersion?: unknown }).workflowVersion === 1 &&
     typeof (value as { finalOutcome?: unknown }).finalOutcome === "string"
-  );
-}
-
-export function isTransactionStatus(value: unknown): value is TransactionStatus {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { transactionId?: unknown }).transactionId === "string" &&
-    typeof (value as { operationalState?: unknown }).operationalState === "string"
   );
 }
 
@@ -293,7 +284,7 @@ export class PactAgentApiClient {
     return parseResponse<PrivateResult>(response);
   }
 
-  async resume(transactionId: string): Promise<WorkflowReport> {
+  async resume(transactionId: string): Promise<WorkflowReport | TransactionStatus> {
     const response = await fetch(`${this.#baseURL}/api/transactions/${transactionId}/resume`, {
       method: "POST",
       headers: authHeaders(this.#apiToken),
@@ -392,7 +383,9 @@ export function friendlyErrorMessage(error: unknown): string {
   if (error instanceof PactAgentApiClientError) {
     return FRIENDLY_ERROR_MESSAGES[error.code] ?? "The runtime could not complete that request.";
   }
-  if (error instanceof Error && error.message === "Failed to fetch") return "The runtime is unavailable.";
+  if (error instanceof Error && /failed to fetch|networkerror|load failed/i.test(error.message)) {
+    return "The runtime is unavailable.";
+  }
   return "Something went wrong.";
 }
 
