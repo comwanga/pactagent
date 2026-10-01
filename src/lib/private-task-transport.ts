@@ -539,7 +539,7 @@ export async function publishGiftWrap(
     if (isTimeoutError(error)) {
       throw new PrivateTaskPublicationError("timeout", "Gift wrap publication timed out");
     }
-    throw new PrivateTaskPublicationError("publication_failure", "Gift wrap publication failed");
+    throw new PrivateTaskPublicationError("publication_failure", `Gift wrap publication failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   return parsed;
 }

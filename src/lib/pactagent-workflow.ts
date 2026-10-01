@@ -678,6 +678,7 @@ export class PactAgentWorkflow {
       await publishGiftWrap(sealed.wrapEvent, this.#dependencies.relay);
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
+      console.error("[PactAgent] Private task delivery error:", error instanceof Error ? `${error.name}: ${error.message}` : String(error));
       workflowError("private_transport_failed", "Private task delivery failed");
     }
   }
@@ -756,11 +757,13 @@ export class PactAgentWorkflow {
       } finally {
         clearTimeout(timeout);
       }
-    } catch {
+    } catch (err) {
+      console.error("[PactAgent] AI model failed, falling back:", err instanceof Error ? `${err.name}: ${err.message}` : String(err));
       outcome = summarizeDocument(summaryRequest);
     }
 
     if (outcome.status !== "completed") {
+      console.error("[PactAgent] Summary failed:", outcome.errorCode, outcome.message);
       workflowError(
         "execution_failed",
         `Document summary execution failed: ${outcome.errorCode}`,

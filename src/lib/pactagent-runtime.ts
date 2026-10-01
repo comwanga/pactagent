@@ -845,9 +845,8 @@ export class PactAgentRuntime {
       .then(async () => {
         try {
           await this.#executeAndPersist(record);
-        } catch {
-          // The safe durable failure/reconciliation projection is authoritative.
-          // API callers observe it through status rather than an unhandled task.
+        } catch (error) {
+          console.error("[PactAgent] Transaction execution failed:", error instanceof Error ? `${error.name}: ${error.message}` : String(error));
         }
       })
       .finally(() => {

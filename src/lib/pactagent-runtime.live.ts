@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { createNostrIdentity, type NostrPublicKey } from "../domain/nostr";
@@ -22,7 +23,7 @@ import {
   type CashuTestMintPort,
 } from "./cashu-test-mint";
 import { createLocalNostrSigner } from "./nostr-signer";
-import { WebSocketNostrRelayAdapter } from "./nostr-relay";
+import { WebSocketNostrRelayAdapter, type RelayWebSocketFactory } from "./nostr-relay";
 import { createLocalNostrEncrypter } from "./private-task-transport";
 import {
   createPactAgentRuntime,
@@ -234,6 +235,27 @@ export async function publishRuntimeBootstrapArtifacts(
   });
 }
 
+function resolveLocalCaPath(): string | undefined {
+  const caPath = process.env.PACTAGENT_LOCAL_CA_PATH;
+  if (!caPath) return undefined;
+  try {
+    if (existsSync(caPath)) {
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+      return caPath;
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+function createLocalTlsWebSocketFactory(): RelayWebSocketFactory {
+  return (url: string) =>
+    new WebSocket(url) as unknown as import("./nostr-relay").RelayWebSocket;
+}
+
+const localCaPath = resolveLocalCaPath();
+
 function wireDependencies(
   config: PactAgentLiveDemoConfig,
   decisionModel: RequesterDecisionModel,
@@ -242,6 +264,7 @@ function wireDependencies(
   const relay = new WebSocketNostrRelayAdapter(config.relayUrl, {
     connectTimeoutMs: 10_000,
     defaultTimeoutMs: 15_000,
+    ...(localCaPath ? { webSocketFactory: createLocalTlsWebSocketFactory() } : {}),
   });
 
   const identities: PactAgentParticipantIdentities = {

@@ -76,13 +76,31 @@ function buildSystemPrompt(): string {
   ].join(" ");
 }
 
-function buildUserMessage(request: DocumentSummaryRequest): string {
-  const parts: string[] = [];
+type UserContentPart =
+  | Readonly<{ type: "text"; text: string }>
+  | Readonly<{ type: "file"; file: Readonly<{ filename: string; file_data: string }> }>;
+
+function buildUserContent(request: DocumentSummaryRequest): UserContentPart[] {
+  const parts: UserContentPart[] = [];
   if (request.private_prompt) {
-    parts.push(`Private prompt: ${request.private_prompt}`, "");
+    parts.push({ type: "text", text: `Private prompt: ${request.private_prompt}\n` });
   }
-  parts.push("Document:", request.source_document);
-  return parts.join("\n");
+  if (request.input_media_type === "application/pdf") {
+    parts.push({
+      type: "file",
+      file: {
+        filename: "document.pdf",
+        file_data: `data:application/pdf;base64,${request.source_document}`,
+      },
+    });
+    parts.push({
+      type: "text",
+      text: "Summarize the attached PDF document concisely, preserving all materially significant commitments and numeric values.",
+    });
+  } else {
+    parts.push({ type: "text", text: `Document:\n${request.source_document}` });
+  }
+  return parts;
 }
 
 function extractSummaryText(envelope: unknown): string | undefined {
@@ -94,7 +112,15 @@ function extractSummaryText(envelope: unknown): string | undefined {
   const message = (choice as { message?: unknown }).message;
   if (typeof message !== "object" || message === null) return undefined;
   const content = (message as { content?: unknown }).content;
-  return typeof content === "string" ? content : undefined;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (typeof part === "object" && part !== null && typeof (part as { text?: unknown }).text === "string") {
+        return (part as { text: string }).text;
+      }
+    }
+  }
+  return undefined;
 }
 
 export function createOpenAIDocumentSummaryModel(
@@ -126,19 +152,24 @@ export function createOpenAIDocumentSummaryModel(
             model: modelName,
             messages: [
               { role: "system", content: buildSystemPrompt() },
-              { role: "user", content: buildUserMessage(request) },
+              { role: "user", content: buildUserContent(request) },
             ],
             max_tokens: 4096,
             temperature: 0.3,
           }),
           signal: context.signal,
         });
-      } catch {
+      } catch (fetchError) {
+        console.error("[PactAgent] Document summary model fetch failed:", fetchError instanceof Error ? `${fetchError.name}: ${fetchError.message}` : String(fetchError));
         throw new DocumentSummaryModelFailure(
           context.signal.aborted ? "timeout" : "unavailable",
         );
       }
-      if (!response.ok) throw new DocumentSummaryModelFailure("unavailable");
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        console.error(`[PactAgent] Document summary model API returned ${response.status}: ${errorText.slice(0, 500)}`);
+        throw new DocumentSummaryModelFailure("unavailable");
+      }
       const contentLength = Number(response.headers.get("content-length"));
       if (Number.isFinite(contentLength) && contentLength > maximumResponseBytes) {
         throw new DocumentSummaryModelFailure("unavailable");
@@ -149,9 +180,6 @@ export function createOpenAIDocumentSummaryModel(
       } catch {
         throw new DocumentSummaryModelFailure("unavailable");
       }
-      if (new TextEncoder().encode(text).byteLength > maximumResponseBytes) {
-        throw new DocumentSummaryModelFailure("unavailable");
-      }
       let envelope: unknown;
       try {
         envelope = JSON.parse(text);
@@ -160,6 +188,10 @@ export function createOpenAIDocumentSummaryModel(
       }
       const summary = extractSummaryText(envelope);
       if (summary === undefined || summary.trim().length === 0) {
+        console.error("[PactAgent] Document summary model response had no summary text. Response:", text.slice(0, 500));
+        throw new DocumentSummaryModelFailure("unavailable");
+      }
+      if (new TextEncoder().encode(summary).byteLength > maximumResponseBytes) {
         throw new DocumentSummaryModelFailure("unavailable");
       }
       const trimmed = summary.trim();

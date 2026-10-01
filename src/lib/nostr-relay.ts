@@ -268,6 +268,9 @@ export class WebSocketNostrRelayAdapter implements NostrRelayAdapter {
   }
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {
+    if (!this.socket || this.socket.readyState !== WEBSOCKET_OPEN) {
+      await this.connect(options?.signal);
+    }
     this.ensureConnected();
     if (containsPrivateKey(event as object)) {
       throw new NostrRelayError({
@@ -370,6 +373,9 @@ export class WebSocketNostrRelayAdapter implements NostrRelayAdapter {
     filter: NostrFilter,
     options?: NostrRelayQueryOptions,
   ): Promise<SignedNostrEvent[]> {
+    if (!this.socket || this.socket.readyState !== WEBSOCKET_OPEN) {
+      await this.connect(options?.signal);
+    }
     this.ensureConnected();
     const socket = this.socket as RelayWebSocket;
     const timeoutMs = options?.timeoutMs ?? this.defaultTimeoutMs;
