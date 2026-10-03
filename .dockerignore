@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.local
+.env
+.env.*
+!.env.example
+docs
+e2e
+e2e-live
+*.md
+railway-plan.json
