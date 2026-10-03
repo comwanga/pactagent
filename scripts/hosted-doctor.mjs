@@ -89,28 +89,30 @@ function relayQueryP002(relayUrl, providerPublicKey) {
         limit: 10,
       }]));
     });
+    const handleEvent = (value) => {
+      try {
+        const event = parseSignedNostrEvent(value[2]);
+        verifySignedNostrEvent(event);
+        if (event.pubkey !== providerPublicKey) throw new Error("provider identity mismatch");
+        if (event.kind === 30360) {
+          parsePontmoreAgentDefinitionEvent(event);
+          found.providers++;
+        } else if (event.kind === 30400) {
+          parsePactServiceOfferEvent(event);
+          found.offers++;
+        } else if (event.kind === 30361) {
+          parseCashuEscrowDescriptorEvent(event);
+          found.descriptors++;
+        }
+      } catch {
+        found.malformed++;
+      }
+    };
+    const messageHandlers = new Map([["EVENT", handleEvent]]);
     socket.addEventListener("message", (message) => {
       try {
         const value = JSON.parse(String(message.data));
-        if (value[0] === "EVENT") {
-          try {
-            const event = parseSignedNostrEvent(value[2]);
-            verifySignedNostrEvent(event);
-            if (event.pubkey !== providerPublicKey) throw new Error("provider identity mismatch");
-            if (event.kind === 30360) {
-              parsePontmoreAgentDefinitionEvent(event);
-              found.providers++;
-            } else if (event.kind === 30400) {
-              parsePactServiceOfferEvent(event);
-              found.offers++;
-            } else if (event.kind === 30361) {
-              parseCashuEscrowDescriptorEvent(event);
-              found.descriptors++;
-            }
-          } catch {
-            found.malformed++;
-          }
-        }
+        messageHandlers.get(value[0])?.(value);
         if (value[0] === "EOSE" && value[1] === subscription) {
           clearTimeout(timer);
           socket.close();
