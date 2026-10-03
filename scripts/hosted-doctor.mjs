@@ -36,18 +36,12 @@ function inspectContainer(name) {
   }
 }
 
-function relayRead(relayUrl, verifyTls = true) {
+function relayRead(relayUrl) {
   return new Promise((resolvePromise) => {
     const subscription = `hosted-doctor-${Date.now()}`;
-    const previousTlsReject = verifyTls ? undefined : process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    if (!verifyTls && previousTlsReject === undefined) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-    }
     const socket = new WebSocket(relayUrl);
     const timer = setTimeout(() => {
       socket.close();
-      if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
       resolvePromise(false);
     }, 8_000);
     socket.addEventListener("open", () => {
@@ -59,22 +53,16 @@ function relayRead(relayUrl, verifyTls = true) {
         if (value[0] === "EOSE" && value[1] === subscription) {
           clearTimeout(timer);
           socket.close();
-          if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-          else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
           resolvePromise(true);
         }
       } catch {
         clearTimeout(timer);
         socket.close();
-        if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-        else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
         resolvePromise(false);
       }
     });
     socket.addEventListener("error", () => {
       clearTimeout(timer);
-      if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
       resolvePromise(false);
     });
   });
@@ -84,18 +72,12 @@ function relayRead(relayUrl, verifyTls = true) {
  * F38-06F: Read-only P002 artifact verification through the relay.
  * Queries the relay for the configured provider's P002 artifacts.
  */
-function relayQueryP002(relayUrl, providerPublicKey, verifyTls = true) {
+function relayQueryP002(relayUrl, providerPublicKey) {
   return new Promise((resolvePromise) => {
     const subscription = `hosted-doctor-p002-${Date.now()}`;
-    const previousTlsReject = verifyTls ? undefined : process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    if (!verifyTls && previousTlsReject === undefined) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-    }
     const socket = new WebSocket(relayUrl);
     const timer = setTimeout(() => {
       socket.close();
-      if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
       resolvePromise({ ok: false, reason: "timeout" });
     }, 10_000);
     const found = { providers: 0, offers: 0, descriptors: 0, malformed: 0 };
@@ -132,8 +114,6 @@ function relayQueryP002(relayUrl, providerPublicKey, verifyTls = true) {
         if (value[0] === "EOSE" && value[1] === subscription) {
           clearTimeout(timer);
           socket.close();
-          if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-          else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
           resolvePromise({
             ok: found.providers > 0 && found.offers > 0 && found.descriptors > 0 && found.malformed === 0,
             providers: found.providers,
@@ -146,15 +126,11 @@ function relayQueryP002(relayUrl, providerPublicKey, verifyTls = true) {
       } catch {
         clearTimeout(timer);
         socket.close();
-        if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-        else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
         resolvePromise({ ok: false, reason: "parse error" });
       }
     });
     socket.addEventListener("error", () => {
       clearTimeout(timer);
-      if (!verifyTls && previousTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      else if (!verifyTls) process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsReject;
       resolvePromise({ ok: false, reason: "connection error" });
     });
   });
@@ -205,7 +181,6 @@ function add(checks, ok, label, detail) {
 export async function runHostedDoctor(options = {}) {
   const environment = options.environment ?? loadLocalEnvironment();
   const checks = [];
-  const isAcceptanceMode = environment.PACTAGENT_HOSTED_ACCEPTANCE === "true";
 
   // F38-06A: Provider mode parsed as closed set
   const providerModeRaw = environment.PACTAGENT_PROVIDER_MODE?.trim();
@@ -322,11 +297,7 @@ export async function runHostedDoctor(options = {}) {
   // 11. WSS handshake through the intended hosted edge
   let nostrReadable = false;
   if (tlsPort && relayUrl) {
-    if (isAcceptanceMode) {
-      nostrReadable = await relayRead(relayUrl, false);
-    } else {
-      nostrReadable = await relayRead(relayUrl, true);
-    }
+    nostrReadable = await relayRead(relayUrl);
   }
   add(checks, nostrReadable, "Nostr relay WSS handshake", nostrReadable ? "WSS handshake and REQ/EOSE succeeded" : "WSS read failed");
 
@@ -360,7 +331,7 @@ export async function runHostedDoctor(options = {}) {
 
   // 13. F38-06F: Doctor must verify P002 artifacts through relay (read-only)
   if (nostrReadable && providerPublicKey) {
-    const p002Result = await relayQueryP002(relayUrl, providerPublicKey, !isAcceptanceMode);
+    const p002Result = await relayQueryP002(relayUrl, providerPublicKey);
     add(checks, p002Result.ok === true, "provider P002 artifacts through relay",
       p002Result.ok ? `validated (providers=${p002Result.providers}, offers=${p002Result.offers}, descriptors=${p002Result.descriptors})`
       : `FAIL: ${p002Result.reason || "missing artifacts"}`);

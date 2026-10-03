@@ -28,8 +28,6 @@ import type { RequesterPolicy } from "../domain/pact-agents";
 import type { RequesterDecisionModel, RequesterDecisionBounds } from "./requester-decision";
 import type { SignedNostrEvent } from "../domain/nostr";
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
 const RELAY_URL = process.env.PACTAGENT_HOSTED_PROTOCOL_URL ?? "wss://localhost:8443";
 
 function createTestStore() {

@@ -5,8 +5,6 @@ import { describe, expect, it } from "vitest";
 import type { NostrPublicKey } from "../domain/nostr";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
 const RELAY_URL = process.env.PACTAGENT_HOSTED_PROTOCOL_URL ?? "wss://localhost:8443";
 const RUNTIME_API_BASE = process.env.PACTAGENT_RUNTIME_API_BASE ?? "http://localhost:3000";
 const UI_ORIGIN = process.env.PACTAGENT_REQUESTER_UI_ORIGIN ?? "http://localhost:3000";

@@ -1,8 +1,9 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import WebSocket from "ws";
 
 import { LOCAL_ROOT, loadLocalEnvironment } from "./local-env.mjs";
 import { nextBinary, runChecked, runCommand, waitFor } from "./local-process.mjs";
@@ -25,7 +26,12 @@ import { nextBinary, runChecked, runCommand, waitFor } from "./local-process.mjs
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..");
 const ACCEPTANCE_STATE = resolve(LOCAL_ROOT, "hosted-acceptance");
+const ACCEPTANCE_CA_PATH = resolve(ACCEPTANCE_STATE, "caddy-root.crt");
 const HOSTED_COMPOSE_FILE = resolve(PROJECT_ROOT, "compose.hosted.yml");
+
+function openAcceptanceWebSocket(url) {
+  return new WebSocket(url, { ca: readFileSync(ACCEPTANCE_CA_PATH) });
+}
 
 /*
  * F38-02C: Deterministic relay isolation.
@@ -94,11 +100,20 @@ async function ensureInfrastructure(environment, runId, composeEnv) {
     "60",
   ], { env: environment });
 
+  await runChecked("docker", [
+    "cp",
+    "pactagent-hosted-caddy:/data/caddy/pki/authorities/local/root.crt",
+    ACCEPTANCE_CA_PATH,
+  ], { env: composeEnv });
+  if (statSync(ACCEPTANCE_CA_PATH).size === 0) {
+    throw new Error("Hosted acceptance Caddy root CA export is empty");
+  }
+
   // Wait for Caddy WSS to be ready
   const wssUrl = environment.PACTAGENT_HOSTED_PROTOCOL_URL || "wss://localhost:8443";
   await waitFor(async () => {
     try {
-      const socket = new WebSocket(wssUrl);
+      const socket = openAcceptanceWebSocket(wssUrl);
       return new Promise((resolvePromise) => {
         const timer = setTimeout(() => { socket.close(); resolvePromise(false); }, 3_000);
         socket.addEventListener("open", () => { clearTimeout(timer); socket.close(); resolvePromise(true); });
@@ -107,7 +122,7 @@ async function ensureInfrastructure(environment, runId, composeEnv) {
     } catch { return false; }
   }, { timeoutMs: 30_000, intervalMs: 1_000 });
 
-  console.log(`PASS: Caddy WSS relay is ready at ${wssUrl}`);
+  console.log("PASS: Caddy WSS relay is ready");
 }
 
 async function startProviderService(environment) {
@@ -252,12 +267,9 @@ async function relayPersistenceProof(environment, composeEnv) {
   }, sk);
 
   const wssUrl = environment.PACTAGENT_HOSTED_PROTOCOL_URL || "wss://localhost:8443";
-  const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
   // Publish + query before restart
   await new Promise((resolvePromise, rejectPromise) => {
-    const socket = new WebSocket(wssUrl);
+    const socket = openAcceptanceWebSocket(wssUrl);
     socket.addEventListener("open", () => {
       socket.send(JSON.stringify(["EVENT", event]));
     });
@@ -276,7 +288,7 @@ async function relayPersistenceProof(environment, composeEnv) {
 
   // 2. Query successfully before restart
   const foundBefore = await new Promise((resolvePromise) => {
-    const socket = new WebSocket(wssUrl);
+    const socket = openAcceptanceWebSocket(wssUrl);
     const sub = `persistence-query-before-${Date.now()}`;
     let found = false;
     socket.addEventListener("open", () => {
@@ -297,8 +309,6 @@ async function relayPersistenceProof(environment, composeEnv) {
   });
 
   if (!foundBefore) {
-    if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls;
     throw new Error("F38-02E: Event not found before restart");
   }
   console.log(`PASS: Event ${event.id} found before restart`);
@@ -317,7 +327,7 @@ async function relayPersistenceProof(environment, composeEnv) {
   // Wait for WSS readiness
   await waitFor(async () => {
     try {
-      const socket = new WebSocket(wssUrl);
+      const socket = openAcceptanceWebSocket(wssUrl);
       return new Promise((resolvePromise) => {
         const timer = setTimeout(() => { socket.close(); resolvePromise(false); }, 3_000);
         socket.addEventListener("open", () => { clearTimeout(timer); socket.close(); resolvePromise(true); });
@@ -328,7 +338,7 @@ async function relayPersistenceProof(environment, composeEnv) {
 
   // 5. Query the EXACT SAME event ID after restart
   const foundAfter = await new Promise((resolvePromise) => {
-    const socket = new WebSocket(wssUrl);
+    const socket = openAcceptanceWebSocket(wssUrl);
     const sub = `persistence-query-after-${Date.now()}`;
     let found = false;
     socket.addEventListener("open", () => {
@@ -347,9 +357,6 @@ async function relayPersistenceProof(environment, composeEnv) {
     socket.addEventListener("error", () => resolvePromise(false));
     setTimeout(() => { socket.close(); resolvePromise(false); }, 5_000);
   });
-
-  if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls;
 
   if (!foundAfter) {
     throw new Error(`F38-02E: Event ${event.id} NOT found after restart — persistence failed`);
@@ -421,9 +428,9 @@ async function main() {
     PACTAGENT_RUNTIME_API_BASE: `http://localhost:${runtimePort}`,
     PACTAGENT_REQUESTER_UI_ORIGIN: `http://localhost:${runtimePort}`,
     PACTAGENT_PROVIDER_READINESS_URL: `http://127.0.0.1:${providerReadinessPort}/ready`,
+    PACTAGENT_LOCAL_CA_PATH: ACCEPTANCE_CA_PATH,
+    NODE_EXTRA_CA_CERTS: ACCEPTANCE_CA_PATH,
     PORT: String(runtimePort),
-    // Explicitly limited to this self-signed local acceptance harness.
-    NODE_TLS_REJECT_UNAUTHORIZED: "0",
   };
 
   // The requester/runtime process receives provider PUBLIC identity only.
@@ -450,8 +457,6 @@ async function main() {
     COMPOSE_PROJECT_NAME: `pactagent-hosted-${runId}`,
   };
 
-  const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   let providerChild, nextChild;
   try {
     await ensureInfrastructure(runtimeEnvironment, runId, composeEnv);
@@ -475,8 +480,6 @@ async function main() {
     await stopChild(nextChild);
     await stopChild(providerChild);
     await cleanupInfrastructure(composeEnv, runtimeEnvironment);
-    if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls;
   }
 }
 

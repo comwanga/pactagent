@@ -114,7 +114,7 @@ function startReadinessServer() {
     }
   });
   readinessServer.listen(readinessPort, readinessHost, () => {
-    console.log(`Provider readiness endpoint listening on http://${readinessHost}:${readinessPort}`);
+    console.log("Provider readiness endpoint is listening");
   });
 }
 
@@ -136,7 +136,7 @@ try {
   console.log("PactAgent Provider Service started");
   console.log(`Provider public key: ${service.providerPublicKey}`);
   console.log(`Provider readiness: http://${readinessHost}:${readinessPort}/ready`);
-} catch (error) {
-  console.error(`Failed to start provider service: ${error.message}`);
+} catch {
+  console.error("Failed to start provider service");
   process.exit(1);
 }

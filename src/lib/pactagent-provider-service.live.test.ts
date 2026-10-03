@@ -13,8 +13,6 @@ import { createPactAgentProviderService } from "./pactagent-provider-service";
 import { createSqliteProviderIdempotencyStore } from "./provider-idempotency-store";
 import { readProviderServiceConfig } from "./provider-service-config";
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
 const RELAY_URL = process.env.PACTAGENT_HOSTED_PROTOCOL_URL ?? "wss://localhost:8443";
 
 function createTestStore() {
