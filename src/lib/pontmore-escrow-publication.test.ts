@@ -61,6 +61,8 @@ class MemoryNostrRelay implements NostrRelayAdapter {
 
   async connect(): Promise<void> {}
 
+  async reconnect(): Promise<void> {}
+
   async disconnect(): Promise<void> {}
 
   async publish(
@@ -175,6 +177,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const relay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {},
       async queryEvents() {
@@ -193,6 +196,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const relay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {},
       async queryEvents() {
@@ -243,6 +247,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const relay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {},
       async queryEvents() {
@@ -278,6 +283,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const mismatchRelay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {},
       async queryEvents() {
@@ -291,6 +297,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const failingRelay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {
         throw Object.assign(new Error("synthetic private transport detail"), { code: "rejected" });
@@ -310,6 +317,7 @@ describe("PIP-01 Cashu descriptor signing and relay flow", () => {
     const retrievalFailureRelay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {
         throw Object.assign(new Error("synthetic transport detail"), { code: "publish_timeout" });

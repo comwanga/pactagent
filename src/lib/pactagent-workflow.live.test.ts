@@ -28,21 +28,24 @@ describe("PactAgent live workflow demonstration", () => {
   it("redacts a malformed live funding token from the reported error", async () => {
     const tokenMarker = "cashuA-PRIVATE-TOKEN-MARKER";
     const config: PactAgentLiveDemoConfig = {
+      economicMode: "live",
       relayUrl: "wss://relay.example",
-      testMintUrl: "https://testmint.example/cashu",
       requesterPrivateKeyHex: "01".repeat(32),
       providerPrivateKeyHex: "02".repeat(32),
       escrowAuthorityPrivateKeyHex: "03".repeat(32),
-      normalSpendKeyHex: "04".repeat(32),
-      refundSpendKeyHex: "05".repeat(32),
-      fundingToken: tokenMarker,
-      fundingReference: "funding-reference-live-test",
-      stateDirectory: ".test-live-state",
+      economicConfig: {
+        mintUrl: "https://testmint.example/cashu",
+        stateDirectory: ".test-live-state",
+        normalSpendKeyHex: "04".repeat(32),
+        refundSpendKeyHex: "05".repeat(32),
+        fundingToken: tokenMarker,
+        fundingReference: "funding-reference-live-test",
+      },
     };
     const cashu = {
       async inspectCapabilities() {
         return {
-          mintUrl: config.testMintUrl,
+          mintUrl: config.economicConfig.mintUrl,
           unit: "sat" as const,
           nuts: {
             nut07ProofState: true,

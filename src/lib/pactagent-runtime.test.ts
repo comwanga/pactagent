@@ -119,6 +119,9 @@ class MemoryRelay implements NostrRelayAdapter {
   async connect(): Promise<void> {
     this.connectCalls += 1;
   }
+  async reconnect(): Promise<void> {
+    this.connectCalls += 1;
+  }
   async disconnect(): Promise<void> {
     this.disconnectCalls += 1;
   }
@@ -382,6 +385,7 @@ function buildRuntime(
     references: fixture.references,
     selectedReferences: fixture.selectedReferences,
     requesterDecisionSource: options.requesterDecisionSource ?? "deterministic",
+    economicMode: "demo",
     resolveFunding: async (reference) => {
       if (reference !== "funding-reference-0001") throw new Error("Unknown funding reference");
       return privateFunding();
@@ -442,16 +446,19 @@ describe("PactAgent runtime", () => {
   it("publishes requester, provider, offer, and escrow bootstrap artifacts to an empty relay", async () => {
     const relay = new MemoryRelay();
     const config: PactAgentLiveDemoConfig = {
+      economicMode: "live",
       relayUrl: relay.url,
-      testMintUrl: MINT_URL,
       requesterPrivateKeyHex: hex(key(31)),
       providerPrivateKeyHex: hex(key(32)),
       escrowAuthorityPrivateKeyHex: hex(key(33)),
-      normalSpendKeyHex: hex(key(21)),
-      refundSpendKeyHex: hex(key(22)),
-      fundingToken: "cashuA_not-used-by-bootstrap-artifact-test",
-      fundingReference: "funding-reference-bootstrap-test",
-      stateDirectory: ".not-used",
+      economicConfig: {
+        mintUrl: MINT_URL,
+        stateDirectory: ".not-used",
+        normalSpendKeyHex: hex(key(21)),
+        refundSpendKeyHex: hex(key(22)),
+        fundingToken: "cashuA_not-used-by-bootstrap-artifact-test",
+        fundingReference: "funding-reference-bootstrap-test",
+      },
     };
     const published = await publishRuntimeBootstrapArtifacts(config, relay, ROOT_TIME);
     expect(relay.events).toHaveLength(4);
@@ -491,6 +498,7 @@ describe("PactAgent runtime", () => {
       refundSpendKey: fixture.refundSpendKey,
     };
     const environment = {
+      PACTAGENT_ECONOMIC_MODE: "live",
       PACTAGENT_LIVE_RELAY_URL: relay.url,
       PACTAGENT_CASHU_TEST_MINT_URL: MINT_URL,
       PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY: hex(key(31)),
@@ -501,6 +509,7 @@ describe("PactAgent runtime", () => {
       PACTAGENT_LIVE_FUNDING_TOKEN: "PRIVATE-LIVE-FUNDING-TOKEN",
       PACTAGENT_LIVE_FUNDING_REFERENCE: "funding-reference-live-failure",
       PACTAGENT_LIVE_STATE_DIRECTORY: ".unused-live-failure-state",
+      PACTAGENT_RUNTIME_MODE: "local",
     } as const;
     const previous = Object.fromEntries(
       Object.keys(environment).map((name) => [name, process.env[name]]),
@@ -509,10 +518,34 @@ describe("PactAgent runtime", () => {
     let closeCalls = 0;
     let caught: unknown;
     try {
-      await createPactAgentRuntimeFromEnv(() => ({
+      await createPactAgentRuntimeFromEnv(async () => ({
         relay,
-        cashu,
-        privateStore: shared.privateStore,
+        economicEnvironment: {
+          mode: "live" as const,
+          mintUrl: fixture.mintUrl,
+          unit: "sat" as const,
+          cashu,
+          privateDelivery: new FakePrivateDelivery(),
+          privateStore: shared.privateStore,
+          settlementStore: shared.settlementStore,
+          normalSpendKey: fixture.normalSpendKey,
+          refundSpendKey: fixture.refundSpendKey,
+          resolveFunding: async () => privateFunding(),
+          collectWalletOutputs: async () => {},
+          close: () => {
+            closeCalls += 1;
+          },
+          async inspectCapabilities() {
+            return {
+              mode: "live" as const,
+              unit: "sat" as const,
+              mintAvailable: false,
+              fundingAvailable: false,
+              walletReady: false,
+              demoResetAvailable: false,
+            };
+          },
+        },
         identities: fixture.identities,
         dependencies,
         close: () => {

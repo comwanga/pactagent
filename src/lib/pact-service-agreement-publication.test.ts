@@ -105,6 +105,8 @@ class MemoryRelay implements NostrRelayAdapter {
 
   async connect(): Promise<void> {}
 
+  async reconnect(): Promise<void> {}
+
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent): Promise<void> {
@@ -631,6 +633,7 @@ describe("PactAgent agreement signer and relay integration", () => {
     const failingRelay: NostrRelayAdapter = {
       url: "wss://relay.example",
       async connect() {},
+      async reconnect() {},
       async disconnect() {},
       async publish() {
         throw new Error("PRIVATE-CREDENTIAL");

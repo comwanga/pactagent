@@ -46,6 +46,8 @@ class MemoryNostrRelay implements NostrRelayAdapter {
 
   async connect(): Promise<void> {}
 
+  async reconnect(): Promise<void> {}
+
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {
@@ -218,6 +220,7 @@ describe("PIP-00 agent definition publication", () => {
       const timeoutRelay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {
           throw Object.assign(new Error("timeout"), { code: "publish_timeout" });
@@ -237,6 +240,7 @@ describe("PIP-00 agent definition publication", () => {
       const failRelay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {
           throw Object.assign(new Error("rejected"), { code: "publish_rejected" });
@@ -333,6 +337,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -350,6 +355,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -368,6 +374,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -449,6 +456,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -465,6 +473,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -624,6 +633,7 @@ describe("PIP-00 agent definition publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -671,6 +681,7 @@ describe("PIP-00 agent definition publication", () => {
       const poisonedRelay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {

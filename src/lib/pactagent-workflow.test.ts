@@ -114,6 +114,7 @@ class MemoryRelay implements NostrRelayAdapter {
   readonly events: SignedNostrEvent[] = [];
 
   async connect(): Promise<void> {}
+  async reconnect(): Promise<void> {}
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent): Promise<void> {

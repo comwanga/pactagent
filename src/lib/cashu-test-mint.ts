@@ -103,6 +103,12 @@ export interface CashuTestMintConfiguration {
   readonly maximumExposureSats: Sats;
   readonly requestTimeoutMs?: number;
   readonly maximumResponseBytes?: number;
+  /**
+   * Transport policy for the mint URL. Defaults to `"live-https"` (HTTPS
+   * mandatory). Demo composition passes `"demo-loopback"` to permit HTTP only
+   * for explicit loopback endpoints. See {@link CashuMintTransportPolicy}.
+   */
+  readonly transportPolicy?: CashuMintTransportPolicy;
 }
 
 export interface NormalizedCashuTestMintConfiguration {
@@ -111,6 +117,7 @@ export interface NormalizedCashuTestMintConfiguration {
   readonly maximumExposureSats: Sats;
   readonly requestTimeoutMs: number;
   readonly maximumResponseBytes: number;
+  readonly transportPolicy: CashuMintTransportPolicy;
 }
 
 function positiveBoundedInteger(value: number, label: string): number {
@@ -120,7 +127,34 @@ function positiveBoundedInteger(value: number, label: string): number {
   return value;
 }
 
-export function normalizeCashuTestMintUrl(value: string): string {
+/**
+ * Economic transport policy for a Cashu mint URL (Issue #36, Blocker 2).
+ *
+ * `"live-https"` — the strict production policy. HTTPS is mandatory. This is
+ * the default and is never weakened. Live economic composition always uses
+ * this policy.
+ *
+ * `"demo-loopback"` — the demo policy. HTTPS is accepted, and HTTP is accepted
+ * ONLY for explicit local development loopback endpoints (`127.0.0.1`,
+ * `localhost`, `::1`). Arbitrary remote HTTP (public hosts, LAN IPs, example
+ * domains) is rejected even in demo mode. If future container/hosting
+ * networking requires non-loopback HTTP on a private network, the transport
+ * policy must be revisited explicitly at the hosting boundary where the
+ * TLS/topology is known; it must not be broadened silently here.
+ */
+export type CashuMintTransportPolicy = "live-https" | "demo-loopback";
+
+const DEMO_LOOPBACK_HOSTS = Object.freeze(new Set(["127.0.0.1", "localhost", "[::1]"]));
+
+function transportPolicyAllows(url: URL, policy: CashuMintTransportPolicy): boolean {
+  if (policy === "live-https") return url.protocol === "https:";
+  return (
+    url.protocol === "https:" ||
+    (url.protocol === "http:" && DEMO_LOOPBACK_HOSTS.has(url.hostname))
+  );
+}
+
+export function canonicalizeCashuMintUrl(value: string): string {
   let url: URL;
   try {
     url = new URL(value);
@@ -128,7 +162,6 @@ export function normalizeCashuTestMintUrl(value: string): string {
     cashuError("invalid_mint_configuration", "Cashu test mint URL is invalid");
   }
   if (
-    url.protocol !== "https:" ||
     url.username !== "" ||
     url.password !== "" ||
     url.search !== "" ||
@@ -137,11 +170,48 @@ export function normalizeCashuTestMintUrl(value: string): string {
   ) {
     cashuError(
       "invalid_mint_configuration",
-      "Cashu test mint URL must be an HTTPS URL without credentials, query, or fragment",
+      "Cashu test mint URL must not carry credentials, query, or fragment",
     );
   }
   url.pathname = url.pathname.replace(/\/+$/, "") || "/";
   return url.toString().replace(/\/$/, "");
+}
+
+export function normalizeCashuMintUrl(value: string, policy: CashuMintTransportPolicy): string {
+  const canonical = canonicalizeCashuMintUrl(value);
+  let url: URL;
+  try {
+    url = new URL(canonical);
+  } catch {
+    cashuError("invalid_mint_configuration", "Cashu test mint URL is invalid");
+  }
+  if (policy === "live-https") {
+    if (!transportPolicyAllows(url, policy)) {
+      cashuError(
+        "invalid_mint_configuration",
+        "Cashu test mint URL must be an HTTPS URL for live economic mode",
+      );
+    }
+    return canonical;
+  }
+  // demo-loopback: HTTPS always accepted; HTTP only for explicit loopback hosts.
+  if (transportPolicyAllows(url, policy)) {
+    return canonical;
+  }
+  cashuError(
+    "invalid_mint_configuration",
+    "Demo Cashu mint URL must be HTTPS, or HTTP only for loopback (127.0.0.1, localhost, ::1)",
+  );
+}
+
+/**
+ * Strict HTTPS-only mint URL normalizer. Equivalent to
+ * `normalizeCashuMintUrl(value, "live-https")`. Retained as the canonical live
+ * policy enforcement point used by live composition, the settlement
+ * coordinator, and tests that assert the strict HTTPS requirement.
+ */
+export function normalizeCashuTestMintUrl(value: string): string {
+  return normalizeCashuMintUrl(value, "live-https");
 }
 
 export function normalizeCashuTestMintConfiguration(
@@ -164,8 +234,9 @@ export function normalizeCashuTestMintConfiguration(
   if (input.maximumExposureSats < 1n) {
     cashuError("invalid_mint_configuration", "Cashu test mint exposure cap must be positive");
   }
+  const transportPolicy: CashuMintTransportPolicy = input.transportPolicy ?? "live-https";
   return Object.freeze({
-    testMintUrl: normalizeCashuTestMintUrl(input.testMintUrl),
+    testMintUrl: normalizeCashuMintUrl(input.testMintUrl, transportPolicy),
     unit: CASHU_TEST_MINT_UNIT,
     maximumExposureSats: input.maximumExposureSats,
     requestTimeoutMs: positiveBoundedInteger(
@@ -176,6 +247,7 @@ export function normalizeCashuTestMintConfiguration(
       input.maximumResponseBytes ?? CASHU_TEST_MINT_DEFAULT_MAX_RESPONSE_BYTES,
       "Cashu maximum response size",
     ),
+    transportPolicy,
   });
 }
 
@@ -343,7 +415,7 @@ export function createPrivateCashuFunding(input: {
   const funding = new PrivateCashuFunding();
   privateFundingMaterial.set(funding, {
     fingerprint: fingerprintPrivateProofs(proofs),
-    mintUrl: normalizeCashuTestMintUrl(input.mintUrl),
+    mintUrl: canonicalizeCashuMintUrl(input.mintUrl),
     unit: CASHU_TEST_MINT_UNIT,
     proofs,
   });
@@ -362,7 +434,7 @@ export function createPrivateCashuProofImport(input: {
   const imported = new PrivateCashuProofImport();
   privateProofImportMaterial.set(imported, {
     fingerprint: fingerprintPrivateProofs(proofs),
-    mintUrl: normalizeCashuTestMintUrl(input.mintUrl),
+    mintUrl: canonicalizeCashuMintUrl(input.mintUrl),
     unit: CASHU_TEST_MINT_UNIT,
     proofs,
   });
@@ -1064,6 +1136,32 @@ function serializePrivateValueRecord(value: PrivateValueRecord): Readonly<Record
   });
 }
 
+/**
+ * Read the private value record (proofs, amount, consumed status) backing a
+ * {@link CashuPrivateHandle} from the private store. This is the read-only
+ * boundary used by the Demo Wallet to aggregate unspent value across multiple
+ * wallet-owned handles (Issue #37).
+ *
+ * Returns `undefined` if no record exists for the handle.
+ */
+export async function readCashuPrivateValueProofs(
+  store: CashuPrivateStore,
+  mintUrl: string,
+  handle: CashuPrivateHandle,
+): Promise<
+  | { readonly proofs: readonly Proof[]; readonly amountSats: bigint; readonly consumed: boolean }
+  | undefined
+> {
+  const raw = await store.read(mintUrl, `value:${handle.reference}`);
+  if (raw === undefined) return undefined;
+  const record = parsePrivateValueRecord(raw);
+  return Object.freeze({
+    proofs: record.proofs,
+    amountSats: record.amountSats,
+    consumed: record.consumedByOperationId !== undefined,
+  });
+}
+
 function parsePreparedSwap(value: unknown): CashuPrivatePreparedSwap | undefined {
   if (value === undefined) return undefined;
   if (
@@ -1137,7 +1235,7 @@ function parseSucceededOperation(value: unknown): CashuOperationSucceeded | unde
       ? {}
       : { changeHandle: safeHandle((value.changeHandle as Record<string, string>).reference) }),
     facts: Object.freeze({
-      mintUrl: normalizeCashuTestMintUrl(facts.mintUrl as string),
+      mintUrl: canonicalizeCashuMintUrl(facts.mintUrl as string),
       unit: CASHU_TEST_MINT_UNIT,
       amountSats: safeSats(amountToBigInt(facts.amountSats as string)),
       inputAmountSats: safeSats(amountToBigInt(facts.inputAmountSats as string)),
@@ -1555,7 +1653,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       if (error instanceof CashuPrivateBackendError) throw mapBackendError(error);
       cashuError("mint_unavailable", "Cashu test mint capability inspection failed");
     }
-    if (normalizeCashuTestMintUrl(snapshot.mintUrl) !== this.configuration.testMintUrl) {
+    if (normalizeCashuMintUrl(snapshot.mintUrl, this.configuration.transportPolicy) !== this.configuration.testMintUrl) {
       cashuError(
         "invalid_mint_configuration",
         "Cashu capability response does not match the configured test mint",
@@ -2468,13 +2566,17 @@ async function readBoundedResponse(response: Response, limit: number): Promise<s
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-function endpointBelongsToMint(endpoint: string, mintUrl: string): boolean {
+function endpointBelongsToMint(
+  endpoint: string,
+  mintUrl: string,
+  policy: CashuMintTransportPolicy,
+): boolean {
   try {
     const endpointUrl = new URL(endpoint);
     const configured = new URL(mintUrl);
     const basePath = configured.pathname.replace(/\/$/, "");
     return (
-      endpointUrl.protocol === "https:" &&
+      transportPolicyAllows(endpointUrl, policy) &&
       endpointUrl.origin === configured.origin &&
       (basePath === "" ||
         endpointUrl.pathname === basePath ||
@@ -2513,7 +2615,7 @@ function createBoundedCashuRequest(
   configuration: NormalizedCashuTestMintConfiguration,
 ): RequestFn {
   return async <T>(options: RequestOptions): Promise<T> => {
-    if (!endpointBelongsToMint(options.endpoint, configuration.testMintUrl)) {
+    if (!endpointBelongsToMint(options.endpoint, configuration.testMintUrl, configuration.transportPolicy)) {
       throw new BoundedCashuRequestError("rejected");
     }
     const controller = new AbortController();
@@ -2834,4 +2936,35 @@ export function createCashuTestMintAdapter(input: {
     new CashuTsMintBackend(configuration),
     input.privateStore,
   );
+}
+
+/**
+ * Create a cashu-ts `Wallet` whose every HTTP request is bound to the
+ * PactAgent transport boundary.
+ *
+ * The returned Wallet is constructed from a `Mint` that carries the same
+ * {@link createBoundedCashuRequest} request implementation used by the
+ * PactAgent Cashu adapter: it validates every request endpoint against the
+ * configured mint origin/path, enforces the selected
+ * {@link CashuMintTransportPolicy}, and rejects redirects
+ * (`redirect: "error"`). No request can follow a cross-origin redirect to a
+ * different host or port.
+ *
+ * Demo funding bootstrap and restoration MUST use this factory rather than
+ * constructing `new Wallet(url, ...)` directly, which would bypass the
+ * transport boundary and follow cross-origin redirects (Issue #36).
+ *
+ * The caller is still responsible for calling `wallet.loadMint()` before
+ * other wallet operations, exactly as with a directly constructed Wallet.
+ */
+export function createBoundedCashuWallet(configuration: CashuTestMintConfiguration): Wallet {
+  const normalized = normalizeCashuTestMintConfiguration(configuration);
+  const mint = new Mint(normalized.testMintUrl, {
+    customRequest: createBoundedCashuRequest(normalized),
+    logger: REDACTING_CASHU_LOGGER,
+  });
+  return new Wallet(mint, {
+    unit: normalized.unit,
+    logger: REDACTING_CASHU_LOGGER,
+  });
 }

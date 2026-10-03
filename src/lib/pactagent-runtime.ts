@@ -22,6 +22,7 @@ import {
 import {
   createPactAgentWorkflow,
   PactAgentWorkflowError,
+  type PactAgentWorkflowErrorCode,
   type PactAgentParticipantIdentities,
   type PactAgentWorkflowDependencies,
   type PactAgentWorkflowReport,
@@ -29,13 +30,22 @@ import {
   type PactAgentWorkflowResumePhase,
   type PactAgentWorkflowResumeState,
 } from "./pactagent-workflow";
+import {
+  EconomicEnvironmentError,
+  parseEconomicMode,
+  type DemoTransactionTerminalOutcome,
+  type DemoWalletStatus,
+  type EconomicMode,
+} from "./economic-environment";
 import type { PactCashuEscrowOperationalState } from "./cashu-escrow-settlement";
 import { type CashuPrivateStore, type PrivateCashuFunding } from "./cashu-test-mint";
 import { type ApprovedRequesterDecision } from "./requester-decision";
 import { type SelectedProviderReferences } from "./provider-discovery";
 import { retrieveAndOpenPrivateResult } from "./private-task-transport";
+import type { NostrRelayAdapter } from "./nostr-relay";
 import {
   PactAgreementPublicationError,
+  buildContextFromRelay,
   retrieveAndReconstructPactAgreement,
   retrievePactAgreementTransitions,
   retrievePactServiceAgreementRoot,
@@ -81,10 +91,42 @@ export interface PactAgentRuntimeConfig {
   readonly references: PactAgreementReferences;
   /** Deterministic provider selection used to rebuild the requester decision. */
   readonly selectedReferences: SelectedProviderReferences;
+  /**
+   * When true, the runtime/workflow does NOT use the provider private signer.
+   * The provider publishes the escrow authority source through the relay.
+   * Issue #38 Blocker 3: requester must not possess provider private key.
+   */
+  readonly externalProvider?: boolean;
   /** Resolves one opaque reference through the trusted private-funding boundary. */
   readonly resolveFunding: (reference: string) => Promise<PrivateCashuFunding>;
+  /** Collects wallet-owned output handles after a transaction reaches terminal state. */
+  readonly collectWalletOutputs?: (walletKey: string, escrowReference: string) => Promise<void>;
+  readonly bindDemoTransactionFunding?: (
+    walletKey: string,
+    transactionId: string,
+  ) => Promise<Readonly<{ fundingReference: string; generation: number }>>;
+  readonly finalizeDemoTransaction?: (
+    fundingReference: string,
+    transactionId: string,
+    outcome: DemoTransactionTerminalOutcome,
+    escrowReference?: string,
+  ) => Promise<void>;
+  /** Starts a demo wallet for the given wallet key (session hash). Issue #37. */
+  readonly startDemoWallet?: (walletKey: string) => Promise<Readonly<{ walletId: string; generation: number }>>;
+  /** Checks whether a demo wallet exists for the given wallet key. Issue #37. */
+  readonly demoWalletExists?: (walletKey: string) => Promise<boolean>;
+  /** Resets the demo wallet (retires old generation, creates fresh allocation). */
+  readonly resetDemoWallet?: (
+    walletKey: string,
+    idempotencyKey: string,
+  ) => Promise<Readonly<{ walletId: string; generation: number }>>;
+  /** Returns the authoritative wallet balance. */
+  readonly walletBalance?: (walletKey: string) => Promise<Readonly<{ availableSats: bigint; generation: number }>>;
+  readonly demoWalletStatus?: (walletKey: string) => Promise<DemoWalletStatus>;
   /** Identifies the recommendation adapter without granting it authority. */
   readonly requesterDecisionSource?: "deterministic" | "model";
+  /** Explicit economic mode. Required, fail-closed, never inferred. */
+  readonly economicMode: EconomicMode;
 }
 
 export type PactAgentRuntimePhase = "initialized" | PactAgentWorkflowResumePhase;
@@ -146,10 +188,11 @@ export interface PactAgentRuntimeStatus {
   readonly agreementId: string;
   readonly selectedOffer: PactAgentRuntimeSelectedOffer;
   readonly requesterDecision?: PactAgentRuntimeRequesterDecision;
-  readonly availableActions: Readonly<{ resume: boolean; reconcile: boolean }>;
+  readonly availableActions: Readonly<{ resume: boolean; reconcile: boolean; refund: boolean }>;
   readonly resultAvailable: boolean;
   readonly reportAvailable: boolean;
   readonly failureCode?: "transaction_failed";
+  readonly failureReason?: PactAgentWorkflowErrorCode;
   readonly agreementRootEventId?: string;
   readonly finalOutcome?: "settled" | "refunded";
   readonly resultReference?: string;
@@ -165,6 +208,7 @@ export type PactAgentRuntimeReconcileResult = PactAgentWorkflowReport | PactAgen
 export interface PactAgentRuntimeStartInput {
   readonly idempotencyKey: string;
   readonly fundingReference: string;
+  /** UTF-8 text for text/plain; standard base64-encoded bytes for application/pdf. */
   readonly privateDocument: string;
   readonly mediaType: "text/plain" | "application/pdf";
   readonly privatePrompt?: string;
@@ -211,6 +255,7 @@ interface DurableTransactionRecord {
   readonly selectedOffer?: PactAgentRuntimeSelectedOffer;
   readonly requesterDecision?: PactAgentRuntimeRequesterDecision;
   readonly failureCode?: "transaction_failed";
+  readonly failureReason?: PactAgentWorkflowErrorCode;
   readonly privateTerms: DocumentSummaryPrivateTerms;
   readonly privateSaltHex: string;
   readonly escrowReference?: string;
@@ -334,6 +379,8 @@ function parseDurableTransactionRecord(value: unknown): DurableTransactionRecord
     (candidate.maximumBudgetSats !== undefined &&
       (typeof candidate.maximumBudgetSats !== "string" || !/^\d+$/.test(candidate.maximumBudgetSats))) ||
     (candidate.failureCode !== undefined && candidate.failureCode !== "transaction_failed") ||
+    (candidate.failureReason !== undefined &&
+      (typeof candidate.failureReason !== "string" || !WORKFLOW_FAILURE_REASONS.has(candidate.failureReason))) ||
     typeof candidate.privateSaltHex !== "string" ||
     !/^[0-9a-f]{64}$/.test(candidate.privateSaltHex)
   ) {
@@ -364,6 +411,9 @@ function parseDurableTransactionRecord(value: unknown): DurableTransactionRecord
     ...(selectedOffer === undefined ? {} : { selectedOffer }),
     ...(requesterDecision === undefined ? {} : { requesterDecision }),
     ...(candidate.failureCode === undefined ? {} : { failureCode: "transaction_failed" as const }),
+    ...(candidate.failureReason === undefined
+      ? {}
+      : { failureReason: candidate.failureReason as PactAgentWorkflowErrorCode }),
     privateTerms,
     privateSaltHex: candidate.privateSaltHex,
     ...(candidate.escrowReference === undefined ? {} : { escrowReference: candidate.escrowReference as string }),
@@ -417,6 +467,7 @@ function serializeDurableTransactionRecord(record: DurableTransactionRecord): un
     ...(record.selectedOffer === undefined ? {} : { selectedOffer: record.selectedOffer }),
     ...(record.requesterDecision === undefined ? {} : { requesterDecision: record.requesterDecision }),
     ...(record.failureCode === undefined ? {} : { failureCode: record.failureCode }),
+    ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
     privateTerms: record.privateTerms,
     privateSaltHex: record.privateSaltHex,
     ...(record.escrowReference === undefined ? {} : { escrowReference: record.escrowReference }),
@@ -453,6 +504,35 @@ function buildDecision(selectedReferences: SelectedProviderReferences): Approved
     selection: Object.freeze({ ...selectedReferences }),
     amountSats: "350",
   });
+}
+
+const REFUND_RECOVERY_STATES: ReadonlySet<string> = new Set<PactCashuEscrowOperationalState>([
+  "refund_authorized",
+  "refund_pending",
+  "refund_confirmed",
+  "refunded",
+]);
+const WORKFLOW_FAILURE_REASONS: ReadonlySet<string> = new Set([
+  "invalid_configuration",
+  "discovery_failed",
+  "decision_rejected",
+  "agreement_publication_failed",
+  "escrow_failed",
+  "reconciliation_required",
+  "private_transport_failed",
+  "private_task_transport_too_large",
+  "execution_failed",
+  "completion_failed",
+  "settlement_failed",
+  "reconstruction_failed",
+  "privacy_boundary_violation",
+  "unexpected_state",
+]);
+
+function isRefundRecoveryState(
+  state: string | undefined,
+): boolean {
+  return state !== undefined && REFUND_RECOVERY_STATES.has(state);
 }
 
 function buildSelectedOffer(selectedReferences: SelectedProviderReferences): PactAgentRuntimeSelectedOffer {
@@ -496,7 +576,34 @@ async function reconstructContext(
   references: PactAgreementReferences,
   identities: PactAgentParticipantIdentities,
   expectedAuthoritySourceReference?: string,
+  relay?: NostrRelayAdapter,
+  externalProvider?: boolean,
 ): Promise<PactAgreementContext> {
+  if (externalProvider && relay) {
+    /*
+     * In externalProvider mode, the requester does NOT possess the
+     * provider's private signer. Retrieve the escrow authority source
+     * from the relay (published by the provider service).
+     */
+    const providerPublicKey = identities.providerSigner.publicKey;
+    const escrowAuthorityPublicKey = identities.escrowAuthoritySigner.publicKey;
+    try {
+      return await buildContextFromRelay({
+        root,
+        references,
+        providerPublicKey,
+        escrowAuthorityPublicKey,
+        relay,
+        timeoutMs: 30_000,
+      });
+    } catch {
+      throw new PactAgentRuntimeError(
+        "corrupt_record",
+        "Escrow authority source was not found on the relay",
+      );
+    }
+  }
+
   const canonicalAuthoritySource = createPactEscrowAuthoritySource({
     root,
     references,
@@ -599,6 +706,7 @@ export class PactAgentRuntime {
   readonly #decision: ApprovedRequesterDecision;
   readonly #selectedOffer: PactAgentRuntimeSelectedOffer;
   readonly #decisionSource: "deterministic" | "model";
+  readonly #externalProvider: boolean;
   readonly #executions = new Map<string, Promise<void>>();
   #started = false;
 
@@ -607,6 +715,12 @@ export class PactAgentRuntime {
     this.#decision = buildDecision(config.selectedReferences);
     this.#selectedOffer = buildSelectedOffer(config.selectedReferences);
     this.#decisionSource = config.requesterDecisionSource ?? "deterministic";
+    this.#externalProvider = config.externalProvider ?? false;
+    parseEconomicMode(config.economicMode);
+  }
+
+  get economicMode(): EconomicMode {
+    return this.#config.economicMode;
   }
 
   async start(): Promise<void> {
@@ -628,10 +742,20 @@ export class PactAgentRuntime {
     }
   }
 
+  async #ensureRelayConnected(): Promise<void> {
+    try {
+      await this.#config.dependencies.relay.reconnect();
+    } catch {
+      // Reconnection failure is classified by the subsequent relay operation;
+      // the caller's query/publish will surface a not_connected error.
+    }
+  }
+
   #newWorkflow() {
     return createPactAgentWorkflow({
       identities: this.#config.identities,
       dependencies: this.#config.dependencies,
+      externalProvider: this.#externalProvider,
     });
   }
 
@@ -673,6 +797,8 @@ export class PactAgentRuntime {
       this.#config.references,
       this.#config.identities,
       expectedAuthoritySourceReference,
+      this.#config.dependencies.relay,
+      this.#externalProvider,
     );
 
     const rawEvents = await retrievePactAgreementTransitions({
@@ -742,6 +868,7 @@ export class PactAgentRuntime {
     reconciliationState?: PactAgentRuntimeReconciliationState;
     operationalState?: string;
     fundingOperationStatus?: string;
+    locktime?: number;
   } | undefined> {
     const binding = (await this.#config.dependencies.settlementStore.read(
       `agreement-escrow:${rootEventId}`,
@@ -753,6 +880,7 @@ export class PactAgentRuntime {
       revision?: number;
       state?: unknown;
       operations?: Record<string, { status?: unknown }>;
+      locktime?: unknown;
     } | undefined;
     if (typeof record?.revision !== "number") return undefined;
     const reconciliationState =
@@ -766,6 +894,7 @@ export class PactAgentRuntime {
       ...(typeof record.operations?.["wf-fund-escrow-001"]?.status === "string"
         ? { fundingOperationStatus: record.operations["wf-fund-escrow-001"].status }
         : {}),
+      ...(typeof record.locktime === "number" ? { locktime: record.locktime } : {}),
       ...(reconciliationState === undefined ? {} : { reconciliationState }),
     };
   }
@@ -797,10 +926,41 @@ export class PactAgentRuntime {
       async () => {
         const existing = await this.#loadRecord(transactionId);
         if (existing) return { record: existing, created: false as const };
-        const record = this.#createInitialRecord(transactionId, idempotencyKey, input);
+        let fundingReference = input.fundingReference;
+        if (this.#config.economicMode === "demo" && this.#config.bindDemoTransactionFunding) {
+          try {
+            const binding = await this.#config.bindDemoTransactionFunding(
+              validateFundingReference(input.fundingReference),
+              transactionId,
+            );
+            fundingReference = binding.fundingReference;
+          } catch (error) {
+            if (error instanceof EconomicEnvironmentError) {
+              throw new PactAgentRuntimeError("invalid_request", "Start Demo before creating a transaction");
+            }
+            throw error;
+          }
+        }
+        const record = this.#createInitialRecord(transactionId, idempotencyKey, input, fundingReference);
         // The transaction identity is durable before execution can publish or
         // perform any economic work.
-        await this.#persistRecord(record);
+        try {
+          await this.#persistRecord(record);
+        } catch (error) {
+          if (fundingReference !== input.fundingReference && this.#config.finalizeDemoTransaction) {
+            try {
+              await this.#config.finalizeDemoTransaction(
+                fundingReference,
+                transactionId,
+                "resolved_not_funded",
+              );
+            } catch {
+              // The durable generation binding deliberately remains visible
+              // and blocks Reset when cleanup cannot be proven complete.
+            }
+          }
+          throw error;
+        }
         return { record, created: true as const };
       },
     );
@@ -812,6 +972,7 @@ export class PactAgentRuntime {
     transactionId: string,
     idempotencyKey: string,
     input: PactAgentRuntimeStartInput,
+    fundingReferenceOverride = input.fundingReference,
   ): DurableTransactionRecord {
     const privateTerms: DocumentSummaryPrivateTerms = {
       source_document: input.privateDocument,
@@ -831,7 +992,7 @@ export class PactAgentRuntime {
       agreementId,
       agreementCreatedAt,
       agreementExpiresAt,
-      fundingReference: validateFundingReference(input.fundingReference),
+      fundingReference: validateFundingReference(fundingReferenceOverride),
       maximumBudgetSats: input.maximumBudgetSats.toString(),
       selectedOffer: this.#selectedOffer,
       privateTerms,
@@ -956,12 +1117,30 @@ export class PactAgentRuntime {
       // Keep the pre-effect initialized record. A later resume may reconstruct
       // an eventually visible root, but can never allocate a second agreement.
     }
-    await this.#persistRecord({
+    const interruptedRecord: DurableTransactionRecord = {
       ...recoveredRecord,
       ...(error instanceof PactAgentWorkflowError && error.code === "reconciliation_required"
         ? { failureCode: undefined }
         : { failureCode: "transaction_failed" as const }),
-    });
+      ...(error instanceof PactAgentWorkflowError && error.code !== "reconciliation_required"
+        ? { failureReason: error.code }
+        : {}),
+    };
+    await this.#persistRecord(interruptedRecord);
+    if (this.#config.finalizeDemoTransaction && interruptedRecord.agreementRootEventId) {
+      const escrow = await this.#readEscrowReferenceAndVersion(interruptedRecord.agreementRootEventId);
+      if (escrow?.operationalState === "prepared" && escrow.fundingOperationStatus === "failed") {
+        try {
+          await this.#config.finalizeDemoTransaction(
+            interruptedRecord.fundingReference,
+            interruptedRecord.transactionId,
+            "resolved_not_funded",
+          );
+        } catch {
+          // Reset remains blocked until the durable binding can be finalized.
+        }
+      }
+    }
   }
 
   async #persistRecoveredRecord(
@@ -986,9 +1165,42 @@ export class PactAgentRuntime {
         : { settlementReference: report.settlementReference }),
       ...(report.refundReference === undefined ? {} : { refundReference: report.refundReference }),
     });
+    if (this.#config.finalizeDemoTransaction) {
+      try {
+        await this.#config.finalizeDemoTransaction(
+          record.fundingReference,
+          record.transactionId,
+          report.finalOutcome,
+          report.escrowReference,
+        );
+      } catch {
+        // The generation-bound durable collection record remains pending.
+        // Demo wallet status retries it and reset remains fail-closed.
+      }
+    } else if (report.escrowReference && this.#config.collectWalletOutputs) {
+      await this.#config.collectWalletOutputs(record.fundingReference, report.escrowReference);
+    }
   }
 
   async #statusForRecord(record: DurableTransactionRecord): Promise<PactAgentRuntimeStatus> {
+    if (
+      this.#config.finalizeDemoTransaction &&
+      (record.phase === "settled" || record.phase === "refunded") &&
+      record.escrowReference
+    ) {
+      try {
+        await this.#config.finalizeDemoTransaction(
+          record.fundingReference,
+          record.transactionId,
+          record.phase,
+          record.escrowReference,
+        );
+      } catch {
+        // The terminal economic state remains authoritative. Collection stays
+        // durable/pending and reset remains unavailable until a later status
+        // or wallet-status request completes the idempotent collection.
+      }
+    }
     const escrow = record.agreementRootEventId
       ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
       : undefined;
@@ -1011,12 +1223,29 @@ export class PactAgentRuntime {
                 ? "failed"
                 : "active";
     const expired = this.#config.dependencies.clock.now() >= record.agreementExpiresAt;
+    const now = this.#config.dependencies.clock.now();
+    const escrowState = escrow?.operationalState;
+    const locktimePassed =
+      escrow?.locktime !== undefined && now >= escrow.locktime;
+    const escrowFundedNotReleased =
+      escrowState === "funded" || escrowState === "release_authorized";
+    const refundRecovery = isRefundRecoveryState(escrowState);
+    const successPathBlocked = escrowFundedNotReleased && locktimePassed;
+    const refundEligible = (escrowFundedNotReleased && locktimePassed) || refundRecovery;
     const resumable =
       !executing &&
       !reportAvailable &&
       operationalState !== "reconciliation_required" &&
       operationalState !== "resolved_not_funded" &&
-      (!expired || escrow !== undefined);
+      (!expired || escrow !== undefined) &&
+      !successPathBlocked &&
+      !refundRecovery;
+    const refundable =
+      !executing &&
+      !reportAvailable &&
+      operationalState !== "reconciliation_required" &&
+      operationalState !== "resolved_not_funded" &&
+      refundEligible;
     const requesterDecision =
       record.requesterDecision ??
       (record.phase === "initialized"
@@ -1033,10 +1262,14 @@ export class PactAgentRuntime {
       availableActions: Object.freeze({
         resume: resumable,
         reconcile: !executing && operationalState === "reconciliation_required",
+        refund: refundable,
       }),
       resultAvailable: record.resultReference !== undefined,
       reportAvailable,
       ...(operationalState === "failed" ? { failureCode: "transaction_failed" as const } : {}),
+      ...(record.failureReason !== undefined && operationalState === "failed"
+        ? { failureReason: record.failureReason }
+        : {}),
       ...(record.agreementRootEventId === undefined
         ? {}
         : { agreementRootEventId: record.agreementRootEventId }),
@@ -1069,6 +1302,7 @@ export class PactAgentRuntime {
     if (this.#executions.has(transactionId)) {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
+    await this.#ensureRelayConnected();
     return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
       const record = await this.#loadRecord(transactionId);
       if (!record) {
@@ -1083,6 +1317,7 @@ export class PactAgentRuntime {
     if (this.#executions.has(transactionId)) {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
+    await this.#ensureRelayConnected();
     return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
       const record = await this.#loadRecord(transactionId);
       if (!record) {
@@ -1117,9 +1352,219 @@ export class PactAgentRuntime {
     });
   }
 
+  /**
+   * Authoritative timeout refund. Invokes the existing Cashu settlement
+   * coordinator refund semantics through the workflow's refund path. The
+   * caller must verify `availableActions.refund === true` before calling; this
+   * method performs its own eligibility checks and fails closed otherwise.
+   *
+   * Idempotency: the underlying coordinator uses fixed idempotency keys and
+   * operation deduplication. A second call after a completed refund returns
+   * the stored terminal result rather than re-spending.
+   */
+  async refund(transactionId: string): Promise<PactAgentWorkflowReport> {
+    this.#ensureRunning();
+    if (this.#executions.has(transactionId)) {
+      throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
+    }
+    await this.#ensureRelayConnected();
+    return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
+      const record = await this.#loadRecord(transactionId);
+      if (!record) {
+        throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
+      }
+      if (record.phase === "settled") {
+        throw new PactAgentRuntimeError("invalid_request", "Transaction is settled; no refund is available");
+      }
+      if (record.phase === "refunded") {
+        return this.#resumeExisting(record);
+      }
+      const escrow = record.agreementRootEventId
+        ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
+        : undefined;
+      if (!escrow) {
+        throw new PactAgentRuntimeError("invalid_request", "No funded escrow is available to refund");
+      }
+      const now = this.#config.dependencies.clock.now();
+      const escrowFundedNotReleased =
+        escrow.operationalState === "funded" || escrow.operationalState === "release_authorized";
+      const refundRecovery = isRefundRecoveryState(escrow.operationalState);
+      const locktimePassed = escrow.locktime !== undefined && now >= escrow.locktime;
+      if (!((escrowFundedNotReleased && locktimePassed) || refundRecovery)) {
+        throw new PactAgentRuntimeError("invalid_request", "Timeout refund is not authorized at this time");
+      }
+      return this.#executeRefund(record, escrow);
+    });
+  }
+
+  async #executeRefund(
+    record: DurableTransactionRecord,
+    escrow: { reference: string; revision: number },
+  ): Promise<PactAgentWorkflowReport> {
+    const { root, context, phase, completionDecision } = await this.#reconstructAgreementState(
+      record.agreementId,
+      record.privateTerms,
+      record.privateSaltHex,
+    );
+    const salt = new PactPrivateCommitmentSalt(Buffer.from(record.privateSaltHex, "hex"));
+
+    let escrowReference: string | undefined = record.escrowReference ?? escrow.reference;
+    let escrowVersion: number | undefined = record.escrowVersion ?? escrow.revision;
+    if (
+      phase !== "proposed" &&
+      phase !== "accepted" &&
+      (escrowReference === undefined || escrowVersion === undefined)
+    ) {
+      const escrowRecord = await this.#readEscrowReferenceAndVersion(root.event.id);
+      escrowReference = escrowRecord?.reference;
+      escrowVersion = escrowRecord?.revision;
+    }
+
+    let refundReference = record.refundReference;
+    if (phase === "refunded" && refundReference === undefined) {
+      const escrowRecord = (await this.#config.dependencies.settlementStore.read(
+        `escrow:${escrowReference}`,
+      )) as { refundReference?: string } | undefined;
+      refundReference = escrowRecord?.refundReference;
+    }
+
+    const resumeState: PactAgentWorkflowResumeState = {
+      kind: "refund" as const,
+      phase,
+      privateTerms: record.privateTerms,
+      privateSalt: salt,
+      context,
+      decision: this.#decision,
+      funding: undefined,
+      escrowReference,
+      escrowVersion,
+      resultReference: record.resultReference,
+      completionDecision,
+      settlementReference: record.settlementReference,
+      refundReference,
+    };
+
+    const workflow = this.#newWorkflow();
+    const report = await workflow.resumeRefundTransaction(resumeState, { reconcileOnly: false });
+    await this.#persistRecoveredRecord(record, report);
+    return report;
+  }
+
+  /**
+   * Starts a demo wallet for the given wallet key (session hash).
+   * Idempotent: returns the existing active wallet if one exists.
+   * Only available in demo mode.
+   */
+  async startDemoWallet(walletKey: string): Promise<Readonly<{ walletId: string; generation: number }>> {
+    this.#ensureRunning();
+    if (this.#config.economicMode !== "demo") {
+      throw new PactAgentRuntimeError("invalid_request", "Start Demo Wallet is only available in demo mode");
+    }
+    if (!this.#config.startDemoWallet) {
+      throw new PactAgentRuntimeError("invalid_request", "Start Demo Wallet is not configured for this environment");
+    }
+    try {
+      return await this.#config.startDemoWallet(walletKey);
+    } catch (error) {
+      if (error instanceof EconomicEnvironmentError) {
+        throw new PactAgentRuntimeError(
+          error.code === "demo_provisioning_reconciliation_required"
+            ? "transaction_in_progress"
+            : "invalid_request",
+          error.code === "demo_provisioning_reconciliation_required"
+            ? "Demo wallet provisioning requires recovery"
+            : "Demo wallet provisioning is unavailable",
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Checks whether a demo wallet exists for the given wallet key.
+   * Only available in demo mode.
+   */
+  async demoWalletExists(walletKey: string): Promise<boolean> {
+    this.#ensureRunning();
+    if (this.#config.economicMode !== "demo") {
+      throw new PactAgentRuntimeError("invalid_request", "Demo wallet check is only available in demo mode");
+    }
+    if (!this.#config.demoWalletExists) {
+      throw new PactAgentRuntimeError("invalid_request", "Demo wallet check is not configured for this environment");
+    }
+    return this.#config.demoWalletExists(walletKey);
+  }
+
+  /**
+   * Resets the demo wallet: retires the current wallet generation and creates
+   * a fresh bounded fake-value allocation. Only available in demo mode.
+   * Economic eligibility is rechecked under the wallet-generation lock.
+   */
+  async resetDemoWallet(
+    walletKey: string,
+    idempotencyKey: string,
+  ): Promise<Readonly<{ walletId: string; generation: number }>> {
+    this.#ensureRunning();
+    if (this.#config.economicMode !== "demo") {
+      throw new PactAgentRuntimeError("invalid_request", "Reset Demo Wallet is only available in demo mode");
+    }
+    if (!this.#config.resetDemoWallet) {
+      throw new PactAgentRuntimeError("invalid_request", "Reset Demo Wallet is not configured for this environment");
+    }
+    try {
+      return await this.#config.resetDemoWallet(walletKey, validateIdempotencyKey(idempotencyKey));
+    } catch (error) {
+      if (error instanceof EconomicEnvironmentError) {
+        throw new PactAgentRuntimeError(
+          error.code === "demo_reset_blocked" ||
+            error.code === "demo_provisioning_reconciliation_required"
+            ? "transaction_in_progress"
+            : "invalid_request",
+          error.code === "demo_reset_blocked"
+            ? "Demo wallet has unresolved economic exposure"
+            : error.code === "demo_provisioning_reconciliation_required"
+              ? "Demo wallet provisioning requires recovery"
+            : "Demo wallet reset is unavailable",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async demoWalletStatus(walletKey: string): Promise<DemoWalletStatus> {
+    this.#ensureRunning();
+    if (this.#config.economicMode !== "demo" || !this.#config.demoWalletStatus) {
+      throw new PactAgentRuntimeError("invalid_request", "Demo wallet status is unavailable");
+    }
+    try {
+      return await this.#config.demoWalletStatus(walletKey);
+    } catch (error) {
+      if (error instanceof EconomicEnvironmentError) {
+        throw new PactAgentRuntimeError("invalid_request", "Demo wallet status is unavailable");
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Returns the authoritative wallet balance derived from all wallet-owned
+   * unspent Cashu value. Only available in demo mode.
+   */
+  async walletBalance(walletKey: string): Promise<Readonly<{ availableSats: bigint; generation: number }>> {
+    this.#ensureRunning();
+    if (this.#config.economicMode !== "demo") {
+      throw new PactAgentRuntimeError("invalid_request", "Wallet balance is only available in demo mode");
+    }
+    if (!this.#config.walletBalance) {
+      throw new PactAgentRuntimeError("invalid_request", "Wallet balance is not configured for this environment");
+    }
+    return this.#config.walletBalance(walletKey);
+  }
+
   /** Safe terminal report; only available once the transaction reached a terminal outcome. */
   async report(transactionId: string): Promise<PactAgentWorkflowReport> {
     this.#ensureRunning();
+    await this.#ensureRelayConnected();
     const record = await this.#loadRecord(transactionId);
     if (!record) {
       throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
@@ -1136,6 +1581,7 @@ export class PactAgentRuntime {
   /** Complete private summary, available only to the authorized requester. */
   async privateResult(transactionId: string): Promise<{ summary: string }> {
     this.#ensureRunning();
+    await this.#ensureRelayConnected();
     const record = await this.#loadRecord(transactionId);
     if (!record) {
       throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");

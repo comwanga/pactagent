@@ -30,6 +30,7 @@ import type { NostrRelayAdapter } from "./nostr-relay";
 import type { NostrSigner } from "../domain/nostr";
 import {
   createPactServiceAgreementRootFromDiscovery,
+  buildContextFromRelay,
   retrieveAndReconstructPactAgreement,
   signPactAgreementTransition,
   signAndPublishPactAgreementTransition,
@@ -45,6 +46,7 @@ import {
   type RequesterDecisionModel,
 } from "./requester-decision";
 import {
+  nostrEventTransportLimitViolation,
   publishGiftWrap,
   retrieveAndOpenPrivateResult,
   retrieveAndOpenPrivateTask,
@@ -95,6 +97,7 @@ export type PactAgentWorkflowErrorCode =
   | "escrow_failed"
   | "reconciliation_required"
   | "private_transport_failed"
+  | "private_task_transport_too_large"
   | "execution_failed"
   | "completion_failed"
   | "settlement_failed"
@@ -175,6 +178,19 @@ export interface PactAgentWorkflowDependencies {
 export interface PactAgentWorkflowConfig {
   readonly identities: PactAgentParticipantIdentities;
   readonly dependencies: PactAgentWorkflowDependencies;
+  /*
+   * When true, the workflow does NOT publish provider-side transitions
+   * (accepted, task_delivered, result_submitted). Instead it polls the
+   * relay until an external provider service publishes them. This is the
+   * hosted-provider mode (Issue #38).
+   *
+   * When false (default), the workflow publishes provider transitions
+   * inline using the provider signer/encrypter — the original single-
+   * process behavior. All existing #33–#37 invariants are preserved.
+   */
+  readonly externalProvider?: boolean;
+  readonly externalProviderPollIntervalMs?: number;
+  readonly externalProviderTimeoutMs?: number;
 }
 
 export interface PactAgentWorkflowTransactionInput {
@@ -307,12 +323,18 @@ function preparationIdempotencyKey(agreementRootEventId: string): string {
 export class PactAgentWorkflow {
   readonly #identities: PactAgentParticipantIdentities;
   readonly #dependencies: PactAgentWorkflowDependencies;
+  readonly #externalProvider: boolean;
+  readonly #externalProviderPollIntervalMs: number;
+  readonly #externalProviderTimeoutMs: number;
   readonly #state: WorkflowState;
   #running = false;
 
   constructor(config: PactAgentWorkflowConfig) {
     this.#identities = config.identities;
     this.#dependencies = config.dependencies;
+    this.#externalProvider = config.externalProvider ?? false;
+    this.#externalProviderPollIntervalMs = config.externalProviderPollIntervalMs ?? 2_000;
+    this.#externalProviderTimeoutMs = config.externalProviderTimeoutMs ?? 120_000;
     this.#state = {
       discovery: undefined,
       decision: undefined,
@@ -534,6 +556,32 @@ export class PactAgentWorkflow {
     const references = draft.references;
     this.#state.references = references;
 
+    if (this.#externalProvider) {
+      /*
+       * In externalProvider mode, the requester does NOT possess the
+       * provider's private signer. The provider service publishes the
+       * signed escrow authority source to the relay. The requester
+       * retrieves it from there.
+       */
+      let context: PactAgreementContext;
+      try {
+        context = await buildContextFromRelay({
+          root: signedRoot,
+          references,
+          providerPublicKey: this.providerPublicKey,
+          escrowAuthorityPublicKey: this.escrowAuthorityPublicKey,
+          relay: this.#dependencies.relay,
+          pollIntervalMs: this.#externalProviderPollIntervalMs,
+          timeoutMs: this.#externalProviderTimeoutMs,
+        });
+      } catch (error) {
+        if (error instanceof PactAgentWorkflowError) throw error;
+        workflowError("agreement_publication_failed", "Escrow authority source was not published by the provider");
+      }
+      this.#state.context = context!;
+      return context!;
+    }
+
     const authoritySource = createPactEscrowAuthoritySource({
       root: signedRoot,
       references,
@@ -677,6 +725,43 @@ export class PactAgentWorkflow {
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
       workflowError("private_transport_failed", "Private task delivery failed");
+    }
+  }
+
+  async #validatePrivateTaskWireSize(
+    context: PactAgreementContext,
+    privateTerms: DocumentSummaryPrivateTerms,
+  ): Promise<void> {
+    const provenance: PrivateTaskProvenance = {
+      agreementId: context.root.content.agreement_id,
+      agreementRoot: context.root.event.id,
+      authorizedSender: this.requesterPublicKey,
+      recipient: this.providerPublicKey,
+    };
+    const payload = {
+      source_document: privateTerms.source_document,
+      input_media_type: privateTerms.input_media_type,
+      ...(privateTerms.private_prompt !== undefined
+        ? { private_prompt: privateTerms.private_prompt }
+        : {}),
+    };
+    let sealed;
+    try {
+      sealed = await sealPrivateTask(
+        payload,
+        this.#identities.requesterEncrypter,
+        provenance,
+        this.#now(),
+      );
+    } catch (error) {
+      if (error instanceof PactAgentWorkflowError) throw error;
+      workflowError("private_transport_failed", "Private task sealing failed during size validation");
+    }
+    if (nostrEventTransportLimitViolation(sealed!.wrapEvent) !== undefined) {
+      workflowError(
+        "private_task_transport_too_large",
+        "Private task gift wrap exceeds the configured relay transport limits",
+      );
     }
   }
 
@@ -1033,6 +1118,54 @@ export class PactAgentWorkflow {
     }
   }
 
+  async #waitForExternalProviderState(
+    context: PactAgreementContext,
+    expectedState: PactAgreementState,
+  ): Promise<PactAgreementHistory> {
+    const deadline = Date.now() + this.#externalProviderTimeoutMs;
+    let lastState: string | undefined;
+    while (Date.now() < deadline) {
+      let history: PactAgreementHistory;
+      try {
+        history = await retrieveAndReconstructPactAgreement({
+          context,
+          relay: this.#dependencies.relay,
+        });
+      } catch {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, this.#externalProviderPollIntervalMs);
+          timer.unref?.();
+        });
+        continue;
+      }
+      lastState = history.currentState;
+      if (history.currentState === expectedState) return history;
+      if (
+        history.currentState === "rejected" ||
+        history.currentState === "expired" ||
+        history.currentState === "disputed"
+      ) {
+        workflowError("unexpected_state", `Agreement reached terminal state: ${history.currentState}`);
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, this.#externalProviderPollIntervalMs);
+        timer.unref?.();
+      });
+    }
+    workflowError(
+      "unexpected_state",
+      `Timed out waiting for external provider state: ${expectedState} (last seen: ${lastState ?? "none"})`,
+    );
+  }
+
+  #extractResultReferenceFromHistory(history: PactAgreementHistory): string {
+    const submitted = history.transitions.find((t) => t.content.state === "result_submitted");
+    if (!submitted?.content.result_reference) {
+      workflowError("reconstruction_failed", "Result submitted transition has no result reference");
+    }
+    return submitted.content.result_reference;
+  }
+
   async runSuccessfulTransaction(
     input: PactAgentWorkflowTransactionInput,
   ): Promise<PactAgentWorkflowReport> {
@@ -1076,10 +1209,17 @@ export class PactAgentWorkflow {
     );
     await input.onProgress?.({ phase: "proposed", agreementRootEventId: context.root.event.id });
 
-    const acceptedEvent = await this.#providerAccepts(context, []);
-    const fundingHistory = [acceptedEvent];
+    let fundingHistory: SignedNostrEvent[];
+    if (this.#externalProvider) {
+      const acceptedHistory = await this.#waitForExternalProviderState(context, "accepted");
+      fundingHistory = acceptedHistory.transitions.map((t) => t.event);
+    } else {
+      const acceptedEvent = await this.#providerAccepts(context, []);
+      fundingHistory = [acceptedEvent];
+    }
     await input.onProgress?.({ phase: "accepted", agreementRootEventId: context.root.event.id });
 
+    await this.#validatePrivateTaskWireSize(context, privateTerms);
     await this.#prepareAndFundEscrow(context, fundingHistory, input.funding);
     await input.onProgress?.({
       phase: "escrow_funded",
@@ -1090,20 +1230,27 @@ export class PactAgentWorkflow {
     const fundedHistory = await this.#collectHistoryEvents(context);
 
     await this.#deliverPrivateTask(context, privateTerms);
-    const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+
+    let resultReference: string;
+    if (this.#externalProvider) {
+      const resultHistory = await this.#waitForExternalProviderState(context, "result_submitted");
+      resultReference = this.#extractResultReferenceFromHistory(resultHistory);
+      this.#state.resultReference = resultReference;
+    } else {
+      const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+      const taskDeliveredHistory = await this.#collectHistoryEvents(context);
+      resultReference = await this.#providerExecutesAndReturnsResult(
+        context,
+        taskDeliveredHistory,
+        task,
+      );
+    }
     await input.onProgress?.({
       phase: "task_delivered",
       agreementRootEventId: context.root.event.id,
       escrowReference: this.#state.escrowReference,
       escrowVersion: this.#state.escrowVersion,
     });
-
-    const taskDeliveredHistory = await this.#collectHistoryEvents(context);
-    const resultReference = await this.#providerExecutesAndReturnsResult(
-      context,
-      taskDeliveredHistory,
-      task,
-    );
     await input.onProgress?.({
       phase: "result_submitted",
       agreementRootEventId: context.root.event.id,
@@ -1383,12 +1530,18 @@ export class PactAgentWorkflow {
       let currentState = (await this.#reconstructHistory(context)).currentState;
 
       if (currentState === "proposed") {
-        await this.#providerAccepts(context, []);
-        currentState = "accepted";
+        if (this.#externalProvider) {
+          const acceptedHistory = await this.#waitForExternalProviderState(context, "accepted");
+          currentState = acceptedHistory.currentState;
+        } else {
+          await this.#providerAccepts(context, []);
+          currentState = "accepted";
+        }
       }
 
       if (currentState === "accepted") {
         const acceptedHistory = await this.#collectHistoryEvents(context);
+        await this.#validatePrivateTaskWireSize(context, privateTerms);
         await this.#prepareAndFundEscrow(
           context,
           acceptedHistory,
@@ -1400,27 +1553,38 @@ export class PactAgentWorkflow {
 
       if (currentState === "escrow_funded") {
         const fundedHistory = await this.#collectHistoryEvents(context);
+        await this.#validatePrivateTaskWireSize(context, privateTerms);
         await this.#deliverPrivateTask(context, privateTerms);
-        const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
-        const taskDeliveredHistory = await this.#collectHistoryEvents(context);
-        await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        if (this.#externalProvider) {
+          const resultHistory = await this.#waitForExternalProviderState(context, "result_submitted");
+          this.#state.resultReference = this.#extractResultReferenceFromHistory(resultHistory);
+        } else {
+          const task = await this.#providerReceivesAndDeliversTask(context, fundedHistory);
+          const taskDeliveredHistory = await this.#collectHistoryEvents(context);
+          this.#state.resultReference = await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        }
         currentState = "result_submitted";
       }
 
       if (currentState === "task_delivered") {
-        const task = await retrieveAndOpenPrivateTask(
-          this.providerPublicKey,
-          this.#identities.providerEncrypter,
-          {
-            agreementId: context.root.content.agreement_id,
-            agreementRoot: context.root.event.id,
-            authorizedSender: this.requesterPublicKey,
-            recipient: this.providerPublicKey,
-          },
-          this.#dependencies.relay,
-        );
-        const taskDeliveredHistory = await this.#collectHistoryEvents(context);
-        await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        if (this.#externalProvider) {
+          const resultHistory = await this.#waitForExternalProviderState(context, "result_submitted");
+          this.#state.resultReference = this.#extractResultReferenceFromHistory(resultHistory);
+        } else {
+          const task = await retrieveAndOpenPrivateTask(
+            this.providerPublicKey,
+            this.#identities.providerEncrypter,
+            {
+              agreementId: context.root.content.agreement_id,
+              agreementRoot: context.root.event.id,
+              authorizedSender: this.requesterPublicKey,
+              recipient: this.providerPublicKey,
+            },
+            this.#dependencies.relay,
+          );
+          const taskDeliveredHistory = await this.#collectHistoryEvents(context);
+          this.#state.resultReference = await this.#providerExecutesAndReturnsResult(context, taskDeliveredHistory, task);
+        }
         currentState = "result_submitted";
       }
 

@@ -100,6 +100,8 @@ export interface NostrRelayQueryOptions {
 export interface NostrRelayAdapter {
   readonly url: string;
   connect(signal?: AbortSignal): Promise<void>;
+  /** Reconnect after an unexpected socket close. No-op after explicit shutdown. */
+  reconnect(): Promise<void>;
   publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void>;
   queryEvents(filter: NostrFilter, options?: NostrRelayQueryOptions): Promise<SignedNostrEvent[]>;
   disconnect(): Promise<void>;
@@ -231,6 +233,7 @@ export class WebSocketNostrRelayAdapter implements NostrRelayAdapter {
   private socket: RelayWebSocket | undefined;
   private pendingConnect: Promise<void> | undefined;
   private nextSubscriptionId = 0;
+  private shuttingDown = false;
 
   constructor(url: string, options: NostrRelayAdapterOptions = {}) {
     assertRelayUrl(url);
@@ -265,6 +268,12 @@ export class WebSocketNostrRelayAdapter implements NostrRelayAdapter {
       this.closeSocket(socket);
       throw error;
     }
+  }
+
+  async reconnect(): Promise<void> {
+    if (this.shuttingDown) return;
+    if (this.socket?.readyState === WEBSOCKET_OPEN) return;
+    return this.connect();
   }
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {
@@ -474,6 +483,7 @@ export class WebSocketNostrRelayAdapter implements NostrRelayAdapter {
   }
 
   async disconnect(): Promise<void> {
+    this.shuttingDown = true;
     const socket = this.socket;
     this.socket = undefined;
     this.pendingConnect = undefined;

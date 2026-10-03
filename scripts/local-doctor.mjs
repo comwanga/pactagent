@@ -12,11 +12,13 @@ import {
 
 import {
   childEnvironmentWithCa,
+  economicModeConfigurationStatus,
   loadLocalEnvironment,
   missingRequiredVariables,
   requesterModelConfigurationStatus,
+  resolveEconomicMintUrl,
+  resolveEconomicStatePath,
   resolveLocalCaPath,
-  resolveLocalStatePath,
 } from "./local-env.mjs";
 import { runSync } from "./local-process.mjs";
 import { inspectLocalState } from "./local-state.mjs";
@@ -104,6 +106,18 @@ export async function runLocalDoctor(options = {}) {
       ? "all required variable names are present"
       : `missing variable names: ${missing.join(", ")}`,
   );
+  const economicMode = economicModeConfigurationStatus(environment);
+  const economicModeDetail = economicMode.reason === "missing"
+    ? "PACTAGENT_ECONOMIC_MODE is missing"
+    : economicMode.reason === "invalid"
+      ? `PACTAGENT_ECONOMIC_MODE must be one of: demo, live (got: ${economicMode.mode})`
+      : `${economicMode.mode} mode is configured`;
+  add(
+    checks,
+    economicMode.ok,
+    "economic mode",
+    economicModeDetail,
+  );
   const requesterModel = requesterModelConfigurationStatus(environment);
   add(
     checks,
@@ -156,60 +170,98 @@ export async function runLocalDoctor(options = {}) {
   }
   add(checks, nostrReadable, "Nostr relay", nostrReadable ? "WSS handshake and read-only REQ/EOSE succeeded" : "WSS read failed");
 
+  // ------------------------------------------------------------------
+  // Mode-aware mint reachability inspection (Issue #36, Blocker 6).
+  //
+  // Demo mode probes ONLY the demo mint and never inspects a live funding
+  // token. Live mode preserves the Testnut funding-token inspection. The
+  // check labels are mode-appropriate (never "Testnut inspection" in demo
+  // mode). Missing demo config already fails via missingRequiredVariables;
+  // an unreachable demo mint or missing required capabilities fail here.
+  // ------------------------------------------------------------------
+  const mode = economicMode.ok ? economicMode.mode : undefined;
+  const mintUrl = resolveEconomicMintUrl(environment);
+  const mintInspectionLabel = mode === "demo" ? "demo mint inspection" : "Testnut inspection";
+
   let fundingSummary;
-  const mintUrl = environment.PACTAGENT_CASHU_TEST_MINT_URL;
-  const fundingToken = environment.PACTAGENT_LIVE_FUNDING_TOKEN;
-  if (mintUrl && fundingToken) {
-    try {
-      fundingSummary = await withTimeout((async () => {
-        const mint = new Mint(mintUrl);
-        const wallet = new Wallet(mint, { unit: "sat" });
-        const [info, keysets] = await Promise.all([mint.getInfo(), mint.getKeySets(), wallet.loadMint()]);
-        const activeSatKeysets = new Set(
-          keysets.keysets
-            .filter((keyset) => keyset.active === true && keyset.unit === "sat")
-            .map((keyset) => keyset.id),
-        );
-        const decoded = getDecodedToken(fundingToken, keysets.keysets.map((keyset) => keyset.id));
-        const states = await wallet.checkProofsStates(decoded.proofs);
-        const unspentProofs = decoded.proofs.filter(
-          (_, index) => states[index]?.state === CheckStateEnum.UNSPENT,
-        );
-        const availableSats = unspentProofs.reduce(
-          (total, proof) => total + proof.amount.toBigInt(),
-          0n,
-        );
-        const inputFeeSats = wallet.getFeesForProofs(unspentProofs).toBigInt();
-        return Object.freeze({
-          mintMatches: decoded.mint.replace(/\/+$/u, "") === mintUrl.replace(/\/+$/u, ""),
-          unitSat: decoded.unit === undefined || decoded.unit === "sat",
-          nuts: REQUIRED_NUTS.filter((nut) => info.nuts[String(nut)]?.supported === true),
-          activeKeysetsAccepted: decoded.proofs.every((proof) => activeSatKeysets.has(proof.id)),
-          proofCount: decoded.proofs.length,
-          unspentCount: states.filter((state) => state.state === CheckStateEnum.UNSPENT).length,
-          availableSats,
-          estimatedRequiredSats: ACCEPTANCE_AMOUNT_SATS + RESERVED_SPEND_FEE_SATS + inputFeeSats,
-        });
-      })(), "Testnut inspection");
-    } catch {
-      fundingSummary = undefined;
+  if (mode === "demo") {
+    if (mintUrl) {
+      try {
+        fundingSummary = await withTimeout((async () => {
+          const mint = new Mint(mintUrl);
+          const [info, keysets] = await Promise.all([mint.getInfo(), mint.getKeySets()]);
+          const activeSatKeysets = keysets.keysets.filter(
+            (keyset) => keyset.active === true && keyset.unit === "sat",
+          );
+          return Object.freeze({
+            nuts: REQUIRED_NUTS.filter((nut) => info.nuts[String(nut)]?.supported === true),
+            activeSatKeysetCount: activeSatKeysets.length,
+          });
+        })(), mintInspectionLabel);
+      } catch {
+        fundingSummary = undefined;
+      }
+    }
+    add(checks, fundingSummary !== undefined, "demo mint reachability", fundingSummary ? "read-only demo mint inspection succeeded" : "demo mint inspection failed");
+    if (fundingSummary) {
+      const nutsOkay = fundingSummary.nuts.length === REQUIRED_NUTS.length;
+      add(checks, nutsOkay, "demo mint capabilities", nutsOkay ? "NUT-07/09/10/11 available" : "required NUT capability missing");
+      add(checks, fundingSummary.activeSatKeysetCount > 0, "demo mint keysets", fundingSummary.activeSatKeysetCount > 0 ? "active sat keyset available" : "no active sat keyset");
+    }
+  } else {
+    const fundingToken = environment.PACTAGENT_LIVE_FUNDING_TOKEN;
+    if (mintUrl && fundingToken) {
+      try {
+        fundingSummary = await withTimeout((async () => {
+          const mint = new Mint(mintUrl);
+          const wallet = new Wallet(mint, { unit: "sat" });
+          const [info, keysets] = await Promise.all([mint.getInfo(), mint.getKeySets(), wallet.loadMint()]);
+          const activeSatKeysets = new Set(
+            keysets.keysets
+              .filter((keyset) => keyset.active === true && keyset.unit === "sat")
+              .map((keyset) => keyset.id),
+          );
+          const decoded = getDecodedToken(fundingToken, keysets.keysets.map((keyset) => keyset.id));
+          const states = await wallet.checkProofsStates(decoded.proofs);
+          const unspentProofs = decoded.proofs.filter(
+            (_, index) => states[index]?.state === CheckStateEnum.UNSPENT,
+          );
+          const availableSats = unspentProofs.reduce(
+            (total, proof) => total + proof.amount.toBigInt(),
+            0n,
+          );
+          const inputFeeSats = wallet.getFeesForProofs(unspentProofs).toBigInt();
+          return Object.freeze({
+            mintMatches: decoded.mint.replace(/\/+$/u, "") === mintUrl.replace(/\/+$/u, ""),
+            unitSat: decoded.unit === undefined || decoded.unit === "sat",
+            nuts: REQUIRED_NUTS.filter((nut) => info.nuts[String(nut)]?.supported === true),
+            activeKeysetsAccepted: decoded.proofs.every((proof) => activeSatKeysets.has(proof.id)),
+            proofCount: decoded.proofs.length,
+            unspentCount: states.filter((state) => state.state === CheckStateEnum.UNSPENT).length,
+            availableSats,
+            estimatedRequiredSats: ACCEPTANCE_AMOUNT_SATS + RESERVED_SPEND_FEE_SATS + inputFeeSats,
+          });
+        })(), mintInspectionLabel);
+      } catch {
+        fundingSummary = undefined;
+      }
+    }
+
+    add(checks, fundingSummary !== undefined, "Testnut reachability", fundingSummary ? "read-only mint inspection succeeded" : "mint inspection failed");
+    if (fundingSummary) {
+      add(checks, fundingSummary.mintMatches, "funding mint", fundingSummary.mintMatches ? "matches configured Testnut mint" : "token belongs to another mint");
+      add(checks, fundingSummary.unitSat, "funding unit", fundingSummary.unitSat ? "sat" : "not sat");
+      const nutsOkay = fundingSummary.nuts.length === REQUIRED_NUTS.length;
+      add(checks, nutsOkay, "mint capabilities", nutsOkay ? "NUT-07/09/10/11 available" : "required NUT capability missing");
+      add(checks, fundingSummary.activeKeysetsAccepted, "funding keysets", fundingSummary.activeKeysetsAccepted ? "all proofs use active sat keysets" : "inactive or foreign keyset detected");
+      const allUnspent = fundingSummary.proofCount > 0 && fundingSummary.unspentCount === fundingSummary.proofCount;
+      add(checks, allUnspent, "funding proofs", allUnspent ? `${fundingSummary.unspentCount}/${fundingSummary.proofCount} UNSPENT` : `${fundingSummary.unspentCount}/${fundingSummary.proofCount} UNSPENT`);
+      const sufficient = fundingSummary.availableSats >= fundingSummary.estimatedRequiredSats;
+      add(checks, sufficient, "funding value", `${fundingSummary.availableSats} sats available; ${fundingSummary.estimatedRequiredSats} sats conservatively required`);
     }
   }
 
-  add(checks, fundingSummary !== undefined, "Testnut reachability", fundingSummary ? "read-only mint inspection succeeded" : "mint inspection failed");
-  if (fundingSummary) {
-    add(checks, fundingSummary.mintMatches, "funding mint", fundingSummary.mintMatches ? "matches configured Testnut mint" : "token belongs to another mint");
-    add(checks, fundingSummary.unitSat, "funding unit", fundingSummary.unitSat ? "sat" : "not sat");
-    const nutsOkay = fundingSummary.nuts.length === REQUIRED_NUTS.length;
-    add(checks, nutsOkay, "mint capabilities", nutsOkay ? "NUT-07/09/10/11 available" : "required NUT capability missing");
-    add(checks, fundingSummary.activeKeysetsAccepted, "funding keysets", fundingSummary.activeKeysetsAccepted ? "all proofs use active sat keysets" : "inactive or foreign keyset detected");
-    const allUnspent = fundingSummary.proofCount > 0 && fundingSummary.unspentCount === fundingSummary.proofCount;
-    add(checks, allUnspent, "funding proofs", allUnspent ? `${fundingSummary.unspentCount}/${fundingSummary.proofCount} UNSPENT` : `${fundingSummary.unspentCount}/${fundingSummary.proofCount} UNSPENT`);
-    const sufficient = fundingSummary.availableSats >= fundingSummary.estimatedRequiredSats;
-    add(checks, sufficient, "funding value", `${fundingSummary.availableSats} sats available; ${fundingSummary.estimatedRequiredSats} sats conservatively required`);
-  }
-
-  const stateDirectory = resolveLocalStatePath(environment);
+  const stateDirectory = resolveEconomicStatePath(environment);
   const state = await inspectLocalState(stateDirectory);
   add(checks, state.directoryExists, "state directory", state.directoryExists ? `exists at ${stateDirectory}` : `missing at ${stateDirectory}`);
   add(checks, state.directoryWritable, "state directory access", state.directoryWritable ? "readable and writable" : "not readable and writable");

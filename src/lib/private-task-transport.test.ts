@@ -52,6 +52,7 @@ class MemoryNostrRelay implements NostrRelayAdapter {
   lastOptions: NostrRelayPublishOptions | undefined;
 
   async connect(): Promise<void> {}
+  async reconnect(): Promise<void> {}
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {

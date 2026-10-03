@@ -1,0 +1,35 @@
+# Hosted-capable Caddy configuration for Issue #38.
+#
+# ONE coherent TLS topology: Caddy terminates TLS with automatic HTTPS
+# (Let's Encrypt) for the explicitly configured hostname. The hostname is
+# supplied by the PACTAGENT_HOSTED_WSS_HOSTNAME environment variable; it
+# is NOT embedded in this file and does NOT default to localhost.
+#
+# If PACTAGENT_HOSTED_WSS_HOSTNAME is unset or empty, Caddy will fail to
+# start with a clear configuration error — FAIL CLOSED.
+#
+# LOCAL acceptance testing uses a SEPARATE Caddyfile (local/Caddyfile)
+# with `tls internal` and a self-signed CA. This file represents the
+# intended real public TLS behavior for #39 Railway deployment.
+#
+# Caddy listens on container port 443. The host/service mapping
+# (8443:443 in compose.hosted.yml) exposes it locally.
+#
+# WebSocket upgrade is preserved by the reverse_proxy directive automatically.
+# No plaintext downgrade: Caddy redirects HTTP to HTTPS.
+
+{$PACTAGENT_HOSTED_WSS_HOSTNAME} {
+    # Automatic HTTPS: Caddy obtains and manages real TLS certificates.
+    # No `tls internal`, no `auto_https off`. One clear model.
+
+    reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM:strfry:7777} {
+        # Preserve WebSocket upgrade headers.
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Health endpoint that does not touch economic state.
+    handle /health {
+        respond "ok" 200
+    }
+}

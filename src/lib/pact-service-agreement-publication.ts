@@ -11,11 +11,15 @@ import {
 import {
   PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
   PACT_AGREEMENT_TRANSITION_TYPE,
+  PACT_ESCROW_AUTHORITY_SOURCE_TYPE,
   PACT_SERVICE_AGREEMENT_ROOT_TYPE,
   PactServiceAgreementError,
+  createPactEscrowAuthoritySource,
   createPactServiceAgreementRoot,
+  createPactEscrowAuthorityBinding,
   parsePactAgreementTransitionEvent,
   parsePactServiceAgreementRootEvent,
+  parsePactEscrowAuthoritySourceEvent,
   reconstructPactAgreementHistory,
   validatePactAgreementTransitionCandidate,
   validatePactServiceAgreementRoot,
@@ -24,6 +28,7 @@ import {
   type PactAgreementHistory,
   type PactAgreementReferences,
   type PactAgreementTransition,
+  type PactEscrowAuthorityBinding,
   type PactServiceAgreementRoot,
   type PactTermsCommitment,
 } from "../domain/pact-service-agreement";
@@ -474,4 +479,154 @@ export async function retrieveAndReconstructPactAgreement(input: {
 }): Promise<PactAgreementHistory> {
   const events = await retrievePactAgreementTransitions(input);
   return reconstructPactAgreementHistory(input.context, events);
+}
+
+/*
+ * Escrow authority source retrieval (Issue #38 Blocker 3).
+ *
+ * In externalProvider mode, the requester does NOT possess the provider's
+ * private signer. The provider service creates, signs, and publishes the
+ * escrow authority source event to the relay. The requester retrieves it.
+ */
+
+export function escrowAuthoritySourceFilter(input: {
+  readonly agreementRootEventId: string;
+  readonly providerPublicKey: NostrPublicKey;
+  readonly limit?: number;
+}): NostrFilter {
+  return {
+    kinds: [PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND],
+    authors: [input.providerPublicKey],
+    tags: {
+      t: [PACT_ESCROW_AUTHORITY_SOURCE_TYPE],
+      e: [input.agreementRootEventId],
+    },
+    limit: queryLimit(input.limit),
+  };
+}
+
+export async function retrieveEscrowAuthoritySource(input: {
+  readonly agreementRootEventId: string;
+  readonly providerPublicKey: NostrPublicKey;
+  readonly relay: NostrRelayAdapter;
+  readonly limit?: number;
+  readonly options?: NostrRelayPublishOptions;
+}): Promise<SignedNostrEvent | undefined> {
+  let events: SignedNostrEvent[];
+  try {
+    events = await input.relay.queryEvents(
+      escrowAuthoritySourceFilter({
+        agreementRootEventId: input.agreementRootEventId,
+        providerPublicKey: input.providerPublicKey,
+        limit: input.limit,
+      }),
+      operationOptions(PACT_AGREEMENT_RELAY_TIMEOUT_MS, input.options),
+    );
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      throw new PactAgreementPublicationError("timeout", "Escrow authority source retrieval timed out");
+    }
+    throw new PactAgreementPublicationError(
+      "retrieval_failure",
+      "Escrow authority source retrieval failed",
+    );
+  }
+
+  for (const value of events) {
+    try {
+      const signed = parseSignedNostrEvent(value);
+      verifySignedNostrEvent(signed);
+      const source = parsePactEscrowAuthoritySourceEvent(signed);
+      if (source.content.agreement_root !== input.agreementRootEventId) continue;
+      if (signed.pubkey !== input.providerPublicKey) continue;
+      return signed;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+/*
+ * Build a PactAgreementContext by retrieving the escrow authority source
+ * from the relay. Used in externalProvider mode where the requester does not
+ * have the provider's private signer.
+ */
+export async function buildContextFromRelay(input: {
+  readonly root: PactServiceAgreementRoot<SignedNostrEvent>;
+  readonly references: PactAgreementReferences;
+  readonly providerPublicKey: NostrPublicKey;
+  readonly escrowAuthorityPublicKey: NostrPublicKey;
+  readonly relay: NostrRelayAdapter;
+  readonly options?: NostrRelayPublishOptions;
+  readonly pollIntervalMs?: number;
+  readonly timeoutMs?: number;
+}): Promise<PactAgreementContext> {
+  const timeoutMs = input.timeoutMs ?? 30_000;
+  const pollIntervalMs = input.pollIntervalMs ?? 2_000;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const source = await retrieveEscrowAuthoritySource({
+      agreementRootEventId: input.root.event.id,
+      providerPublicKey: input.providerPublicKey,
+      relay: input.relay,
+      options: input.options,
+    });
+    if (source) {
+      const binding = createPactEscrowAuthorityBinding({
+        root: input.root,
+        references: input.references,
+        authority: input.escrowAuthorityPublicKey,
+        source,
+      });
+      return Object.freeze({
+        root: input.root,
+        references: input.references,
+        escrowAuthority: binding,
+      });
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, pollIntervalMs);
+      timer.unref?.();
+    });
+  }
+  throw new PactAgreementPublicationError(
+    "retrieval_failure",
+    "Timed out waiting for the provider to publish the escrow authority source",
+  );
+}
+
+/*
+ * Publish a signed escrow authority source event to the relay. Used by the
+ * standalone provider service.
+ */
+export async function publishEscrowAuthoritySource(input: {
+  readonly root: PactServiceAgreementRoot<SignedNostrEvent>;
+  readonly references: PactAgreementReferences;
+  readonly authority: NostrPublicKey;
+  readonly signer: NostrSigner;
+  readonly relay: NostrRelayAdapter;
+  readonly options?: NostrRelayPublishOptions;
+}): Promise<SignedNostrEvent> {
+  const draft = createPactEscrowAuthoritySource({
+    root: input.root,
+    references: input.references,
+    authority: input.authority,
+    createdAt: input.root.event.created_at + 1,
+  });
+  assertSignerIdentity(input.signer, draft.event.pubkey);
+  let signed: SignedNostrEvent;
+  try {
+    signed = await input.signer.sign(draft.event);
+  } catch {
+    throw new PactAgreementPublicationError(
+      "signing_failure",
+      "Escrow authority source signing failed",
+    );
+  }
+  const parsed = parseSignedNostrEvent(signed);
+  assertSignedEventMatchesDraft(draft.event, parsed);
+  await publish(parsed, input.relay, input.options);
+  return parsed;
 }
