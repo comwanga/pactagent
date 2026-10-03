@@ -92,7 +92,7 @@ function relayQueryP002(relayUrl, providerPublicKey) {
     socket.addEventListener("message", (message) => {
       try {
         const value = JSON.parse(String(message.data));
-        if (value[0] === "EVENT" && value[1] === subscription) {
+        if (value[0] === "EVENT") {
           try {
             const event = parseSignedNostrEvent(value[2]);
             verifySignedNostrEvent(event);

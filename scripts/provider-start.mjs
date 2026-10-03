@@ -135,7 +135,7 @@ try {
   startReadinessServer();
   console.log("PactAgent Provider Service started");
   console.log(`Provider public key: ${service.providerPublicKey}`);
-  console.log(`Provider readiness: http://${readinessHost}:${readinessPort}/ready`);
+  console.log("Provider readiness endpoint is available at /ready");
 } catch {
   console.error("Failed to start provider service");
   process.exit(1);
