@@ -32,8 +32,10 @@ economic action is authorized, and the runtime remains authoritative for lifecyc
 Public agreement events and API projections are separated from private task, result, Cashu, key,
 and credential material.
 
-PactAgent currently exposes a runtime and authenticated HTTP API. A requester-facing UI is a future
-layer and is not part of Issue #33.
+PactAgent now includes the Issue #34 requester PoC as a thin client over the authenticated Issue #33
+HTTP API. It supports in-memory submission, authoritative status/recovery actions, private-result and
+safe-report retrieval, and same-browser reload recovery through an opaque server-owned session. This
+is not production authentication or a multi-user deployment.
 
 ## Verified proof of operation
 
@@ -52,7 +54,7 @@ mint or production-money environment.
 ## Architecture
 
 ```text
-HTTP API / future requester UI
+Requester UI â†’ explicit requester BFF â†’ authenticated HTTP API
         │
         ▼
 PactAgent runtime
@@ -64,7 +66,10 @@ PactAgent runtime
 ```
 
 See the [architecture](docs/architecture.md), [runtime/API](docs/pactagent-runtime.md), and
-[workflow](docs/pactagent-workflow.md) documentation for the detailed boundaries.
+[workflow](docs/pactagent-workflow.md) documentation for the detailed boundaries. The
+[requester integration boundary](docs/requester-integration-boundary.md) documents the
+Issue #34 browser-to-runtime contract, requester-session ownership, privacy model, and deterministic
+browser acceptance suite.
 
 ## Requirements
 
@@ -135,6 +140,24 @@ Runs the doctor first, then attempts exactly one 350-sat golden-path transaction
 ecash. It never blindly retries an ambiguous Cashu submission. This lane consumes Testnut ecash and
 must not be treated as production-money testing.
 
+### Requester browser acceptance
+
+```sh
+npm run test:e2e:requester
+```
+
+Runs deterministic Chromium acceptance against the test-only #33 HTTP fixture.
+The separate economic live lane requires a prestarted configured runtime and is
+explicitly opt-in:
+
+```sh
+npm run test:e2e:requester:live
+```
+
+Missing live configuration skips by category. Complete configuration with a
+runtime/relay/mint failure fails without falling back to the fixture. See the
+[requester live acceptance runbook](docs/requester-live-acceptance.md).
+
 ## Local developer commands
 
 | Command | Purpose |
@@ -146,6 +169,8 @@ must not be treated as production-money testing.
 | `npm test` | Run the deterministic, non-economic test suite. |
 | `npm run test:process` | Run deterministic separate-process restart and recovery acceptance. |
 | `npm run test:local:testnut` | Opt in to one guarded economic Testnut acceptance. |
+| `npm run test:e2e:requester` | Run deterministic requester Chromium acceptance with the test-only fixture. |
+| `npm run test:e2e:requester:live` | Opt in to one real requester-browser BOSS-stack test transaction. |
 | `npm run local:down` | Remove only the Compose-owned local relay infrastructure while preserving data. |
 | `npm run local:reset-state -- --force` | Archive safe project-local state and create a fresh directory; refuse risky state. |
 
@@ -182,15 +207,16 @@ trust path after startup. `runtime:start:local` loads the configuration and supp
 PactAgent remains an integrated proof-of-concept and test environment, not production financial
 software. The runtime uses one explicitly configured Cashu test mint, has no production wallet or
 automatic Lightning acquisition of ecash, and has no real-sats/production mode. Developers provide
-their own isolated test keys, API token, and Testnut ecash. The requester-facing UI is the next
-application layer and is outside this runtime work. The initial optional model integration supports
-OpenAI's Responses API; generic provider routing, local-model hosting, and production credential
-management remain out of scope.
+their own isolated test keys, API token, and Testnut ecash. The requester-facing session boundary is
+PoC transaction ownership rather than production authentication or a multi-user account system.
+The initial optional model integration supports OpenAI's Responses API; generic provider routing,
+local-model hosting, and production credential management remain out of scope.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Local development](docs/local-development.md)
+- [Requester live browser acceptance](docs/requester-live-acceptance.md)
 - [Runtime and HTTP API](docs/pactagent-runtime.md)
 - [End-to-end workflow](docs/pactagent-workflow.md)
 - [Service agreements](docs/pact-service-agreements.md)
