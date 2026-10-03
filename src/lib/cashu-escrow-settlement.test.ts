@@ -97,6 +97,7 @@ class TestRelay implements NostrRelayAdapter {
   readonly events: SignedNostrEvent[] = [];
   failures = 0;
   async connect(): Promise<void> {}
+  async reconnect(): Promise<void> {}
   async disconnect(): Promise<void> {}
   async publish(event: SignedNostrEvent): Promise<void> {
     if (this.failures > 0) {

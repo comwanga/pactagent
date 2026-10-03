@@ -73,6 +73,7 @@ class MemoryNostrRelay implements NostrRelayAdapter {
   queryOverride: ((filter: NostrFilter) => SignedNostrEvent[] | undefined) | undefined;
 
   async connect(): Promise<void> {}
+  async reconnect(): Promise<void> {}
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {
@@ -1245,6 +1246,7 @@ describe("relay-backed provider discovery", () => {
       const hangingRelay: NostrRelayAdapter = {
         url: relay.url,
         connect: () => relay.connect(),
+        reconnect: () => relay.reconnect(),
         disconnect: () => relay.disconnect(),
         publish: (event, options) => relay.publish(event, options),
         queryEvents(filter, options) {
@@ -1286,6 +1288,7 @@ describe("relay-backed provider discovery", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -1306,6 +1309,7 @@ describe("relay-backed provider discovery", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {

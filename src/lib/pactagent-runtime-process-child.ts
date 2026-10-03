@@ -130,6 +130,12 @@ class DurableRelay implements NostrRelayAdapter {
     this.write(state);
   }
 
+  async reconnect(): Promise<void> {
+    const state = this.read();
+    state.connectCalls += 1;
+    this.write(state);
+  }
+
   async disconnect(): Promise<void> {
     const state = this.read();
     state.disconnectCalls += 1;
@@ -345,6 +351,7 @@ async function buildRuntimeConfig(): Promise<{
       references: fixture.references,
       selectedReferences: fixture.selectedReferences,
       privateStore,
+      economicMode: "demo",
       resolveFunding: async (reference) => {
         if (
           reference !== "funding-reference-process" &&

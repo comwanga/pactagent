@@ -1,6 +1,32 @@
 name: pactagent-local
 
 services:
+  demo-mint:
+    image: cashubtc/nutshell:0.21.0@sha256:beed25e291357368e35e1698bf2e4645d97ed435232a8f8ff6501c77d67c0b90
+    container_name: pactagent-local-demo-mint
+    command: ["poetry", "run", "mint"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3338:3338"
+    environment:
+      - MINT_BACKEND_BOLT11_SAT=FakeWallet
+      - MINT_LISTEN_HOST=0.0.0.0
+      - MINT_LISTEN_PORT=3338
+      - MINT_PRIVATE_KEY=DEMO_ONLY_NO_MONETARY_VALUE
+      # Nutshell 0.21.0 uses the `mint_database` setting (env: MINT_DATABASE),
+      # NOT `MINT_DATABASE_URL` (which 0.21.0 ignores). The Database class
+      # creates <MINT_DATABASE>/mint.sqlite3. The path is explicit and beneath
+      # the mounted volume so persistence is intentional, not accidental.
+      - MINT_DATABASE=/app/data/mint
+      - TOR=FALSE
+    volumes:
+      - ./.local/demo-mint-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:3338/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   strfry:
     image: dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d
     container_name: pactagent-local-strfry

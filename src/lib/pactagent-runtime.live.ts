@@ -1,5 +1,3 @@
-import { join, resolve } from "node:path";
-
 import { createNostrIdentity, type NostrPublicKey } from "../domain/nostr";
 import { sats } from "../domain/money";
 import type { RequesterPolicy } from "../domain/pact-agents";
@@ -10,20 +8,10 @@ import {
   createPactServiceOffer,
   PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID,
 } from "../domain/pact-service-offer";
-import {
-  createSqlitePactCashuEscrowSettlementStore,
-} from "./cashu-escrow-settlement";
-import {
-  createCashuTestMintAdapter,
-  createCashuPrivateValueDelivery,
-  createPrivateCashuSpendingKey,
-  createSqliteCashuPrivateStore,
-  type CashuPrivateStore,
-  type CashuTestMintPort,
-} from "./cashu-test-mint";
 import { createLocalNostrSigner } from "./nostr-signer";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
 import { createLocalNostrEncrypter } from "./private-task-transport";
+import { createPublicKeyOnlySigner, createPublicKeyOnlyEncrypter } from "./public-key-only-identity";
 import {
   createPactAgentRuntime,
   PactAgentRuntimeError,
@@ -37,16 +25,17 @@ import {
   assertLiveDemoConfig,
   createLiveDemoApprovalDecisionModel,
   createLiveDemoRequesterDefinition,
-  importLiveDemoFunding,
   readLiveDemoConfigFromEnv,
   type PactAgentLiveDemoConfig,
+  type PactAgentHostedRuntimeConfig,
+  type PactAgentRuntimeConfig as PactAgentRuntimeEnvConfig,
 } from "./pactagent-workflow.live";
 import {
   type PactAgentParticipantIdentities,
   type PactAgentWorkflowDependencies,
 } from "./pactagent-workflow";
 import type { RequesterDecisionBounds, RequesterDecisionModel } from "./requester-decision";
-import type { SelectedProviderReferences } from "./provider-discovery";
+import { discoverProviders, type SelectedProviderReferences } from "./provider-discovery";
 import type { SignedNostrEvent } from "../domain/nostr";
 import type { NostrRelayAdapter } from "./nostr-relay";
 import { createModelBackedRequesterDecisionModel } from "./model-requester-decision";
@@ -54,39 +43,51 @@ import {
   createOpenAIRequesterRecommendationTransport,
   readRequesterDecisionModeConfiguration,
 } from "./openai-requester-decision";
+import {
+  createEconomicEnvironmentFromConfig,
+  EconomicEnvironmentError,
+  type EconomicEnvironment,
+} from "./economic-environment";
 
 /*
  * Opt-in live PactAgent runtime wiring (Issue #33).
  *
- * Composes the existing live-demo helpers to stand up the long-lived runtime
- * against a configured WebSocket relay + Cashu test mint. The bootstrap
- * publishes or verifies the P001 requester definition, the P002 provider
- * definition, the exact 350-sat offer, and the PIP-01 escrow descriptor, then
- * enforces a single configured mint with a literal "sat" unit.
+ * Composes the economic environment (Issue #35) with the non-economic runtime
+ * resources (relay, identities, policy, decision model) to stand up the
+ * long-lived runtime. The economic environment owns all Cashu, private store,
+ * settlement store, spending key, and funding resolution resources. The
+ * runtime receives composed economic resources through PactAgentWorkflowDependencies
+ * and never constructs them directly.
  *
  * Missing configuration produces an explicit configuration error (no fallback).
- * Funding is imported once per process; the proof source is single-use, so each
- * funded transaction requires a fresh funding token (documented PoC limit).
+ * Demo mode fails explicitly because the demo economic implementation does
+ * not exist until #36.
  */
 
 export interface PactAgentRuntimeEnv {
   readonly runtime: PactAgentRuntime;
+  readonly composition: PactAgentRuntimeComposition;
   readonly close: () => void;
+}
+
+export interface PactAgentRuntimeComposition {
+  readonly runtimeMode: "local" | "hosted";
+  readonly externalProvider: boolean;
+  readonly providerPublicKey: NostrPublicKey;
 }
 
 export interface PactAgentRuntimeWiring {
   readonly relay: NostrRelayAdapter;
-  readonly cashu: CashuTestMintPort;
-  readonly privateStore: CashuPrivateStore;
+  readonly economicEnvironment: EconomicEnvironment;
   readonly identities: PactAgentParticipantIdentities;
   readonly dependencies: PactAgentWorkflowDependencies;
   readonly close: () => void;
 }
 
 export type PactAgentRuntimeWiringFactory = (
-  config: PactAgentLiveDemoConfig,
+  config: PactAgentRuntimeEnvConfig,
   decisionModel: RequesterDecisionModel,
-) => PactAgentRuntimeWiring;
+) => Promise<PactAgentRuntimeWiring>;
 
 export interface LiveRequesterDecision {
   readonly source: "deterministic" | "model";
@@ -117,7 +118,7 @@ export function createLiveRequesterDecisionFromEnv(
 }
 
 export async function publishRuntimeRequesterDefinition(
-  config: PactAgentLiveDemoConfig,
+  config: PactAgentRuntimeEnvConfig,
   escrowDescriptorAddress: string,
   now: number,
   relay: NostrRelayAdapter,
@@ -135,15 +136,95 @@ export async function publishRuntimeRequesterDefinition(
 }
 
 export async function publishRuntimeBootstrapArtifacts(
-  config: PactAgentLiveDemoConfig,
+  config: PactAgentRuntimeEnvConfig,
   relay: NostrRelayAdapter,
   now: number,
 ): Promise<Readonly<{
   references: PactAgreementReferences;
   selectedReferences: SelectedProviderReferences;
 }>> {
-  const providerSigner = createLocalNostrSigner(config.providerPrivateKeyHex);
-  const providerIdentity = createNostrIdentity(providerSigner.publicKey, [config.relayUrl]);
+  // F38-01: In hosted mode, the runtime does NOT publish provider-owned
+  // P002 artifacts. The standalone provider service publishes them.
+  // The runtime discovers them through the relay.
+  const isHosted = "externalProvider" in config && config.externalProvider === true;
+  if (isHosted) {
+    // Discover the provider from the relay instead of publishing.
+    const providerPublicKey = (config as PactAgentHostedRuntimeConfig).providerPublicKeyHex as NostrPublicKey;
+
+    // Discover providers through the relay using the actual production
+    // discovery path. This proves the provider service has published
+    // its artifacts and the runtime can find them.
+    const requesterPolicy: RequesterPolicy = {
+      maxBudgetSats: sats(500n),
+      allowedCapabilities: ["document-summary"],
+      maximumEscrowDurationSeconds: 15 * 60,
+      maximumProviderPriceSats: sats(450n),
+      allowedSettlementNetworks: ["cashu"],
+      autoRelease: "deterministic_checks_only",
+    };
+
+    const discovery = await discoverProviders({
+      requesterPolicy,
+      capability: "document-summary",
+      relay,
+      now,
+    });
+
+    if (!discovery.selected) {
+      throw new PactAgentRuntimeError(
+        "invalid_configuration",
+        "Hosted runtime could not discover a provider through the relay. " +
+          "Ensure the standalone provider service is running and has published its artifacts.",
+      );
+    }
+
+    // Verify the discovered provider matches the configured public key.
+    if (discovery.selected.selected.providerPublicKey !== providerPublicKey) {
+      throw new PactAgentRuntimeError(
+        "invalid_configuration",
+        "Discovered provider does not match the configured provider public key. " +
+          "Ensure PACTAGENT_LIVE_PROVIDER_PUBLIC_KEY matches the running provider service identity.",
+      );
+    }
+
+    // Retrieve the actual signed events from the relay for the references.
+    const providerDefinitionReference = discovery.selected.selected.providerDefinitionReference;
+    const offerReference = discovery.selected.selected.offerReference;
+    const escrowDescriptorReference = discovery.selected.selected.escrowDescriptorReference;
+
+    // Publish the requester definition (runtime owns requester authority).
+    const requesterDefinitionEvent = await publishRuntimeRequesterDefinition(
+      config,
+      escrowDescriptorReference,
+      now,
+      relay,
+    );
+
+    // Retrieve the provider definition and escrow descriptor events from the relay.
+    const { retrieveAgentDefinition } = await import("./pontmore-agent-publication");
+    const { retrieveCashuEscrowDescriptor } = await import("./pontmore-escrow-publication");
+    const providerDef = await retrieveAgentDefinition(providerDefinitionReference, relay);
+    const descriptor = await retrieveCashuEscrowDescriptor(escrowDescriptorReference, relay);
+
+    return Object.freeze({
+      references: {
+        requesterDefinition: requesterDefinitionEvent,
+        providerDefinition: providerDef.event,
+        escrowDescriptor: descriptor.event,
+      },
+      selectedReferences: {
+        providerPublicKey,
+        providerDefinitionReference,
+        offerReference,
+        escrowDescriptorReference,
+      },
+    });
+  }
+
+  // Local mode: publish all artifacts inline (existing behavior).
+  const localConfig = config as PactAgentLiveDemoConfig;
+  const providerSigner = createLocalNostrSigner(localConfig.providerPrivateKeyHex);
+  const providerIdentity = createNostrIdentity(providerSigner.publicKey, [localConfig.relayUrl]);
   const descriptor = createCashuEscrowDescriptor({
     identity: providerIdentity,
     identifier: "live-cashu-escrow",
@@ -185,7 +266,7 @@ export async function publishRuntimeBootstrapArtifacts(
     relay,
   );
   const requesterDefinitionEvent = await publishRuntimeRequesterDefinition(
-    config,
+    localConfig,
     descriptor.address,
     now,
     relay,
@@ -205,47 +286,43 @@ export async function publishRuntimeBootstrapArtifacts(
   });
 }
 
-function wireDependencies(
-  config: PactAgentLiveDemoConfig,
+async function wireDependencies(
+  config: PactAgentRuntimeEnvConfig,
   decisionModel: RequesterDecisionModel,
-): PactAgentRuntimeWiring {
+): Promise<PactAgentRuntimeWiring> {
   const relay = new WebSocketNostrRelayAdapter(config.relayUrl, {
     connectTimeoutMs: 10_000,
     defaultTimeoutMs: 15_000,
   });
 
+  // F38-01: In hosted mode, the runtime does NOT possess the provider
+  // private key. Use public-key-only stubs that throw if signing or
+  // decryption is attempted. The standalone provider service owns
+  // provider signing/encryption authority.
+  const isHosted = "externalProvider" in config && config.externalProvider === true;
+  const providerPrivateKeyHex = isHosted
+    ? undefined
+    : (config as PactAgentLiveDemoConfig).providerPrivateKeyHex;
+  const providerPublicKeyHex = isHosted
+    ? (config as PactAgentHostedRuntimeConfig).providerPublicKeyHex
+    : undefined;
+
   const identities: PactAgentParticipantIdentities = {
     requesterSigner: createLocalNostrSigner(config.requesterPrivateKeyHex),
-    providerSigner: createLocalNostrSigner(config.providerPrivateKeyHex),
+    providerSigner: isHosted
+      ? createPublicKeyOnlySigner(providerPublicKeyHex!)
+      : createLocalNostrSigner(providerPrivateKeyHex!),
     escrowAuthoritySigner: createLocalNostrSigner(config.escrowAuthorityPrivateKeyHex),
     requesterEncrypter: createLocalNostrEncrypter(config.requesterPrivateKeyHex),
-    providerEncrypter: createLocalNostrEncrypter(config.providerPrivateKeyHex),
+    providerEncrypter: isHosted
+      ? createPublicKeyOnlyEncrypter(providerPublicKeyHex!)
+      : createLocalNostrEncrypter(providerPrivateKeyHex!),
   };
 
-  const stateDirectory = resolve(config.stateDirectory);
-  const privateStore = createSqliteCashuPrivateStore(join(stateDirectory, "cashu-private.sqlite"));
-  const settlementStore = createSqlitePactCashuEscrowSettlementStore(
-    join(stateDirectory, "escrow-settlement.sqlite"),
+  const economicEnvironment = await createEconomicEnvironmentFromConfig(
+    config.economicMode,
+    config.economicConfig,
   );
-  const cashu = createCashuTestMintAdapter({
-    configuration: {
-      testMintUrl: config.testMintUrl,
-      unit: "sat",
-      maximumExposureSats: sats(400n),
-      requestTimeoutMs: 10_000,
-      maximumResponseBytes: 500_000,
-    },
-    privateStore,
-  });
-
-  const privateDelivery = createCashuPrivateValueDelivery({
-    configuration: {
-      testMintUrl: config.testMintUrl,
-      unit: "sat",
-      maximumExposureSats: sats(400n),
-    },
-    privateStore,
-  });
 
   const requesterPolicy: RequesterPolicy = {
     maxBudgetSats: sats(500n),
@@ -262,15 +339,6 @@ function wireDependencies(
     modelTimeoutMilliseconds: 30_000,
   };
 
-  const normalSpendKey = createPrivateCashuSpendingKey({
-    purpose: "cashu-nut11",
-    secretKeyHex: config.normalSpendKeyHex,
-  });
-  const refundSpendKey = createPrivateCashuSpendingKey({
-    purpose: "cashu-nut11",
-    secretKeyHex: config.refundSpendKeyHex,
-  });
-
   const clock = { now: () => Math.floor(Date.now() / 1000) };
 
   const dependencies: PactAgentWorkflowDependencies = {
@@ -279,23 +347,21 @@ function wireDependencies(
     requesterPolicy,
     decisionModel,
     decisionBounds,
-    cashu,
-    privateDelivery,
-    settlementStore,
-    mintUrl: config.testMintUrl,
-    normalSpendKey,
-    refundSpendKey,
+    cashu: economicEnvironment.cashu,
+    privateDelivery: economicEnvironment.privateDelivery,
+    settlementStore: economicEnvironment.settlementStore,
+    mintUrl: economicEnvironment.mintUrl,
+    normalSpendKey: economicEnvironment.normalSpendKey,
+    refundSpendKey: economicEnvironment.refundSpendKey,
   };
 
   return {
     relay,
-    cashu,
-    privateStore,
+    economicEnvironment,
     identities,
     dependencies,
     close() {
-      settlementStore.close();
-      privateStore.close();
+      economicEnvironment.close();
     },
   };
 }
@@ -321,7 +387,7 @@ async function disconnectRelayBounded(
 export async function createPactAgentRuntimeFromEnv(
   wiringFactory: PactAgentRuntimeWiringFactory = wireDependencies,
 ): Promise<PactAgentRuntimeEnv> {
-  let config: PactAgentLiveDemoConfig;
+  let config: PactAgentRuntimeEnvConfig;
   let requesterDecision: LiveRequesterDecision;
   try {
     config = assertLiveDemoConfig(readLiveDemoConfigFromEnv());
@@ -332,7 +398,22 @@ export async function createPactAgentRuntimeFromEnv(
       error instanceof Error ? error.message : "Live runtime configuration is missing",
     );
   }
-  const wired = wiringFactory(config, requesterDecision.model);
+
+  // F38-01: Determine if we are in hosted (externalProvider) mode.
+  const isHosted = "externalProvider" in config && config.externalProvider === true;
+
+  let wired: PactAgentRuntimeWiring;
+  try {
+    wired = await wiringFactory(config, requesterDecision.model);
+  } catch (error) {
+    if (error instanceof EconomicEnvironmentError) {
+      throw new PactAgentRuntimeError(
+        "invalid_configuration",
+        error.message,
+      );
+    }
+    throw error;
+  }
 
   try {
     await wired.relay.connect();
@@ -344,43 +425,59 @@ export async function createPactAgentRuntimeFromEnv(
       now,
     );
 
-    // Enforce exactly one configured mint with a literal "sat" unit.
-    const capabilities = await wired.cashu.inspectCapabilities();
+    const capabilities = await wired.economicEnvironment.cashu.inspectCapabilities();
     if (capabilities.unit !== "sat") {
       throw new Error("Configured mint does not use sat");
     }
 
-    const funding = await importLiveDemoFunding(config, wired.cashu);
-    await wired.privateStore.write("funding-reference", config.fundingReference, {
-      version: 1,
-      source: "configured-live-import",
-    });
     const runtimeConfig: PactAgentRuntimeConfig = {
       identities: wired.identities,
       dependencies: wired.dependencies,
-      privateStore: wired.privateStore,
+      privateStore: wired.economicEnvironment.privateStore,
       references,
       selectedReferences,
+      // F38-01: externalProvider is an explicit production/runtime configuration
+      // property. In hosted mode, it is true. In local mode, it is false.
+      // It does NOT rely on a default false value.
+      externalProvider: isHosted,
       requesterDecisionSource: requesterDecision.source,
-      resolveFunding: async (reference) => {
-        const lookupReference =
-          reference === "legacy-configured-funding" ? config.fundingReference : reference;
-        const authorization = await wired.privateStore.read("funding-reference", lookupReference);
-        if (
-          (reference !== config.fundingReference && reference !== "legacy-configured-funding") ||
-          typeof authorization !== "object" ||
-          authorization === null ||
-          (authorization as { source?: unknown }).source !== "configured-live-import"
-        ) {
-          throw new PactAgentRuntimeError("invalid_request", "Funding reference was not found");
-        }
-        return funding;
-      },
+      economicMode: wired.economicEnvironment.mode,
+      resolveFunding: wired.economicEnvironment.resolveFunding,
+      collectWalletOutputs: wired.economicEnvironment.collectWalletOutputs,
+      ...(wired.economicEnvironment.bindDemoTransactionFunding === undefined
+        ? {}
+        : { bindDemoTransactionFunding: wired.economicEnvironment.bindDemoTransactionFunding }),
+      ...(wired.economicEnvironment.finalizeDemoTransaction === undefined
+        ? {}
+        : { finalizeDemoTransaction: wired.economicEnvironment.finalizeDemoTransaction }),
+      ...(wired.economicEnvironment.startDemoWallet === undefined
+        ? {}
+        : { startDemoWallet: wired.economicEnvironment.startDemoWallet }),
+      ...(wired.economicEnvironment.demoWalletExists === undefined
+        ? {}
+        : { demoWalletExists: wired.economicEnvironment.demoWalletExists }),
+      ...(wired.economicEnvironment.resetDemoWallet === undefined
+        ? {}
+        : { resetDemoWallet: wired.economicEnvironment.resetDemoWallet }),
+      ...(wired.economicEnvironment.walletBalance === undefined
+        ? {}
+        : { walletBalance: wired.economicEnvironment.walletBalance }),
+      ...(wired.economicEnvironment.demoWalletStatus === undefined
+        ? {}
+        : { demoWalletStatus: wired.economicEnvironment.demoWalletStatus }),
     };
 
     const runtime = createPactAgentRuntime(runtimeConfig);
     await runtime.start();
-    return { runtime, close: wired.close };
+    return {
+      runtime,
+      composition: Object.freeze({
+        runtimeMode: isHosted ? "hosted" : "local",
+        externalProvider: isHosted,
+        providerPublicKey: wired.identities.providerSigner.publicKey,
+      }),
+      close: wired.close,
+    };
   } catch (error) {
     await disconnectRelayBounded(wired.relay);
     try {

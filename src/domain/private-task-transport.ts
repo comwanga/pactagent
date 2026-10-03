@@ -68,6 +68,7 @@ function transportError(code: PrivateTaskTransportErrorCode, message: string): n
  * not need to carry protocol metadata.
  */
 export interface PrivateTaskPayload {
+  /** UTF-8 text for text/plain; standard base64-encoded bytes for application/pdf. */
   readonly source_document: string;
   readonly input_media_type: "text/plain" | "application/pdf";
   readonly private_prompt?: string;

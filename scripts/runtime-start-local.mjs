@@ -4,18 +4,19 @@ import {
   PROJECT_ROOT,
   childEnvironmentWithCa,
   loadLocalEnvironment,
-  missingRequiredVariables,
+  preflightRuntimeStartLocal,
   resolveLocalCaPath,
 } from "./local-env.mjs";
 import { nextBinary, runChecked, runForeground } from "./local-process.mjs";
 
 const environment = loadLocalEnvironment();
-const caPath = resolveLocalCaPath(environment);
-const missing = missingRequiredVariables(environment);
-if (missing.length > 0) {
-  console.error(`Missing required local environment variable names: ${missing.join(", ")}`);
-  process.exit(1);
+const preflight = preflightRuntimeStartLocal(environment);
+if (preflight.action === "exit") {
+  console.error(preflight.detail);
+  process.exit(preflight.code);
 }
+
+const caPath = resolveLocalCaPath(environment);
 if (!existsSync(caPath)) {
   console.error("Local Caddy CA is missing. Run npm run local:up first.");
   process.exit(1);

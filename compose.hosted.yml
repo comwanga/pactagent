@@ -1,0 +1,65 @@
+name: pactagent-hosted
+
+# Hosted-capable PactAgent Nostr/P002 infrastructure (Issue #38).
+#
+# This compose file defines the persistent Strfry relay and TLS/WSS edge
+# suitable for later Railway deployment (#39). It does NOT include the
+# PactAgent runtime or provider service — those are application processes
+# that connect to this infrastructure as clients.
+#
+# ONE coherent TLS topology:
+# - Caddy listens on container 443; host mapping exposes 8443 locally.
+# - Healthcheck probes CONTAINER port 443.
+# - Hostname is required (PACTAGENT_HOSTED_WSS_HOSTNAME). The real
+#   Caddyfile-hosted does NOT default to localhost — it fails closed.
+# - For local acceptance, set PACTAGENT_HOSTED_CADDYFILE to
+#   Caddyfile-hosted-acceptance (tls internal, self-signed CA).
+#
+# #39 will compose these services for Railway with domain/DNS provisioning.
+
+services:
+  strfry:
+    image: dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d
+    container_name: pactagent-hosted-strfry
+    command: ["/app/strfry.sh"]
+    restart: unless-stopped
+    volumes:
+      - strfry-db:/app/strfry-db
+      - ./local/strfry-hosted.conf:/etc/strfry.conf:ro
+    healthcheck:
+      test: ["CMD", "curl", "-ILfSs", "http://localhost:7777/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  caddy:
+    image: caddy@sha256:14a9c00d4e833ebc2b65d36515b37bde3b73f0b323a2663aaafc88953d8c4e3f
+    container_name: pactagent-hosted-caddy
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    restart: unless-stopped
+    depends_on:
+      strfry:
+        condition: service_healthy
+    environment:
+      # F38-05: Hosted mode requires an explicit hostname. Missing
+      # PACTAGENT_HOSTED_WSS_HOSTNAME makes Caddy fail to start.
+      # Local acceptance explicitly sets this to localhost from the
+      # acceptance harness environment — the default does NOT live here.
+      - PACTAGENT_HOSTED_WSS_HOSTNAME=${PACTAGENT_HOSTED_WSS_HOSTNAME:?PACTAGENT_HOSTED_WSS_HOSTNAME is required for hosted mode}
+      - PACTAGENT_STRFRY_UPSTREAM=strfry:7777
+    ports:
+      - "8443:443"
+    volumes:
+      - caddy-data:/data
+      - ./local/${PACTAGENT_HOSTED_CADDYFILE:-Caddyfile-hosted}:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      # Healthcheck probes CONTAINER port 443 (where Caddy listens),
+      # not the host-mapped port 8443.
+      test: ["CMD", "wget", "--no-check-certificate", "--spider", "https://localhost:443/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  strfry-db:
+  caddy-data:

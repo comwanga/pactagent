@@ -1,0 +1,24 @@
+# Local-acceptance Caddyfile for hosted-protocol acceptance (Issue #38).
+#
+# This file is SEPARATE from Caddyfile-hosted. It uses `tls internal`
+# (self-signed CA) for local acceptance testing only. The real hosted
+# deployment uses Caddyfile-hosted with automatic HTTPS.
+#
+# Caddy listens on container port 443. The host mapping (8443:443)
+# exposes it locally. The hostname is supplied by the
+# PACTAGENT_HOSTED_WSS_HOSTNAME environment variable and defaults to
+# localhost ONLY for local acceptance — the real Caddyfile-hosted does
+# NOT default to localhost and fails closed if the hostname is missing.
+
+{$PACTAGENT_HOSTED_WSS_HOSTNAME:localhost} {
+    tls internal
+
+    reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM:strfry:7777} {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    handle /health {
+        respond "ok" 200
+    }
+}

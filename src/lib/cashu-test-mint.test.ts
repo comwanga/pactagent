@@ -22,8 +22,10 @@ import {
   createPrivateCashuProofImport,
   createPrivateCashuSpendingKey,
   createSqliteCashuPrivateStore,
+  normalizeCashuMintUrl,
   normalizeCashuTestMintConfiguration,
   normalizeCashuPrivateProofState,
+  normalizeCashuTestMintUrl,
   serializeCashuRequestBody,
   type CashuPrivateStore,
   type CashuTestMintPort,
@@ -142,6 +144,99 @@ describe("Cashu test-mint configuration and capabilities", () => {
         maximumExposureSats: sats(100n),
       }),
     ).toThrowError(CashuTestMintError);
+  });
+
+  // ==================================================================
+  // Issue #36, Blocker 2: mode-aware URL transport policy
+  // ==================================================================
+  describe("normalizeCashuMintUrl transport policy (Blocker 2)", () => {
+    it("live-https accepts HTTPS", () => {
+      expect(normalizeCashuMintUrl("https://mint.example/cashu", "live-https")).toBe("https://mint.example/cashu");
+    });
+
+    it("live-https rejects HTTP loopback", () => {
+      expect(() => normalizeCashuMintUrl("http://127.0.0.1:3338", "live-https")).toThrowError(CashuTestMintError);
+    });
+
+    it("live-https rejects HTTP remote", () => {
+      expect(() => normalizeCashuMintUrl("http://example.com", "live-https")).toThrowError(CashuTestMintError);
+    });
+
+    it("demo-loopback accepts HTTPS", () => {
+      expect(normalizeCashuMintUrl("https://mint.example/cashu", "demo-loopback")).toBe("https://mint.example/cashu");
+    });
+
+    it.each(["http://127.0.0.1:3338", "http://localhost:3338", "http://[::1]:3338", "http://127.0.0.1:3338/"])(
+      "demo-loopback accepts HTTP loopback %s",
+      (url) => {
+        expect(normalizeCashuMintUrl(url, "demo-loopback")).toMatch(/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):3338\/?$/);
+      },
+    );
+
+    it.each(["http://example.com", "http://192.168.1.10:3338", "http://10.0.0.1", "http://mint.local"])(
+      "demo-loopback rejects HTTP remote/LAN %s",
+      (url) => {
+        expect(() => normalizeCashuMintUrl(url, "demo-loopback")).toThrowError(CashuTestMintError);
+      },
+    );
+
+    it.each(["not a url", "://no-scheme", "https://", "https://user:pass@mint.example", "https://mint.example?q=1", "https://mint.example#frag"])(
+      "rejects malformed/unsafe URLs %s",
+      (url) => {
+        expect(() => normalizeCashuMintUrl(url, "live-https")).toThrowError(CashuTestMintError);
+        expect(() => normalizeCashuMintUrl(url, "demo-loopback")).toThrowError(CashuTestMintError);
+      },
+    );
+
+    it("normalizes trailing slashes for both policies", () => {
+      expect(normalizeCashuMintUrl("https://mint.example/cashu///", "live-https")).toBe("https://mint.example/cashu");
+      expect(normalizeCashuMintUrl("http://127.0.0.1:3338///", "demo-loopback")).toBe("http://127.0.0.1:3338");
+    });
+
+    it("normalizeCashuTestMintUrl remains the strict live-https policy", () => {
+      expect(normalizeCashuTestMintUrl("https://mint.example")).toBe("https://mint.example");
+      expect(() => normalizeCashuTestMintUrl("http://127.0.0.1:3338")).toThrowError(CashuTestMintError);
+    });
+
+    it("the adapter accepts a demo-loopback transport policy for HTTP loopback", () => {
+      const adapter = createCashuTestMintAdapter({
+        configuration: {
+          testMintUrl: "http://127.0.0.1:3338",
+          unit: "sat",
+          maximumExposureSats: sats(400n),
+          transportPolicy: "demo-loopback",
+        },
+        privateStore: createInMemoryCashuPrivateStore(),
+      });
+      expect(adapter).toBeDefined();
+    });
+
+    it("the adapter rejects a demo-loopback policy for HTTP remote (no accidental broadening)", () => {
+      expect(() =>
+        createCashuTestMintAdapter({
+          configuration: {
+            testMintUrl: "http://example.com:3338",
+            unit: "sat",
+            maximumExposureSats: sats(400n),
+            transportPolicy: "demo-loopback",
+          },
+          privateStore: createInMemoryCashuPrivateStore(),
+        }),
+      ).toThrowError(CashuTestMintError);
+    });
+
+    it("the adapter defaults to live-https and rejects HTTP loopback", () => {
+      expect(() =>
+        createCashuTestMintAdapter({
+          configuration: {
+            testMintUrl: "http://127.0.0.1:3338",
+            unit: "sat",
+            maximumExposureSats: sats(400n),
+          },
+          privateStore: createInMemoryCashuPrivateStore(),
+        }),
+      ).toThrowError(CashuTestMintError);
+    });
   });
 
   it("validates NUT-07, NUT-09, NUT-10, NUT-11, sat, key material, and fees", async () => {

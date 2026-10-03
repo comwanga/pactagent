@@ -1,3 +1,4 @@
+import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES,
@@ -11,6 +12,10 @@ import { GET as getReport } from "@/app/api/transactions/[id]/report/route";
 import { GET as getResult } from "@/app/api/transactions/[id]/result/route";
 import { POST as postResume } from "@/app/api/transactions/[id]/resume/route";
 import { POST as postTransaction } from "@/app/api/transactions/route";
+import { POST as postStartDemo } from "@/app/api/runtime/start-demo/route";
+import { POST as postWalletBalance } from "@/app/api/runtime/wallet-balance/route";
+import { POST as postResetDemo } from "@/app/api/runtime/reset-demo/route";
+import { GET as getRuntimeReadiness } from "@/app/api/runtime/readiness/route";
 import {
   configurePactAgentRuntime,
   getPactAgentRuntime,
@@ -43,6 +48,31 @@ function startBody() {
     privatePrompt: "PRIVATE-PROMPT Summarize this document.",
     maximumBudgetSats: 500,
   };
+}
+
+function buildBase64Pdf(lines: readonly string[]): string {
+  const content = lines
+    .map((line) => `BT /F1 12 Tf 72 720 Td (${line.replace(/[\\()]/g, "\\$&")}) Tj ET`)
+    .join("\n");
+  const body = deflateSync(Buffer.from(content, "latin1")).toString("binary");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Filter /FlateDecode /Length ${Buffer.byteLength(body, "binary")} >>\nstream\n${body}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(pdf, "latin1"));
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf, "latin1");
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, "latin1").toString("base64");
 }
 
 async function waitForStatus(
@@ -106,6 +136,66 @@ describe("PactAgent HTTP transaction API", () => {
       expect(response.status).toBe(401);
       expect(response.headers.get("cache-control")).toBe("no-store");
     }
+  });
+
+  it("protects typed Demo wallet runtime endpoints with the runtime bearer", async () => {
+    const requests = [
+      postStartDemo(new Request("http://localhost/api/runtime/start-demo", { method: "POST" })),
+      postWalletBalance(new Request("http://localhost/api/runtime/wallet-balance", { method: "POST" })),
+      postResetDemo(new Request("http://localhost/api/runtime/reset-demo", { method: "POST" })),
+      Promise.resolve(getRuntimeReadiness(new Request("http://localhost/api/runtime/readiness"))),
+    ];
+    const responses = await Promise.all(requests);
+    for (const response of responses) {
+      expect(response.status).toBe(401);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    }
+  });
+
+  it("fails closed when hosted doctor requests composition before a live runtime exists", async () => {
+    const response = getRuntimeReadiness(authed("http://localhost/api/runtime/readiness"));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      error: "Runtime is not initialized",
+      code: "not_running",
+    });
+  });
+
+  it("serializes Demo wallet mutations and bigint balance through strict runtime routes", async () => {
+    resetPactAgentRuntime();
+    configurePactAgentRuntime({
+      ...observed.config,
+      startDemoWallet: async () => ({ walletId: "private-wallet-id", generation: 4 }),
+      resetDemoWallet: async (_walletKey, idempotencyKey) => {
+        expect(idempotencyKey).toBe("reset-runtime-0001");
+        return { walletId: "private-wallet-id-next", generation: 5 };
+      },
+      demoWalletStatus: async () => ({
+        availableSats: 650n,
+        generation: 4,
+        resetAvailable: true,
+        accountingPending: false,
+      }),
+    });
+    const body = (value: unknown) => ({
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(value),
+    } satisfies RequestInit);
+    const started = await postStartDemo(authed("http://localhost/api/runtime/start-demo", body({ walletKey: "session-wallet-runtime" })));
+    const balance = await postWalletBalance(authed("http://localhost/api/runtime/wallet-balance", body({ walletKey: "session-wallet-runtime" })));
+    const reset = await postResetDemo(authed("http://localhost/api/runtime/reset-demo", body({
+      walletKey: "session-wallet-runtime",
+      idempotencyKey: "reset-runtime-0001",
+    })));
+    const startedBody = await started.json();
+    const balanceBody = await balance.json();
+    const resetBody = await reset.json();
+    expect(startedBody).toEqual({ ok: true, generation: 4 });
+    expect(balanceBody).toEqual({ generation: 4, availableSats: 650, resetAvailable: true, accountingPending: false });
+    expect(resetBody).toEqual({ ok: true, generation: 5 });
+    expect(JSON.stringify([startedBody, balanceBody, resetBody])).not.toContain("private-wallet-id");
   });
 
   it("runs bounded runtime shutdown exactly once for concurrent lifecycle signals", async () => {
@@ -198,6 +288,36 @@ describe("PactAgent HTTP transaction API", () => {
       { params: Promise.resolve({ id: body.transactionId }) },
     );
     expect(immediate.status).toBe(200);
+  }, 60_000);
+
+  it("defines application/pdf privateDocument as standard base64 through the #33 workflow", async () => {
+    const encodedPdf = buildBase64Pdf([
+      "PactAgent PDF input remains base64 through the private task boundary.",
+      "The provider decodes the bytes before extracting text.",
+    ]);
+    const started = await postTransaction(
+      authed("http://localhost/api/transactions", {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": "base64-pdf-contract-0001" },
+        body: JSON.stringify({
+          ...startBody(),
+          privateDocument: encodedPdf,
+          mediaType: "application/pdf",
+        }),
+      }),
+    );
+    expect(started.status).toBe(202);
+    const { transactionId: id } = await started.json() as { transactionId: string };
+    await waitForStatus(id, (status) => status.resultAvailable === true);
+
+    const result = await getResult(
+      authed(`http://localhost/api/transactions/${id}/result`),
+      { params: Promise.resolve({ id }) },
+    );
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({
+      summary: expect.stringContaining("PactAgent PDF input remains base64"),
+    });
   }, 60_000);
 
   it("returns a durable pollable id before delayed execution and runs one logical agreement", async () => {

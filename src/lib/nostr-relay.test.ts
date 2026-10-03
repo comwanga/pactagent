@@ -608,3 +608,51 @@ describe("WebSocketNostrRelayAdapter - disconnect", () => {
     });
   });
 });
+
+describe("WebSocketNostrRelayAdapter - reconnect", () => {
+  it("reconnects after an unexpected server close, allowing subsequent queries", async () => {
+    const ref: { current?: FakeRelaySocket } = {};
+    const adapter = createAdapter(ref);
+    await adapter.connect();
+    expect(ref.current?.readyState).toBe(1);
+    ref.current!.serverClose(1006, "unexpected");
+    expect(ref.current?.readyState).toBe(3);
+    await adapter.reconnect();
+    expect(ref.current?.readyState).toBe(1);
+    const queryPromise = adapter.queryEvents({ kinds: [1] });
+    ref.current!.receive(["EOSE", "pactagent-0"]);
+    const events = await queryPromise;
+    expect(events).toHaveLength(0);
+  });
+
+  it("concurrent reconnect callers share one controlled connect attempt", async () => {
+    const ref: { current?: FakeRelaySocket } = {};
+    const adapter = createAdapter(ref, { openDelayMs: 50 });
+    await adapter.connect();
+    ref.current!.serverClose(1006, "unexpected");
+    const [a, b] = await Promise.all([adapter.reconnect(), adapter.reconnect()]);
+    expect(a).toBeUndefined();
+    expect(b).toBeUndefined();
+    expect(ref.current?.readyState).toBe(1);
+  });
+
+  it("does not reconnect after explicit disconnect", async () => {
+    const ref: { current?: FakeRelaySocket } = {};
+    const adapter = createAdapter(ref);
+    await adapter.connect();
+    await adapter.disconnect();
+    await adapter.reconnect();
+    expect(ref.current?.readyState).toBe(3);
+    await expect(adapter.queryEvents({ kinds: [1] })).rejects.toMatchObject({ code: "not_connected" });
+  });
+
+  it("reconnect is a no-op when already connected", async () => {
+    const ref: { current?: FakeRelaySocket } = {};
+    const adapter = createAdapter(ref);
+    await adapter.connect();
+    const firstSocket = ref.current;
+    await adapter.reconnect();
+    expect(ref.current).toBe(firstSocket);
+    expect(ref.current?.readyState).toBe(1);
+  });
+});

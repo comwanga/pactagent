@@ -63,6 +63,11 @@ export async function getPactAgentRuntime(): Promise<PactAgentRuntime> {
   return runtime;
 }
 
+/** Return the composition of the runtime actually instantiated in this process. */
+export function getRunningPactAgentRuntimeComposition(): PactAgentRuntimeEnv["composition"] | undefined {
+  return liveEnv?.composition;
+}
+
 export async function shutdownPactAgentRuntime(): Promise<void> {
   if (shutdownInFlight) return shutdownInFlight;
   shutdownInFlight = (async () => {

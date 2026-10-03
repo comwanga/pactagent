@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
 import { readLiveDemoConfigFromEnv } from "./pactagent-workflow.live";
+import type { LiveEconomicEnvironmentConfig } from "./economic-environment";
 
 /*
  * Issue #33 black-box acceptance layer (opt-in, live only).
@@ -26,6 +27,9 @@ import { readLiveDemoConfigFromEnv } from "./pactagent-workflow.live";
  */
 
 const liveConfig = readLiveDemoConfigFromEnv();
+const liveEconomicConfig = liveConfig?.economicMode === "live"
+  ? (liveConfig.economicConfig as LiveEconomicEnvironmentConfig)
+  : undefined;
 const REPO_ROOT = process.cwd();
 const NEXT_BIN = join(REPO_ROOT, "node_modules", "next", "dist", "bin", "next");
 const LIVE_ENV_PREFIX = "PACTAGENT_LIVE_";
@@ -140,7 +144,7 @@ function readPrivateStoreMarkers(stateDir: string): string[] {
   }
 }
 
-describe.skipIf(!liveConfig)("PactAgent runtime black-box acceptance (live)", () => {
+describe.skipIf(!liveEconomicConfig)("PactAgent runtime black-box acceptance (live)", () => {
   const token = `bb-${randomBytes(12).toString("hex")}`;
   const idempotencyKey = `blackbox-${randomBytes(8).toString("hex")}`;
   const documentMarker = `PRIVATE-DOC-MARKER-${randomBytes(8).toString("hex")}`;
@@ -163,6 +167,7 @@ describe.skipIf(!liveConfig)("PactAgent runtime black-box acceptance (live)", ()
     server = await startServer({
       PACTAGENT_RUNTIME_API_TOKEN: token,
       PACTAGENT_LIVE_STATE_DIRECTORY: stateDir,
+      PACTAGENT_RUNTIME_MODE: "local",
     });
 
     const started = await api(server.baseUrl, token, "/api/transactions", {
@@ -241,7 +246,7 @@ describe.skipIf(!liveConfig)("PactAgent runtime black-box acceptance (live)", ()
         "content-type": "application/json",
         "idempotency-key": `${idempotencyKey}-invalid`,
       },
-      body: JSON.stringify({ privateDocument: documentMarker, rawCashuToken: liveConfig?.fundingToken }),
+      body: JSON.stringify({ privateDocument: documentMarker, rawCashuToken: liveEconomicConfig?.fundingToken }),
     });
     expect(validation.status).toBe(400);
     const metrics = await capturePublicSurface(server.baseUrl, "/api/metrics");
@@ -264,6 +269,7 @@ describe.skipIf(!liveConfig)("PactAgent runtime black-box acceptance (live)", ()
     server = await startServer({
       PACTAGENT_RUNTIME_API_TOKEN: token,
       PACTAGENT_LIVE_STATE_DIRECTORY: stateDir,
+      PACTAGENT_RUNTIME_MODE: "local",
     });
 
     const status = await api(server.baseUrl, token, `/api/transactions/${transactionId}`);
@@ -288,12 +294,12 @@ describe.skipIf(!liveConfig)("PactAgent runtime black-box acceptance (live)", ()
       token,
       ...privateStoreMarkers,
       liveConfig?.requesterPrivateKeyHex,
-      liveConfig?.providerPrivateKeyHex,
+      "providerPrivateKeyHex" in (liveConfig ?? {}) ? (liveConfig as { providerPrivateKeyHex?: string }).providerPrivateKeyHex : undefined,
       liveConfig?.escrowAuthorityPrivateKeyHex,
-      liveConfig?.normalSpendKeyHex,
-      liveConfig?.refundSpendKeyHex,
-      liveConfig?.fundingToken,
-      liveConfig?.fundingReference,
+      liveEconomicConfig?.normalSpendKeyHex,
+      liveEconomicConfig?.refundSpendKeyHex,
+      liveEconomicConfig?.fundingToken,
+      liveEconomicConfig?.fundingReference,
     ].filter((value): value is string => typeof value === "string" && value.length > 0);
     for (const body of collectedBodies) {
       expect(findForbiddenPublicMaterial(JSON.parse(body))).toBeUndefined();

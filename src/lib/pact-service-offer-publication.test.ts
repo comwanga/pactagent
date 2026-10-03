@@ -63,6 +63,7 @@ class MemoryNostrRelay implements NostrRelayAdapter {
   lastOptions: NostrRelayPublishOptions | undefined;
 
   async connect(): Promise<void> {}
+  async reconnect(): Promise<void> {}
   async disconnect(): Promise<void> {}
 
   async publish(event: SignedNostrEvent, options?: NostrRelayPublishOptions): Promise<void> {
@@ -173,6 +174,7 @@ describe("PactAgent service-offer publication", () => {
       const timeoutRelay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {
           throw Object.assign(new Error("timeout"), { code: "publish_timeout" });
@@ -192,6 +194,7 @@ describe("PactAgent service-offer publication", () => {
       const failRelay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {
           throw Object.assign(new Error("rejected"), { code: "publish_rejected" });
@@ -301,6 +304,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -346,6 +350,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -363,6 +368,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -381,6 +387,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -397,6 +404,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {
@@ -413,6 +421,7 @@ describe("PactAgent service-offer publication", () => {
       const relay: NostrRelayAdapter = {
         url: "wss://relay.example",
         async connect() {},
+        async reconnect() {},
         async disconnect() {},
         async publish() {},
         async queryEvents() {

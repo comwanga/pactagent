@@ -103,6 +103,9 @@ export class MemoryRelay implements NostrRelayAdapter {
   async connect(): Promise<void> {
     this.connectCalls += 1;
   }
+  async reconnect(): Promise<void> {
+    this.connectCalls += 1;
+  }
   async disconnect(): Promise<void> {
     this.disconnectCalls += 1;
   }
@@ -346,6 +349,7 @@ export function buildRuntimeConfig(
     references: fixture.references,
     selectedReferences: fixture.selectedReferences,
     requesterDecisionSource: options.requesterDecisionSource ?? "deterministic",
+    economicMode: "demo",
     resolveFunding: async (reference) => {
       if (reference !== "funding-reference-0001") throw new Error("Unknown funding reference");
       return privateFunding();

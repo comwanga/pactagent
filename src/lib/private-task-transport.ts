@@ -69,6 +69,42 @@ export const PRIVATE_TASK_RELAY_TIMEOUT_MS = 10_000;
 export const PRIVATE_TASK_GIFT_WRAP_PAGE_SIZE = 50;
 export const PRIVATE_TASK_GIFT_WRAP_MAX_PAGES = 20;
 
+/*
+ * Strfry 1.1.3 enforces two distinct finite limits:
+ *
+ * - events.maxEventSize applies to normalized event JSON;
+ * - relay.maxWebsocketPayloadSize applies to the complete WebSocket message.
+ *
+ * The local relay reserves 256 bytes above the normalized-event limit for the
+ * `["EVENT", event]` JSON envelope. PactAgent measures both representations
+ * before funding, so neither limit is inferred from the other.
+ */
+export const MAX_NOSTR_NORMALIZED_EVENT_BYTES = 1_048_576;
+export const MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES = 1_048_832;
+
+export interface NostrEventTransportSize {
+  readonly normalizedEventBytes: number;
+  readonly websocketPayloadBytes: number;
+}
+
+export function measureNostrEventTransportSize(event: SignedNostrEvent): NostrEventTransportSize {
+  return Object.freeze({
+    normalizedEventBytes: Buffer.byteLength(JSON.stringify(event)),
+    websocketPayloadBytes: Buffer.byteLength(JSON.stringify(["EVENT", event])),
+  });
+}
+
+export type NostrEventTransportLimitViolation = "normalized_event" | "websocket_payload";
+
+export function nostrEventTransportLimitViolation(
+  event: SignedNostrEvent,
+): NostrEventTransportLimitViolation | undefined {
+  const size = measureNostrEventTransportSize(event);
+  if (size.websocketPayloadBytes > MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES) return "websocket_payload";
+  if (size.normalizedEventBytes > MAX_NOSTR_NORMALIZED_EVENT_BYTES) return "normalized_event";
+  return undefined;
+}
+
 export type PrivateTaskPublicationErrorCode =
   | "signing_failure"
   | "publication_failure"

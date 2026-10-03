@@ -7,18 +7,26 @@ const root = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
   resolve: {
-    alias: { "@": resolve(root, "src") },
+    alias: {
+      "@": resolve(root, "src"),
+      "server-only": resolve(root, "src/test/server-only.ts"),
+    },
   },
   test: {
     fileParallelism: false,
     maxWorkers: 1,
     projects: [
       {
-        resolve: { alias: { "@": resolve(root, "src") } },
+        resolve: {
+          alias: {
+            "@": resolve(root, "src"),
+            "server-only": resolve(root, "src/test/server-only.ts"),
+          },
+        },
         test: {
           name: "deterministic",
           environment: "node",
-          include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
+          include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.mjs"],
           exclude: [
             "src/**/*.live.test.ts",
             "src/**/*.blackbox.test.ts",
@@ -28,13 +36,19 @@ export default defineConfig({
             "src/lib/pactagent-runtime-api.test.ts",
             "src/lib/pactagent-runtime.test.ts",
             "src/lib/pactagent-workflow.test.ts",
+            "src/lib/recovery-remediation.test.ts",
           ],
-          testTimeout: 20_000,
+          testTimeout: 30_000,
           pool: "forks",
         },
       },
       {
-        resolve: { alias: { "@": resolve(root, "src") } },
+        resolve: {
+          alias: {
+            "@": resolve(root, "src"),
+            "server-only": resolve(root, "src/test/server-only.ts"),
+          },
+        },
         test: {
           name: "long-deterministic",
           environment: "node",
@@ -43,6 +57,7 @@ export default defineConfig({
             "src/lib/pactagent-runtime-api.test.ts",
             "src/lib/pactagent-runtime.test.ts",
             "src/lib/pactagent-workflow.test.ts",
+            "src/lib/recovery-remediation.test.ts",
           ],
           testTimeout: 20_000,
           pool: "vmThreads",

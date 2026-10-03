@@ -19,8 +19,8 @@ import {
 import { parseCashuEscrowDescriptorEvent } from "../domain/pontmore-escrow";
 import {
   CashuTestMintError,
+  canonicalizeCashuMintUrl,
   isPrivateCashuSpendingKey,
-  normalizeCashuTestMintUrl,
   type CashuMutationResult,
   type CashuOperationSucceeded,
   type CashuP2PKSpendingCondition,
@@ -834,7 +834,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
   private readonly mintUrl: string;
 
   constructor(private readonly dependencies: PactCashuEscrowSettlementCoordinatorDependencies) {
-    this.mintUrl = normalizeCashuTestMintUrl(dependencies.mintUrl);
+    this.mintUrl = canonicalizeCashuMintUrl(dependencies.mintUrl);
     if (
       !isPrivateCashuSpendingKey(dependencies.normalSpendKey) ||
       !isPrivateCashuSpendingKey(dependencies.refundSpendKey) ||
