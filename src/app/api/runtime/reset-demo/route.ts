@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { logRuntimeApiError } from "../support";
+
 import {
   apiStatusForError,
   getPactAgentRuntime,
@@ -42,6 +44,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     const result = await runtime.resetDemoWallet(parsed.walletKey, parsed.idempotencyKey);
     return NextResponse.json({ ok: true, generation: result.generation }, { headers: NO_STORE });
   } catch (error) {
+    logRuntimeApiError("reset-demo", error);
     return NextResponse.json(toApiError(error), { status: apiStatusForError(error), headers: NO_STORE });
   }
 }

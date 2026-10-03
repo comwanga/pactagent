@@ -108,6 +108,13 @@ export function requesterOwnsTransaction(request: Request, transactionId: string
 
 export function unavailableRequester(error: unknown): NextResponse {
   const status = error instanceof RequesterTransportConfigurationError ? 503 : 500;
+  // Server-side operator log only; responses remain redacted. Error messages
+  // produced by the runtime are sanitized by design (no keys, proofs, or
+  // private task material).
+  console.error(
+    "requester transport failure:",
+    error instanceof Error ? error.message : String(error),
+  );
   return requesterJson(
     { error: "The transaction service is unavailable", code: "runtime_unavailable" } satisfies RequesterApiErrorDto,
     { status },

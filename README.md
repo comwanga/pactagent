@@ -51,6 +51,28 @@ exact 350-sat service offer and demonstrates:
 Testnut is test infrastructure and bearer test ecash is still single-use. It is not a production
 mint or production-money environment.
 
+## Live Demo deployment
+
+A production-like Demo environment runs publicly on Railway
+([Issue #39 deployment docs](docs/issue-39-railway-deployment.md)):
+
+- Public PactAgent Demo: `https://pactagent-web-production.up.railway.app`
+- Public relay (WSS): `wss://pactagent-relay-production.up.railway.app`
+
+Demo sats have no monetary value. Open the public URL and click **Start Demo**
+for the zero-setup judge flow. Read-only production checks:
+
+```sh
+npm run railway:doctor
+```
+
+and the full public acceptance:
+
+```sh
+npm run railway:acceptance
+```
+
+
 ## Architecture
 
 ```text
@@ -224,6 +246,7 @@ local-model hosting, and production credential management remain out of scope.
 - [Cashu escrow settlement](docs/cashu-escrow-settlement.md)
 - [PIP-01 Cashu descriptor](docs/pip01-cashu-descriptor.md)
 - [Private task/result transport boundaries](docs/pactagent-workflow.md#publicprivate-data-boundaries)
+- [Railway deployment](docs/issue-39-railway-deployment.md)
 
 ## Collaboration
 

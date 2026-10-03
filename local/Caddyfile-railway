@@ -1,0 +1,28 @@
+# Railway WSS edge Caddyfile (Issue #39).
+#
+# The Railway platform edge terminates trusted public TLS for the generated
+# relay domain and forwards HTTP/HTTPS to this container's PORT. Caddy does
+# NOT run automatic HTTPS here (no self-signed CA, no cert duplication).
+# Browsers and Node clients get a trusted certificate from the platform edge.
+#
+# WebSocket upgrades are preserved by reverse_proxy so wss:// works end to
+# end. Strfry is reached over Railway private networking and is never
+# directly exposed to the public internet.
+
+{
+    auto_https off
+    admin off
+}
+
+:{$PORT} {
+    reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM} {
+        # Preserve WebSocket upgrade headers and original host.
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Health endpoint that does not touch economic state.
+    handle /health {
+        respond "ok" 200
+    }
+}

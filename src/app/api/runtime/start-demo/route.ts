@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { logRuntimeApiError } from "../support";
+
 import {
   apiStatusForError,
   getPactAgentRuntime,
@@ -39,6 +41,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       { headers: NO_STORE },
     );
   } catch (error) {
+    logRuntimeApiError("start-demo", error);
     return NextResponse.json(toApiError(error), {
       status: apiStatusForError(error),
       headers: NO_STORE,

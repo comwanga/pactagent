@@ -38,6 +38,8 @@
     "test:hosted-protocol:live": "vitest run --configLoader runner --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-provider-service.live.test.ts src/lib/strfry-size-boundary.live.test.ts",
     "test:hosted-e2e:live": "vitest run --configLoader runner --config vitest.live.config.ts --maxWorkers=1 src/lib/hosted-protocol-full-e2e.live.test.ts",
     "hosted:doctor": "node --import tsx scripts/hosted-doctor.mjs",
+    "railway:doctor": "node --import tsx scripts/railway-doctor.mjs",
+    "railway:acceptance": "node scripts/run-railway-acceptance.mjs",
     "provider:start": "node --conditions=react-server --import tsx scripts/provider-start.mjs",
     "test:local:testnut": "node scripts/run-with-local-ca.mjs scripts/test-local-testnut.mjs",
     "requester:model:doctor": "vitest run --config vitest.model.config.ts --configLoader runner --maxWorkers=1",
@@ -69,6 +71,7 @@
     "eslint": "9.39.5",
     "eslint-config-next": "16.3.8",
     "jsdom": "^30.1.1",
+    "railway": "^3.12.0",
     "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "vitest": "3.2.7"

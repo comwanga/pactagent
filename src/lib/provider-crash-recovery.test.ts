@@ -603,4 +603,42 @@ describe("F38-03/F38-04 provider crash recovery (service-level)", () => {
 
     store.close();
   }, 30_000);
+
+  it("Issue #39: inclusive-since relay polls do not re-process the newest agreement root forever", async () => {
+    const relay = new InMemoryRelay();
+    relay.addEvent(fixture.references.requesterDefinition);
+    relay.addEvent(fixture.references.providerDefinition);
+    relay.addEvent(fixture.references.escrowDescriptor);
+
+    const now = Math.floor(Date.now() / 1000);
+    const rootEvent = createAgreementRoot(fixture, now);
+    relay.addEvent(rootEvent);
+
+    const { store } = createStore();
+    const readCalls = new Map<string, number>();
+    const countingStore = new Proxy(store, {
+      get(target, property) {
+        if (property === "read") {
+          return async (key: string) => {
+            readCalls.set(key, (readCalls.get(key) ?? 0) + 1);
+            return target.read(key);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    const service = createService(fixture, countingStore, relay);
+    await service.start();
+    // Several poll cycles (500ms interval) — the inclusive `since` filter
+    // keeps returning the newest root on every poll.
+    await new Promise((r) => setTimeout(r, 3_000));
+    await service.stop();
+
+    // The root must be processed (read) exactly once despite repeated polls.
+    expect(readCalls.get(rootEvent.id)).toBe(1);
+
+    store.close();
+  }, 30_000);
 });

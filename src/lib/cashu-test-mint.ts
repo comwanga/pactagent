@@ -109,6 +109,14 @@ export interface CashuTestMintConfiguration {
    * for explicit loopback endpoints. See {@link CashuMintTransportPolicy}.
    */
   readonly transportPolicy?: CashuMintTransportPolicy;
+  /**
+   * Explicit private-network hosts allowed for HTTP under the demo transport
+   * policy (Issue #39). Only DNS names are accepted (no IPs, no wildcards).
+   * The demo policy still accepts HTTP loopback and HTTPS regardless of this
+   * list, and the live policy ignores it entirely. Redirects are rejected at
+   * the fetch layer independent of this allowlist.
+   */
+  readonly allowedDemoPrivateHosts?: readonly string[];
 }
 
 export interface NormalizedCashuTestMintConfiguration {
@@ -118,6 +126,7 @@ export interface NormalizedCashuTestMintConfiguration {
   readonly requestTimeoutMs: number;
   readonly maximumResponseBytes: number;
   readonly transportPolicy: CashuMintTransportPolicy;
+  readonly allowedDemoPrivateHosts: readonly string[];
 }
 
 function positiveBoundedInteger(value: number, label: string): number {
@@ -146,11 +155,51 @@ export type CashuMintTransportPolicy = "live-https" | "demo-loopback";
 
 const DEMO_LOOPBACK_HOSTS = Object.freeze(new Set(["127.0.0.1", "localhost", "[::1]"]));
 
-function transportPolicyAllows(url: URL, policy: CashuMintTransportPolicy): boolean {
+const DEMO_PRIVATE_HOST_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/u;
+const DEMO_PRIVATE_HOST_IPV4_PATTERN = /^[0-9]+(\.[0-9]+){3}$/u;
+const DEMO_PRIVATE_HOST_MAXIMUM_COUNT = 8;
+
+export function normalizeDemoPrivateHostAllowlist(
+  entries: readonly string[] | undefined,
+): readonly string[] {
+  if (entries === undefined || entries.length === 0) return Object.freeze([]);
+  if (entries.length > DEMO_PRIVATE_HOST_MAXIMUM_COUNT) {
+    cashuError(
+      "invalid_mint_configuration",
+      `Demo mint private host allowlist supports at most ${DEMO_PRIVATE_HOST_MAXIMUM_COUNT} hosts`,
+    );
+  }
+  const normalized: string[] = [];
+  for (const entry of entries) {
+    const host = entry.trim().toLowerCase();
+    if (
+      host.length === 0 ||
+      host.length > 253 ||
+      host.includes(":") ||
+      DEMO_PRIVATE_HOST_IPV4_PATTERN.test(host) ||
+      !DEMO_PRIVATE_HOST_PATTERN.test(host)
+    ) {
+      cashuError(
+        "invalid_mint_configuration",
+        "Demo mint private host allowlist entries must be plain DNS names " +
+          "(lowercase letters, digits, hyphens, at least one dot; no IPs, no wildcards, no ports)",
+      );
+    }
+    if (!normalized.includes(host)) normalized.push(host);
+  }
+  return Object.freeze(normalized);
+}
+
+function transportPolicyAllows(
+  url: URL,
+  policy: CashuMintTransportPolicy,
+  allowedDemoPrivateHosts: readonly string[],
+): boolean {
   if (policy === "live-https") return url.protocol === "https:";
   return (
     url.protocol === "https:" ||
-    (url.protocol === "http:" && DEMO_LOOPBACK_HOSTS.has(url.hostname))
+    (url.protocol === "http:" &&
+      (DEMO_LOOPBACK_HOSTS.has(url.hostname) || allowedDemoPrivateHosts.includes(url.hostname)))
   );
 }
 
@@ -177,7 +226,11 @@ export function canonicalizeCashuMintUrl(value: string): string {
   return url.toString().replace(/\/$/, "");
 }
 
-export function normalizeCashuMintUrl(value: string, policy: CashuMintTransportPolicy): string {
+export function normalizeCashuMintUrl(
+  value: string,
+  policy: CashuMintTransportPolicy,
+  allowedDemoPrivateHosts: readonly string[] = Object.freeze([]),
+): string {
   const canonical = canonicalizeCashuMintUrl(value);
   let url: URL;
   try {
@@ -185,8 +238,11 @@ export function normalizeCashuMintUrl(value: string, policy: CashuMintTransportP
   } catch {
     cashuError("invalid_mint_configuration", "Cashu test mint URL is invalid");
   }
+  // Validate the allowlist on every entry path so invalid entries can never
+  // silently broaden the demo transport policy.
+  const normalizedAllowedHosts = normalizeDemoPrivateHostAllowlist(allowedDemoPrivateHosts);
   if (policy === "live-https") {
-    if (!transportPolicyAllows(url, policy)) {
+    if (!transportPolicyAllows(url, policy, normalizedAllowedHosts)) {
       cashuError(
         "invalid_mint_configuration",
         "Cashu test mint URL must be an HTTPS URL for live economic mode",
@@ -194,13 +250,15 @@ export function normalizeCashuMintUrl(value: string, policy: CashuMintTransportP
     }
     return canonical;
   }
-  // demo-loopback: HTTPS always accepted; HTTP only for explicit loopback hosts.
-  if (transportPolicyAllows(url, policy)) {
+  // demo-loopback: HTTPS always accepted; HTTP only for explicit loopback
+  // hosts or explicitly allowlisted private-network hosts.
+  if (transportPolicyAllows(url, policy, normalizedAllowedHosts)) {
     return canonical;
   }
   cashuError(
     "invalid_mint_configuration",
-    "Demo Cashu mint URL must be HTTPS, or HTTP only for loopback (127.0.0.1, localhost, ::1)",
+    "Demo Cashu mint URL must be HTTPS, HTTP for loopback (127.0.0.1, localhost, ::1), " +
+      "or HTTP for an explicitly allowlisted private-network host",
   );
 }
 
@@ -235,8 +293,9 @@ export function normalizeCashuTestMintConfiguration(
     cashuError("invalid_mint_configuration", "Cashu test mint exposure cap must be positive");
   }
   const transportPolicy: CashuMintTransportPolicy = input.transportPolicy ?? "live-https";
+  const allowedDemoPrivateHosts = normalizeDemoPrivateHostAllowlist(input.allowedDemoPrivateHosts);
   return Object.freeze({
-    testMintUrl: normalizeCashuMintUrl(input.testMintUrl, transportPolicy),
+    testMintUrl: normalizeCashuMintUrl(input.testMintUrl, transportPolicy, allowedDemoPrivateHosts),
     unit: CASHU_TEST_MINT_UNIT,
     maximumExposureSats: input.maximumExposureSats,
     requestTimeoutMs: positiveBoundedInteger(
@@ -248,6 +307,7 @@ export function normalizeCashuTestMintConfiguration(
       "Cashu maximum response size",
     ),
     transportPolicy,
+    allowedDemoPrivateHosts,
   });
 }
 
@@ -1653,7 +1713,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       if (error instanceof CashuPrivateBackendError) throw mapBackendError(error);
       cashuError("mint_unavailable", "Cashu test mint capability inspection failed");
     }
-    if (normalizeCashuMintUrl(snapshot.mintUrl, this.configuration.transportPolicy) !== this.configuration.testMintUrl) {
+    if (normalizeCashuMintUrl(snapshot.mintUrl, this.configuration.transportPolicy, this.configuration.allowedDemoPrivateHosts) !== this.configuration.testMintUrl) {
       cashuError(
         "invalid_mint_configuration",
         "Cashu capability response does not match the configured test mint",
@@ -2570,13 +2630,14 @@ function endpointBelongsToMint(
   endpoint: string,
   mintUrl: string,
   policy: CashuMintTransportPolicy,
+  allowedDemoPrivateHosts: readonly string[],
 ): boolean {
   try {
     const endpointUrl = new URL(endpoint);
     const configured = new URL(mintUrl);
     const basePath = configured.pathname.replace(/\/$/, "");
     return (
-      transportPolicyAllows(endpointUrl, policy) &&
+      transportPolicyAllows(endpointUrl, policy, allowedDemoPrivateHosts) &&
       endpointUrl.origin === configured.origin &&
       (basePath === "" ||
         endpointUrl.pathname === basePath ||
@@ -2615,7 +2676,7 @@ function createBoundedCashuRequest(
   configuration: NormalizedCashuTestMintConfiguration,
 ): RequestFn {
   return async <T>(options: RequestOptions): Promise<T> => {
-    if (!endpointBelongsToMint(options.endpoint, configuration.testMintUrl, configuration.transportPolicy)) {
+    if (!endpointBelongsToMint(options.endpoint, configuration.testMintUrl, configuration.transportPolicy, configuration.allowedDemoPrivateHosts)) {
       throw new BoundedCashuRequestError("rejected");
     }
     const controller = new AbortController();
