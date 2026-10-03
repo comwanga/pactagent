@@ -16,6 +16,7 @@ import {
   createSqliteCashuPrivateStore,
   isPrivateCashuSpendingKey,
   normalizeCashuMintUrl,
+  normalizeDemoPrivateHostAllowlist,
   readCashuPrivateValueProofs,
   type CashuMintTransportPolicy,
   type CashuPrivateStore,
@@ -182,6 +183,7 @@ export interface EconomicEnvironment {
 export interface CreateEconomicEnvironmentInput {
   readonly mode: EconomicMode;
   readonly mintUrl: string;
+  readonly allowedDemoPrivateHosts?: readonly string[];
   readonly cashu: CashuTestMintPort;
   readonly privateDelivery: CashuPrivateValueDeliveryPort;
   readonly privateStore: CashuPrivateStore;
@@ -227,7 +229,7 @@ export function createEconomicEnvironment(
 ): EconomicEnvironment {
   const mode = parseEconomicMode(input.mode);
   const transportPolicy: CashuMintTransportPolicy = mode === "demo" ? "demo-loopback" : "live-https";
-  const mintUrl = normalizeCashuMintUrl(input.mintUrl, transportPolicy);
+  const mintUrl = normalizeCashuMintUrl(input.mintUrl, transportPolicy, input.allowedDemoPrivateHosts);
   if (
     !isPrivateCashuSpendingKey(input.normalSpendKey) ||
     !isPrivateCashuSpendingKey(input.refundSpendKey) ||
@@ -514,6 +516,13 @@ export interface DemoEconomicEnvironmentConfig {
    * is superseded by this per-session allocation.
    */
   readonly initialBalanceSats?: number;
+  /**
+   * Explicit private-network DNS hosts allowed for HTTP demo mint transport
+   * (Issue #39 Railway deployment). Only DNS names (no IPs, no wildcards).
+   * HTTPS and HTTP loopback remain allowed without listing. The live economic
+   * policy is never affected by this list.
+   */
+  readonly allowedPrivateHosts?: readonly string[];
 }
 
 /**
@@ -843,7 +852,8 @@ export async function createDemoEconomicEnvironment(
   config: DemoEconomicEnvironmentConfig,
   factories?: LiveEconomicEnvironmentFactories,
 ): Promise<EconomicEnvironment> {
-  const mintUrl = normalizeCashuMintUrl(config.mintUrl, "demo-loopback");
+  const allowedPrivateHosts = normalizeDemoPrivateHostAllowlist(config.allowedPrivateHosts);
+  const mintUrl = normalizeCashuMintUrl(config.mintUrl, "demo-loopback", allowedPrivateHosts);
   const stateDirectory = resolve(config.stateDirectory);
   const initialBalanceSats = config.initialBalanceSats ?? 1000;
 
@@ -865,6 +875,7 @@ export async function createDemoEconomicEnvironment(
     requestTimeoutMs: 10_000,
     maximumResponseBytes: 500_000,
     transportPolicy: "demo-loopback",
+    allowedDemoPrivateHosts: allowedPrivateHosts,
   };
 
   const createPrivateStore = factories?.createPrivateStore ?? ((dbPath: string) =>
@@ -884,6 +895,7 @@ export async function createDemoEconomicEnvironment(
         requestTimeoutMs: 10_000,
         maximumResponseBytes: 500_000,
         transportPolicy: cfg.transportPolicy,
+        allowedDemoPrivateHosts: allowedPrivateHosts,
       },
       privateStore: cfg.privateStore,
     }));
@@ -913,6 +925,7 @@ export async function createDemoEconomicEnvironment(
         unit: "sat",
         maximumExposureSats: sats(BigInt(initialBalanceSats)),
         transportPolicy: "demo-loopback",
+        allowedDemoPrivateHosts: allowedPrivateHosts,
       },
       privateStore,
     });
@@ -1454,6 +1467,7 @@ export async function createDemoEconomicEnvironment(
     return createEconomicEnvironment({
       mode: "demo",
       mintUrl,
+      allowedDemoPrivateHosts: allowedPrivateHosts,
       cashu,
       privateDelivery,
       privateStore,

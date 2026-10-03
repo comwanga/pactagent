@@ -134,6 +134,12 @@ export function readDemoEconomicConfigFromEnv(
   }
   const initialBalanceSatsRaw = environment.PACTAGENT_DEMO_WALLET_INITIAL_BALANCE_SATS;
   const initialBalanceSats = initialBalanceSatsRaw ? Number(initialBalanceSatsRaw) : undefined;
+  // Issue #39: explicit private-network demo mint hosts (Railway). DNS names
+  // only; invalid entries fail closed inside the transport normalizer.
+  const allowedPrivateHostsRaw = environment.PACTAGENT_DEMO_MINT_PRIVATE_HOSTS?.trim();
+  const allowedPrivateHosts = allowedPrivateHostsRaw
+    ? allowedPrivateHostsRaw.split(",").map((entry) => entry.trim()).filter((entry) => entry.length > 0)
+    : undefined;
   return Object.freeze({
     mintUrl,
     stateDirectory,
@@ -141,6 +147,9 @@ export function readDemoEconomicConfigFromEnv(
     refundSpendKeyHex,
     fundingReference,
     ...(initialBalanceSats === undefined ? {} : { initialBalanceSats }),
+    ...(allowedPrivateHosts === undefined || allowedPrivateHosts.length === 0
+      ? {}
+      : { allowedPrivateHosts: Object.freeze(allowedPrivateHosts) }),
   });
 }
 

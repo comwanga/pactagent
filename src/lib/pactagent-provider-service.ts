@@ -223,6 +223,13 @@ export class PactAgentProviderService {
   #lastPollTimestamp = 0;
   // F38-06C: Track poll failures so protocolReady reflects real state.
   #pollFailing = false;
+  // Issue #39: Strfry's `since` filter is INCLUSIVE, so the newest agreement
+  // root is re-returned on every poll. Track processed root event ids so the
+  // same root is not re-recovered (and re-logged) forever. The durable
+  // idempotency store remains the authoritative dedup across restarts; this
+  // set only bounds the poll loop. Capped to stay bounded in memory.
+  #processedRootEventIds = new Set<string>();
+  static readonly #PROCESSED_ROOT_ID_CAP = 500;
 
   constructor(config: PactAgentProviderServiceConfig) {
     if (config.offerAmountSats <= 0n) {
@@ -482,6 +489,11 @@ export class PactAgentProviderService {
     let latestTimestamp = this.#lastPollTimestamp;
     for (const event of events) {
       if (this.#stopping) break;
+      // Issue #39: skip roots already processed in this process lifetime.
+      // Strfry re-returns the newest root when the inclusive `since` filter
+      // matches; without this skip the provider would re-run recovery for
+      // that root on every poll indefinitely.
+      if (this.#processedRootEventIds.has(event.id)) continue;
       try {
         const parsed = parseSignedNostrEvent(event);
         verifySignedNostrEvent(parsed);
@@ -494,8 +506,17 @@ export class PactAgentProviderService {
           error: errMsg.slice(0, 200),
         });
       }
+      this.#rememberProcessedRoot(event.id);
     }
     this.#lastPollTimestamp = latestTimestamp;
+  }
+
+  #rememberProcessedRoot(eventId: string): void {
+    if (this.#processedRootEventIds.size >= PactAgentProviderService.#PROCESSED_ROOT_ID_CAP) {
+      const oldest = this.#processedRootEventIds.values().next();
+      if (!oldest.done) this.#processedRootEventIds.delete(oldest.value);
+    }
+    this.#processedRootEventIds.add(eventId);
   }
 
   async #processAgreementRoot(rootEvent: SignedNostrEvent): Promise<void> {

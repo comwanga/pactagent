@@ -26,6 +26,7 @@ import {
   normalizeCashuTestMintConfiguration,
   normalizeCashuPrivateProofState,
   normalizeCashuTestMintUrl,
+  normalizeDemoPrivateHostAllowlist,
   serializeCashuRequestBody,
   type CashuPrivateStore,
   type CashuTestMintPort,
@@ -236,6 +237,86 @@ describe("Cashu test-mint configuration and capabilities", () => {
           privateStore: createInMemoryCashuPrivateStore(),
         }),
       ).toThrowError(CashuTestMintError);
+    });
+
+    // Issue #39: explicit private-network demo mint hosts (Railway).
+    it("demo-loopback accepts an explicitly allowlisted private-network HTTP host", () => {
+      expect(
+        normalizeCashuMintUrl(
+          "http://pactagent-demo-mint.railway.internal:3338",
+          "demo-loopback",
+          Object.freeze(["pactagent-demo-mint.railway.internal"]),
+        ),
+      ).toBe("http://pactagent-demo-mint.railway.internal:3338");
+    });
+
+    it("demo-loopback rejects an HTTP host that is not allowlisted", () => {
+      expect(() =>
+        normalizeCashuMintUrl(
+          "http://other-service.railway.internal:3338",
+          "demo-loopback",
+          Object.freeze(["pactagent-demo-mint.railway.internal"]),
+        ),
+      ).toThrowError(CashuTestMintError);
+    });
+
+    it("demo-loopback allowlist matching is exact (no suffix or partial matches)", () => {
+      expect(() =>
+        normalizeCashuMintUrl(
+          "http://evil-pactagent-demo-mint.railway.internal:3338",
+          "demo-loopback",
+          Object.freeze(["pactagent-demo-mint.railway.internal"]),
+        ),
+      ).toThrowError(CashuTestMintError);
+    });
+
+    it("demo-loopback allowlist rejects IP addresses", () => {
+      expect(() =>
+        normalizeCashuMintUrl(
+          "http://10.0.0.1:3338",
+          "demo-loopback",
+          Object.freeze(["10.0.0.1"]),
+        ),
+      ).toThrowError(CashuTestMintError);
+    });
+
+    it("normalizeDemoPrivateHostAllowlist rejects invalid entries and normalizes valid ones", () => {
+      expect(
+        normalizeDemoPrivateHostAllowlist([" PactAgent-Demo-Mint.Railway.Internal "]),
+      ).toEqual(["pactagent-demo-mint.railway.internal"]);
+      for (const invalid of ["10.0.0.1", "*.railway.internal", "host", "mint", "no-dots", "with space", ""]) {
+        expect(() => normalizeDemoPrivateHostAllowlist([invalid])).toThrowError(CashuTestMintError);
+      }
+      expect(normalizeDemoPrivateHostAllowlist(undefined)).toEqual([]);
+      expect(() =>
+        normalizeDemoPrivateHostAllowlist(Array.from({ length: 9 }, (_, index) => `host-${index}.railway.internal`)),
+      ).toThrowError(CashuTestMintError);
+    });
+
+    it("live-https ignores the private-host allowlist entirely", () => {
+      expect(() =>
+        normalizeCashuMintUrl(
+          "http://pactagent-demo-mint.railway.internal:3338",
+          "live-https",
+          Object.freeze(["pactagent-demo-mint.railway.internal"]),
+        ),
+      ).toThrowError(CashuTestMintError);
+      expect(normalizeCashuMintUrl("https://mint.example", "live-https", Object.freeze(["mint.example"])))
+        .toBe("https://mint.example");
+    });
+
+    it("the adapter accepts an allowlisted private-network demo mint URL", () => {
+      const adapter = createCashuTestMintAdapter({
+        configuration: {
+          testMintUrl: "http://pactagent-demo-mint.railway.internal:3338",
+          unit: "sat",
+          maximumExposureSats: sats(400n),
+          transportPolicy: "demo-loopback",
+          allowedDemoPrivateHosts: Object.freeze(["pactagent-demo-mint.railway.internal"]),
+        },
+        privateStore: createInMemoryCashuPrivateStore(),
+      });
+      expect(adapter).toBeDefined();
     });
   });
 
