@@ -89,6 +89,23 @@ function relayRequest(relayUrl, send) {
   });
 }
 
+/**
+ * Parse a relay WebSocket frame into [type, subscriptionId, payload].
+ * Returns undefined when the frame is not a well-formed array. This shape
+ * validation runs BEFORE any processing so downstream handling never depends
+ * on truthiness of relay-controlled values.
+ */
+function parseRelayFrame(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || parsed.length < 2) return undefined;
+  return parsed;
+}
+
 function relayQueryP002(relayUrl, providerPublicKey) {
   return new Promise((resolve) => {
     const subscription = `railway-doctor-p002-${Date.now()}`;
@@ -98,6 +115,25 @@ function relayQueryP002(relayUrl, providerPublicKey) {
       resolve({ ok: false, reason: "timeout", found: { providers: 0, offers: 0, descriptors: 0, malformed: 0 } });
     }, 20_000);
     const found = { providers: 0, offers: 0, descriptors: 0, malformed: 0 };
+
+    const classifyProviderEvent = (rawEvent) => {
+      const event = parseSignedNostrEvent(rawEvent);
+      verifySignedNostrEvent(event);
+      if (event.pubkey !== providerPublicKey) throw new Error("provider identity mismatch");
+      if (event.kind === 30360) {
+        parsePontmoreAgentDefinitionEvent(event);
+        found.providers++;
+      } else if (event.kind === 30400) {
+        parsePactServiceOfferEvent(event);
+        found.offers++;
+      } else if (event.kind === 30361) {
+        parseCashuEscrowDescriptorEvent(event);
+        found.descriptors++;
+      } else {
+        found.malformed++;
+      }
+    };
+
     ws.addEventListener("open", () => {
       ws.send(JSON.stringify(["REQ", subscription, {
         authors: [providerPublicKey],
@@ -106,34 +142,26 @@ function relayQueryP002(relayUrl, providerPublicKey) {
       }]));
     });
     ws.addEventListener("message", (message) => {
-      let value;
-      try {
-        value = JSON.parse(String(message.data));
-        if (value[0] === "EVENT" && value[2]) {
-          const event = parseSignedNostrEvent(value[2]);
-          verifySignedNostrEvent(event);
-          if (event.pubkey !== providerPublicKey) throw new Error("provider identity mismatch");
-          if (event.kind === 30360) {
-            parsePontmoreAgentDefinitionEvent(event);
-            found.providers++;
-          } else if (event.kind === 30400) {
-            parsePactServiceOfferEvent(event);
-            found.offers++;
-          } else if (event.kind === 30361) {
-            parseCashuEscrowDescriptorEvent(event);
-            found.descriptors++;
-          } else {
-            found.malformed++;
-          }
-        }
-      } catch {
-        found.malformed++;
-      }
-      if (value?.[0] === "EOSE" && value[1] === subscription) {
+      const frame = parseRelayFrame(String(message.data));
+      if (frame === undefined) return;
+      const [type, subId, payload] = frame;
+      if (subId !== subscription) return;
+      if (type === "EOSE") {
         clearTimeout(timer);
         ws.close();
         const ok = found.providers > 0 && found.offers > 0 && found.descriptors > 0 && found.malformed === 0;
         resolve({ ok, reason: ok ? "" : "artifacts missing or malformed", found });
+        return;
+      }
+      if (type !== "EVENT") return;
+      if (payload === null || payload === undefined || typeof payload !== "object" || Array.isArray(payload)) {
+        found.malformed++;
+        return;
+      }
+      try {
+        classifyProviderEvent(payload);
+      } catch {
+        found.malformed++;
       }
     });
     ws.addEventListener("error", () => {
