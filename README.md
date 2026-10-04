@@ -6,6 +6,8 @@ PactAgent is an open-source framework for bounded economic agents that discover 
 Nostr, form service agreements, exchange private work, and settle using Cashu. It builds on open
 protocols and Pontmore concepts; PactAgent is not itself the Pontmore protocol.
 
+<img width="1877" height="880" alt="image" src="https://github.com/user-attachments/assets/8d647cbf-ef6d-4a14-bbe3-ec244703c12a" />
+
 ## What PactAgent currently does
 
 The integrated runtime executes the `document-summary@1` path end to end:
