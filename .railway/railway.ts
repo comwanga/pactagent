@@ -84,9 +84,15 @@ export default defineRailway(() => {
 
   const strfry = service("pactagent-strfry", {
     build: { builder: "DOCKERFILE", dockerfilePath: "deploy/strfry.Dockerfile" },
-    start: "/app/strfry.sh",
-    healthcheck: "/",
-    healthcheckTimeout: 300,
+    deploy: {
+      startCommand: "/bin/bash /app/entrypoint.sh",
+      // The entrypoint execs Strfry as PID 1. Bound unexpected startup/runtime
+      // failures at the platform layer; normal Railway restarts are explicit.
+      restartPolicyType: "ON_FAILURE",
+      restartPolicyMaxRetries: 10,
+      healthcheckPath: "/",
+      healthcheckTimeout: 300,
+    },
     volumeMounts: { "/app/strfry-db": strfryDb },
     env: {
       PORT: "7777",
@@ -117,6 +123,10 @@ export default defineRailway(() => {
       MINT_LISTEN_PORT: "3338",
       MINT_DATABASE: "/app/data/mint",
       TOR: "FALSE",
+      // B39-03: Nutshell's startup settings dump is DEBUG-level. Keep DEBUG
+      // disabled and the effective Loguru threshold at INFO explicitly.
+      DEBUG: "FALSE",
+      LOG_LEVEL: "INFO",
       // Secret value (set on Railway, never committed):
       MINT_PRIVATE_KEY: preserve(),
     },

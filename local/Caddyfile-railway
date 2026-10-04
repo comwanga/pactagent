@@ -8,6 +8,12 @@
 # WebSocket upgrades are preserved by reverse_proxy so wss:// works end to
 # end. Strfry is reached over Railway private networking and is never
 # directly exposed to the public internet.
+#
+# B39-02: /health is UPSTREAM-AWARE readiness. It proxies to Strfry, so it
+# returns 200 only while the Caddy edge AND the Strfry relay path are both
+# operational. When Strfry is unavailable the probe returns 502, and both
+# Railway deploy gating and the production doctor observe a real failure
+# instead of a false healthy edge.
 
 {
     auto_https off
@@ -15,14 +21,21 @@
 }
 
 :{$PORT} {
-    reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM} {
-        # Preserve WebSocket upgrade headers and original host.
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
+    handle /health {
+        # Probe Strfry's own HTTP surface (its root answers 200 when the
+        # relay process is serving). Read-only — no events are published.
+        rewrite * /
+        reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM} {
+            header_up Host {host}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 
-    # Health endpoint that does not touch economic state.
-    handle /health {
-        respond "ok" 200
+    handle {
+        reverse_proxy {$PACTAGENT_STRFRY_UPSTREAM} {
+            # Preserve WebSocket upgrade headers and original host.
+            header_up Host {host}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 }
