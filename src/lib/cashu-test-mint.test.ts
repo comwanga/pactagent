@@ -1173,6 +1173,35 @@ describe("Cashu test-mint retry and reconciliation", () => {
     }
   });
 
+  it("enumerates in-memory store keys within a scope and isolates other scopes", async () => {
+    const store = createInMemoryCashuPrivateStore();
+    await store.write("transaction", "txn_a", { phase: "accepted" });
+    await store.write("transaction", "txn_b", { phase: "funded" });
+    await store.write("other-scope", "txn_c", { phase: "x" });
+    expect([...(await store.list!("transaction"))].sort()).toEqual(["txn_a", "txn_b"]);
+    expect(await store.list!("other-scope")).toEqual(["txn_c"]);
+    expect(await store.list!("empty-scope")).toEqual([]);
+  });
+
+  it("enumerates durable store keys within a scope across a reopen", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pactagent-cashu-list-"));
+    const databasePath = join(directory, "cashu-private.sqlite");
+    let store = createSqliteCashuPrivateStore(databasePath);
+    try {
+      await store.write("transaction", "txn_a", { phase: "accepted" });
+      await store.write("transaction", "txn_b", { phase: "funded" });
+      await store.write(MINT_URL, "exposure-ledger", { version: 1 });
+      store.close();
+      store = createSqliteCashuPrivateStore(databasePath);
+      expect([...(await store.list!("transaction"))].sort()).toEqual(["txn_a", "txn_b"]);
+      expect(await store.list!(MINT_URL)).toEqual(["exposure-ledger"]);
+      expect(await store.list!("empty-scope")).toEqual([]);
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("recovers by operation identity when lock ownership is lost after mint success", async () => {
     const base = createInMemoryCashuPrivateStore();
     let loseOwnership = true;

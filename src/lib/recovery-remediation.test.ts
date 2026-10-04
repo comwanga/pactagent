@@ -551,6 +551,111 @@ describe("Pre-#37 recovery remediation", () => {
     runtime.shutdown();
   });
 
+  it("reclaims an expired funded escrow by refunding it to free exposure", async () => {
+    const shared = sharedStores();
+    const relay = new GiftWrapFailingRelay();
+    relay.events.push(...fixture.referenceEvents);
+    const { runtime, clock } = buildRuntime(fixture, shared, { relay });
+
+    await runtime.start();
+    await expect(
+      runtime.startTransaction(startInput("reclaim-sweep-001")),
+    ).rejects.toMatchObject({ code: "private_transport_failed" });
+    const id = `txn_${createHash("sha256").update("reclaim-sweep-001").digest("hex").slice(0, 32)}`;
+    clock.advanceTo(ROOT_TIME + 1000);
+
+    const summary = await runtime.reclaimExpiredFundedEscrows();
+    expect(summary.reclaimed).toBe(1);
+
+    const status = await runtime.status(id);
+    expect(status.operationalState).toBe("refunded");
+    expect(status.availableActions.refund).toBe(false);
+    runtime.shutdown();
+  });
+
+  it("does not reclaim a funded escrow before its locktime has passed", async () => {
+    const shared = sharedStores();
+    const relay = new GiftWrapFailingRelay();
+    relay.events.push(...fixture.referenceEvents);
+    const { runtime, cashu } = buildRuntime(fixture, shared, { relay });
+
+    await runtime.start();
+    await expect(
+      runtime.startTransaction(startInput("reclaim-before-locktime-001")),
+    ).rejects.toMatchObject({ code: "private_transport_failed" });
+    const spendBefore = cashu.spendCalls;
+
+    const summary = await runtime.reclaimExpiredFundedEscrows();
+    expect(summary.reclaimed).toBe(0);
+    expect(cashu.spendCalls).toBe(spendBefore);
+    runtime.shutdown();
+  });
+
+  it("reclaim is idempotent and does not re-spend an already refunded escrow", async () => {
+    const shared = sharedStores();
+    const relay = new GiftWrapFailingRelay();
+    relay.events.push(...fixture.referenceEvents);
+    const { runtime, clock, cashu } = buildRuntime(fixture, shared, { relay });
+
+    await runtime.start();
+    await expect(
+      runtime.startTransaction(startInput("reclaim-idempotent-001")),
+    ).rejects.toMatchObject({ code: "private_transport_failed" });
+    clock.advanceTo(ROOT_TIME + 1000);
+
+    await runtime.reclaimExpiredFundedEscrows();
+    const spendAfterFirst = cashu.spendCalls;
+    const second = await runtime.reclaimExpiredFundedEscrows();
+    expect(second.reclaimed).toBe(0);
+    expect(cashu.spendCalls).toBe(spendAfterFirst);
+    runtime.shutdown();
+  });
+
+  it("reclaims expired funded escrows during bootstrap readiness", async () => {
+    const shared = sharedStores();
+    const relay = new GiftWrapFailingRelay();
+    relay.events.push(...fixture.referenceEvents);
+    const { runtime, clock } = buildRuntime(fixture, shared, { relay });
+
+    await runtime.start();
+    await expect(
+      runtime.startTransaction(startInput("bootstrap-reclaim-001")),
+    ).rejects.toMatchObject({ code: "private_transport_failed" });
+    const id = `txn_${createHash("sha256").update("bootstrap-reclaim-001").digest("hex").slice(0, 32)}`;
+    clock.advanceTo(ROOT_TIME + 1000);
+
+    await runtime.bootstrap();
+
+    const status = await runtime.status(id);
+    expect(status.operationalState).toBe("refunded");
+    runtime.shutdown();
+  });
+
+  it("reclaims a prior expired funded escrow before funding a newly accepted transaction", async () => {
+    const shared = sharedStores();
+    const relay = new GiftWrapFailingRelay();
+    relay.events.push(...fixture.referenceEvents);
+    const { runtime, clock } = buildRuntime(fixture, shared, { relay });
+
+    await runtime.start();
+    await expect(
+      runtime.startTransaction(startInput("accept-reclaim-prior-001")),
+    ).rejects.toMatchObject({ code: "private_transport_failed" });
+    const priorId = `txn_${createHash("sha256").update("accept-reclaim-prior-001").digest("hex").slice(0, 32)}`;
+    clock.advanceTo(ROOT_TIME + 1000);
+
+    await runtime.acceptTransaction(startInput("accept-reclaim-new-001"));
+
+    const deadline = Date.now() + 15_000;
+    let priorStatus = await runtime.status(priorId);
+    while (priorStatus.operationalState !== "refunded" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      priorStatus = await runtime.status(priorId);
+    }
+    expect(priorStatus.operationalState).toBe("refunded");
+    runtime.shutdown();
+  });
+
   it.each([
     ["refund_authorized", 0],
     ["refund_pending", 0],
