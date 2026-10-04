@@ -710,6 +710,10 @@ function validateCashuSuccess(
 
 function mapCashuFailure(error: unknown, operation: "fund" | "release" | "refund"): never {
   if (error instanceof CashuTestMintError) {
+    // Safe operational evidence only: enum values carry no bearer material or
+    // private payload. Keep the public workflow error redacted while making a
+    // Demo deployment's pre-submission failure diagnosable by operators.
+    console.error("cashu operation failed", operation, error.code, error.operationStatus);
     if (error.code === "invalid_mint_configuration" || error.code === "unsupported_unit") {
       settlementError("unsupported_mint_or_unit", "Cashu mint or unit is unsupported");
     }
