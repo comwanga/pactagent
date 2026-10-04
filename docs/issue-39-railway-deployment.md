@@ -55,7 +55,7 @@ Browser → pactagent-web (public HTTPS)
 | `pactagent-web` | Requester UI, BFF, runtime | Public HTTPS (generated domain) | 3000 | `GET /api/health` | `/data` |
 | `pactagent-provider` | Standalone P002 provider service | Private | 3939 | `GET /health` | `/data` |
 | `pactagent-strfry` | Persistent Nostr relay | Private | 7777 | `GET /` | `/app/strfry-db` |
-| `pactagent-relay` | Caddy WSS edge (platform TLS termination) | Public WSS (generated domain) | 8080 | `GET /health` | none |
+| `pactagent-relay` | Caddy WSS edge (platform TLS termination) | Public WSS (generated domain) | 8080 | `GET /health` (upstream-aware readiness) | none |
 | `pactagent-demo-mint` | Nutshell FakeWallet Demo Cashu mint | Private | 3338 | `GET /v1/info` | `/app/data` |
 
 ### Service-to-service paths (private network)
@@ -88,6 +88,15 @@ Strfry and the Demo mint have no public domains and no public DNS records.
 9. Provider idempotency/recovery state survives restarts (Railway volume).
 10. Requester sessions and Demo wallet state survive restarts (Railway volume
     under `PACTAGENT_DEMO_STATE_DIRECTORY=/data`).
+
+Strfry runs under a bounded PID 1 shutdown wrapper instead of the upstream
+process-group broadcast. The wrapper forwards an intentional Railway SIGTERM
+to the Strfry child, waits up to ten seconds for it to be fully reaped, and
+returns a controlled retryable status instead of the signal-derived status 143.
+The bounded `ON_FAILURE` policy then remounts the persistent volume once the
+old process is gone. Unexpected Strfry exits still propagate their original
+status to Railway. A normal Railway restart therefore starts the same deployment
+without requiring a redeploy.
 
 ## 4. Persistence volumes
 
@@ -167,6 +176,8 @@ Public non-secret:
 - `MINT_LISTEN_HOST`, `MINT_LISTEN_PORT`
 - `MINT_DATABASE`
 - `TOR`
+- `DEBUG` (`FALSE`)
+- `LOG_LEVEL` (`INFO`)
 
 Server secrets:
 
@@ -241,6 +252,8 @@ deployed system READ ONLY — no economic mutation:
 - public HTTPS reachability + trusted certificate (system store);
 - `GET /api/health`;
 - WSS relay `REQ/EOSE`;
+- upstream-aware relay readiness (`GET /health` fails when Strfry is not
+  serving, even if Caddy itself is alive);
 - verified P002 artifacts (provider definition, offer, escrow descriptor);
 - runtime composition (`hosted`, `externalProvider`) via the bearer surface;
 - requester surfaces session-gated.
@@ -272,8 +285,9 @@ judge flow in a real browser and then runs a relay privacy scan:
 ## 11. Restart/persistence procedure
 
 1. Record a safe relay event id.
-2. `railway redeploy --service pactagent-strfry --yes` and confirm the event
-   is still queryable.
+2. `railway restart --service pactagent-strfry --yes` and confirm public relay
+   readiness fails while Strfry is unavailable, then recovers automatically.
+   Confirm the event is still queryable; no redeploy should be required.
 3. `railway redeploy --service pactagent-provider --yes` and confirm readiness
    + artifact publication + no recovery loops.
 4. `railway redeploy --service pactagent-demo-mint --yes` and confirm
@@ -281,6 +295,17 @@ judge flow in a real browser and then runs a relay privacy scan:
 5. `railway redeploy --service pactagent-web --yes` and confirm `/api/health`,
    runtime re-initialization, session recovery, and wallet balance.
 6. Re-run the doctor.
+
+The relay `/health` contract is readiness, not Caddy-only liveness: it proxies
+a read-only HTTP probe to Strfry and becomes non-2xx whenever the upstream
+relay is unavailable. It does not publish a Nostr event or mutate economic
+state.
+
+Nutshell 0.21.0's optional DEBUG settings dump replaces `mint_private_key`
+with a fixed `********` marker before logging. Production additionally pins
+`DEBUG=FALSE` and `LOG_LEVEL=INFO`, so the settings dump is not emitted. Mint
+startup logs must never contain an unredacted private key, seed, token,
+macaroon, rune, Demo spend/refund key, runtime bearer, or provider key.
 
 ## 12. Judge flow
 

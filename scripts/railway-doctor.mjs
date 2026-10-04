@@ -224,6 +224,16 @@ async function main() {
     record("relay WSS REQ/EOSE", false, error.message);
   }
 
+  // 2b. B39-02: relay readiness is upstream-aware — /health only returns
+  // 2xx while the Strfry relay path is operational.
+  try {
+    const relayProbeUrl = relayUrl.replace(/^wss:/u, "https:");
+    const probe = await httpsGet(`${relayProbeUrl}/health`);
+    record("relay /health upstream-aware readiness", probe.status === 200, `HTTP ${probe.status}`);
+  } catch (error) {
+    record("relay /health upstream-aware readiness", false, error.message);
+  }
+
   // 3. P002 provider artifacts (verified signatures).
   const p002 = await relayQueryP002(relayUrl, providerPublicKey);
   record("provider P002 artifacts visible and valid", p002.ok,
