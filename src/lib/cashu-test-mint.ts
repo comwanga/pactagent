@@ -2888,6 +2888,12 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
       return this.prepared("lock", preview);
     } catch (error) {
       const message = error instanceof Error ? error.message.toLowerCase() : "";
+      console.error(
+        "cashu lock preparation rejected",
+        input.amountSats.toString(),
+        sumProofAmounts(input.proofs).toString(),
+        message.includes("insufficient") ? "insufficient" : "rejected",
+      );
       throw new CashuPrivateBackendError(
         message.includes("insufficient") ? "insufficient_value" : "rejected",
         "not_submitted",
