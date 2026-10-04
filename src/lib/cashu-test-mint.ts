@@ -2011,6 +2011,11 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         );
       }
       if (sumProofAmounts(funding.proofs) < input.amountSats) {
+        console.error(
+          "cashu funding insufficient",
+          input.amountSats.toString(),
+          sumProofAmounts(funding.proofs).toString(),
+        );
         const error = new CashuTestMintError(
           "insufficient_value",
           "Private Cashu funding is insufficient",
