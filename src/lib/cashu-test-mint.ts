@@ -1102,7 +1102,7 @@ export interface CashuMintPrivateBackend {
   prepareSpend(input: {
     readonly proofs: readonly Proof[];
     readonly amountSats: bigint;
-    readonly spendingKeyHex: string;
+    readonly spendingKeyHex?: string;
   }): Promise<CashuPrivatePreparedSwap>;
   submit(prepared: CashuPrivatePreparedSwap): Promise<CashuPrivateSwapResult>;
   inspectProofStates(proofs: readonly Proof[]): Promise<readonly CashuPrivateProofState[]>;
@@ -1445,6 +1445,10 @@ function validateOperationId(value: string): string {
     cashuError("operation_rejected", "Cashu operation id is invalid");
   }
   return value;
+}
+
+function exposureRecoveryOperationId(operationId: string): string {
+  return `cashu_recovery_${createHash("sha256").update(operationId).digest("hex").slice(0, 48)}`;
 }
 
 function safeHandle(reference: string): CashuPrivateHandle {
@@ -1862,6 +1866,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
   private async reconcileExposureLedger(
     ledger: StoredExposureLedger,
     excludeOperationId: string,
+    recoverAmbiguousInputs = false,
   ): Promise<StoredExposureLedger> {
     const operations = new Map<string, StoredOperation | undefined>();
     for (const operationId of Object.keys(ledger.reservations)) {
@@ -1941,6 +1946,18 @@ class CashuTestMintAdapter implements CashuTestMintPort {
             stale = false;
           }
         }
+        if (!stale && recoverAmbiguousInputs) {
+          const recovered = await this.recoverAmbiguousLock(operationId, operation);
+          if (recovered === "released") stale = true;
+          if (recovered === "locked") {
+            reservations[operationId] = Object.freeze({
+              amountSats: reservation.amountSats,
+              status: "locked",
+            });
+            changed ||= reservation.status !== "locked";
+            continue;
+          }
+        }
       }
       if (stale) {
         changed = true;
@@ -1963,6 +1980,177 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
     }
     return reconciled;
+  }
+
+  /**
+   * Fence a legacy ambiguous lock with a durable, mutually-exclusive recovery
+   * swap. An UNSPENT observation alone is never terminal: the original HTTP
+   * request may still win after that observation. Instead, the recovery swap
+   * consumes the same inputs and returns their value as ordinary proofs. Only
+   * a durably recorded recovery success proves that the old lock cannot later
+   * complete. If the old lock won, NUT-09 restoration records it as locked.
+   */
+  private async recoverAmbiguousLock(
+    operationId: string,
+    operation: StoredOperation,
+  ): Promise<"retained" | "locked" | "released"> {
+    const prepared = operation.prepared;
+    if (operation.kind !== "lock" || operation.status !== "submitted_unknown" || !prepared) {
+      return "retained";
+    }
+    const recoveryId = exposureRecoveryOperationId(operationId);
+    const recoveryFingerprint = JSON.stringify({
+      kind: "exposure-recovery",
+      operationId,
+      inputSet: fingerprintPrivateProofs(prepared.inputProofs),
+      amountSats: prepared.requestedAmountSats.toString(),
+    });
+    let recovery: StoredOperation | undefined;
+    try {
+      recovery = await this.readOperation(recoveryId);
+    } catch {
+      return "retained";
+    }
+    if (
+      recovery &&
+      (recovery.fingerprint !== recoveryFingerprint ||
+        recovery.kind !== "spend" ||
+        recovery.spentExposureOperationId !== operationId)
+    ) {
+      return "retained";
+    }
+    if (recovery?.status === "succeeded") {
+      return this.terminalizeRecoveredLock(operationId, operation);
+    }
+
+    let states: readonly CashuPrivateProofState[];
+    try {
+      states = await this.backend.inspectProofStates(prepared.inputProofs);
+    } catch {
+      return "retained";
+    }
+    if (
+      states.length !== prepared.inputProofs.length ||
+      states.some((state) => !["unspent", "pending", "spent"].includes(state.state))
+    ) {
+      return "retained";
+    }
+    const allUnspent = states.every((state) => state.state === "unspent");
+    const allSpent = states.every((state) => state.state === "spent");
+    if (!allUnspent && !allSpent) return "retained";
+
+    if (allSpent) {
+      if (recovery?.prepared) {
+        try {
+          const restoredRecovery = await this.backend.restore(recovery.prepared);
+          if (restoredRecovery) {
+            await this.completeSuccessfulOperation(
+              recoveryId,
+              recoveryFingerprint,
+              "spend",
+              recovery.prepared,
+              operation.allowedPublicKeys,
+              restoredRecovery,
+              operationId,
+              undefined,
+              false,
+              true,
+            );
+            return this.terminalizeRecoveredLock(operationId, operation);
+          }
+        } catch {
+          return "retained";
+        }
+      }
+      try {
+        const restoredLock = await this.backend.restore(prepared);
+        if (!restoredLock) return "retained";
+        await this.completeSuccessfulOperation(
+          operationId,
+          operation.fingerprint,
+          "lock",
+          prepared,
+          operation.allowedPublicKeys,
+          restoredLock,
+          operation.spentExposureOperationId,
+          undefined,
+          false,
+        );
+        return "locked";
+      } catch {
+        return "retained";
+      }
+    }
+
+    let recoveryPrepared = recovery?.prepared;
+    if (!recoveryPrepared) {
+      try {
+        recoveryPrepared = await this.backend.prepareSpend({
+          proofs: prepared.inputProofs,
+          amountSats: prepared.requestedAmountSats,
+        });
+      } catch {
+        return "retained";
+      }
+      const originalSecrets = new Set(prepared.inputProofs.map((proof) => proof.secret));
+      if (
+        recoveryPrepared.kind !== "spend" ||
+        recoveryPrepared.requestedAmountSats !== prepared.requestedAmountSats ||
+        !recoveryPrepared.inputProofs.some((proof) => originalSecrets.has(proof.secret))
+      ) {
+        return "retained";
+      }
+      try {
+        await this.writeOperation(recoveryId, {
+          fingerprint: recoveryFingerprint,
+          kind: "spend",
+          status: "submitted_unknown",
+          prepared: recoveryPrepared,
+          allowedPublicKeys: operation.allowedPublicKeys,
+          spentExposureOperationId: operationId,
+        });
+      } catch {
+        return "retained";
+      }
+    }
+
+    try {
+      const result = await this.backend.submit(recoveryPrepared);
+      await this.completeSuccessfulOperation(
+        recoveryId,
+        recoveryFingerprint,
+        "spend",
+        recoveryPrepared,
+        operation.allowedPublicKeys,
+        result,
+        operationId,
+        undefined,
+        false,
+        true,
+      );
+      return this.terminalizeRecoveredLock(operationId, operation);
+    } catch {
+      return "retained";
+    }
+  }
+
+  private async terminalizeRecoveredLock(
+    operationId: string,
+    operation: StoredOperation,
+  ): Promise<"retained" | "released"> {
+    try {
+      await this.writeOperation(operationId, {
+        fingerprint: operation.fingerprint,
+        kind: operation.kind,
+        status: "failed_definitively",
+        errorCode: "proof_already_spent",
+        allowedPublicKeys: operation.allowedPublicKeys,
+        spentExposureOperationId: operation.spentExposureOperationId,
+      });
+      return "released";
+    } catch {
+      return "retained";
+    }
   }
 
   private async accountedExposure(
@@ -2015,7 +2203,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         } catch {
           cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
         }
-        const ledger = await this.reconcileExposureLedger(
+        let ledger = await this.reconcileExposureLedger(
           parseExposureLedger(stored),
           operationId,
         );
@@ -2033,12 +2221,19 @@ class CashuTestMintAdapter implements CashuTestMintPort {
             [operationId]: Object.freeze({ amountSats: amountSats.toString(), status: "reserved" as const }),
           };
           if (await this.accountedExposure(proposedReservations) > this.configuration.maximumExposureSats) {
-            cashuError(
-              "insufficient_value",
-              "Requested Cashu value exceeds the configured aggregate exposure cap",
-              "not_submitted",
-              operationId,
-            );
+            ledger = await this.reconcileExposureLedger(ledger, operationId, true);
+            const recoveredReservations = {
+              ...ledger.reservations,
+              [operationId]: Object.freeze({ amountSats: amountSats.toString(), status: "reserved" as const }),
+            };
+            if (await this.accountedExposure(recoveredReservations) > this.configuration.maximumExposureSats) {
+              cashuError(
+                "insufficient_value",
+                "Requested Cashu value exceeds the configured aggregate exposure cap",
+                "not_submitted",
+                operationId,
+              );
+            }
           }
         }
         const nextReservations = { ...ledger.reservations };
@@ -2689,6 +2884,8 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     result: CashuPrivateSwapResult,
     spentExposureOperationId?: string,
     tombstone?: SpendSourceTombstone,
+    updateExposureLedger = true,
+    retainPreparedSpend = false,
   ): Promise<CashuOperationSucceeded> {
     const inputAmount = cashuAccountingInputAmount(prepared);
     const outputAmount = sumProofAmounts(result.sendProofs);
@@ -2718,7 +2915,8 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     await this.writeValue(reference, {
       proofs: result.sendProofs,
       amountSats: prepared.requestedAmountSats,
-      allowedPublicKeys: kind === "lock" ? allowedPublicKeys : [],
+      allowedPublicKeys:
+        kind === "lock" || retainPreparedSpend ? allowedPublicKeys : [],
       ...(kind === "lock" ? { exposureOperationId: operationId } : {}),
     });
     let changeHandle: CashuPrivateHandle | undefined;
@@ -2727,13 +2925,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       await this.writeValue(changeReference, {
         proofs: result.keepProofs,
         amountSats: changeAmount,
-        allowedPublicKeys: [],
+        allowedPublicKeys: retainPreparedSpend ? allowedPublicKeys : [],
       });
       changeHandle = safeHandle(changeReference);
     }
-    if (kind === "lock") {
+    if (kind === "lock" && updateExposureLedger) {
       await this.updateExposure(operationId, exposureAmount, "locked");
-    } else if (spentExposureOperationId !== undefined) {
+    } else if (kind === "spend" && spentExposureOperationId !== undefined && updateExposureLedger) {
       await this.updateExposure(
         spentExposureOperationId,
         prepared.requestedAmountSats,
@@ -2763,7 +2961,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       fingerprint,
       kind,
       status: "succeeded",
-      ...(kind === "lock" ? { prepared } : {}),
+      ...(kind === "lock" || retainPreparedSpend ? { prepared } : {}),
       result: succeeded,
       allowedPublicKeys,
       spentExposureOperationId,
@@ -3133,7 +3331,7 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
   async prepareSpend(input: {
     readonly proofs: readonly Proof[];
     readonly amountSats: bigint;
-    readonly spendingKeyHex: string;
+    readonly spendingKeyHex?: string;
   }): Promise<CashuPrivatePreparedSwap> {
     await this.ensureWallet();
     try {

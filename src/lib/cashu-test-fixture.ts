@@ -105,7 +105,7 @@ export class FakeCashuBackend implements CashuMintPrivateBackend {
   async prepareSpend(input: {
     readonly proofs: readonly Proof[];
     readonly amountSats: bigint;
-    readonly spendingKeyHex: string;
+    readonly spendingKeyHex?: string;
   }): Promise<CashuPrivatePreparedSwap> {
     const prepared = this.prepare("spend", input.proofs, input.amountSats);
     return {

@@ -1,4 +1,4 @@
-import { CheckStateEnum, serializeProofs } from "@cashu/cashu-ts";
+import { CheckStateEnum, serializeProofs, type Proof } from "@cashu/cashu-ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2121,6 +2121,374 @@ describe("write-ahead submission boundary", () => {
         "write-ahead-01": { amountSats: "351", status: "reserved" },
       },
     });
+  });
+
+  it("preempts an all-unspent legacy ambiguity with a durable recovery winner before admitting new exposure", async () => {
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore,
+    });
+    const lockKey = spendingKey();
+    await expect(adapter.prepareLockedValue({
+      operationId: "legacy-ambiguous-preempt-01",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    })).resolves.toMatchObject({ outcome: "reconciliation_required" });
+
+    const fresh = await adapter.prepareLockedValue({
+      operationId: "fresh-after-preempt-01",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "fresh-after-preempt")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    });
+    expect(fresh.status).toBe("succeeded");
+    await expect(privateStore.read(MINT_URL, "operation:legacy-ambiguous-preempt-01"))
+      .resolves.toMatchObject({ status: "failed_definitively", errorCode: "proof_already_spent" });
+    await expect(privateStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "fresh-after-preempt-01": { amountSats: "201", status: "locked" },
+      },
+    });
+    expect(backend.inspectCalls).toBe(1);
+    expect(backend.prepareCalls).toBe(3);
+    expect(backend.submitCalls).toBe(3);
+  });
+
+  it("keeps the original lock counted when it wins the late-completion race against recovery", async () => {
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(
+      new CashuPrivateBackendError("timeout", "submitted_unknown"),
+      new CashuPrivateBackendError("proof_already_spent", "submitted_unknown"),
+    );
+    vi.spyOn(backend, "restore").mockImplementation(async (prepared) => {
+      backend.restoreCalls += 1;
+      return prepared.kind === "lock" ? backend.resultFor(prepared) : undefined;
+    });
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(500n) },
+      backend,
+      privateStore,
+    });
+    const ambiguous = {
+      operationId: "late-race-original-wins",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+    await expect(adapter.prepareLockedValue(ambiguous)).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+    });
+    const fresh = {
+      operationId: "late-race-fresh-lock",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "late-race-fresh")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+    await expect(adapter.prepareLockedValue(fresh)).rejects.toMatchObject({ code: "insufficient_value" });
+
+    backend.states = [{ state: "spent" }];
+    await expect(adapter.prepareLockedValue(fresh)).rejects.toMatchObject({ code: "insufficient_value" });
+    await expect(privateStore.read(MINT_URL, "operation:late-race-original-wins"))
+      .resolves.toMatchObject({ status: "succeeded" });
+    await expect(privateStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "late-race-original-wins": { amountSats: "351", status: "locked" },
+      },
+    });
+    expect(backend.restoreCalls).toBe(2);
+    vi.mocked(backend.restore).mockRestore();
+  });
+
+  it("finishes recovery idempotently after a crash between recovery success and old-lock terminality", async () => {
+    const baseStore = createInMemoryCashuPrivateStore();
+    let failOldTerminalWrite = true;
+    const privateStore: CashuPrivateStore = {
+      read: (scope, key) => baseStore.read(scope, key),
+      async write(scope, key, value) {
+        if (
+          failOldTerminalWrite &&
+          key === "operation:crash-safe-old-lock" &&
+          (value as { status?: unknown }).status === "failed_definitively"
+        ) {
+          failOldTerminalWrite = false;
+          throw new Error("simulated crash before terminal old-lock write");
+        }
+        await baseStore.write(scope, key, value);
+      },
+      withExclusiveLock: (scope, key, operation) => baseStore.withExclusiveLock(scope, key, operation),
+    };
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(500n) },
+      backend,
+      privateStore,
+    });
+    await expect(adapter.prepareLockedValue({
+      operationId: "crash-safe-old-lock",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    })).resolves.toMatchObject({ outcome: "reconciliation_required" });
+    const fresh = {
+      operationId: "crash-safe-fresh-lock",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "crash-safe-fresh")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    };
+
+    await expect(adapter.prepareLockedValue(fresh)).rejects.toMatchObject({ code: "insufficient_value" });
+    expect(backend.submitCalls).toBe(2);
+    await expect(adapter.prepareLockedValue(fresh)).resolves.toMatchObject({ status: "succeeded" });
+    expect(backend.submitCalls).toBe(3);
+    await expect(baseStore.read(MINT_URL, "operation:crash-safe-old-lock"))
+      .resolves.toMatchObject({ status: "failed_definitively" });
+    await expect(baseStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "crash-safe-fresh-lock": { amountSats: "201", status: "locked" },
+      },
+    });
+  });
+
+  // The production blockage originates from records written by pre-PR#48 code,
+  // before the write-ahead recovery model existed. These seed the exact legacy
+  // persisted shape DIRECTLY into the store — a `submitted_unknown` lock with
+  // persisted `prepared.inputProofs`/`opaque`, a `locked` exposure reservation,
+  // and no recovery metadata — and prove the new mechanism resolves them
+  // without deletion, discounting, or trusting an UNSPENT snapshot.
+  function seedLegacyAmbiguousLock(
+    store: CashuPrivateStore,
+    options: {
+      readonly operationId: string;
+      readonly lockPublicKey: string;
+      readonly inputProofs: readonly Proof[];
+      readonly requestedAmountSats: bigint;
+      readonly reservationSats: bigint;
+      readonly includeExposureAmount?: boolean;
+      readonly includePrepared?: boolean;
+    },
+  ): Promise<void> {
+    const prepared = {
+      kind: "lock" as const,
+      inputProofs: serializeProofs([...options.inputProofs]),
+      requestedAmountSats: options.requestedAmountSats.toString(),
+      // Older production records predate the exposure/amount split; omit the
+      // field to exercise the `requestedAmountSats` fallback when requested.
+      ...(options.includeExposureAmount === false
+        ? {}
+        : { exposureAmountSats: options.reservationSats.toString() }),
+      opaque: { privateBlindingMaterial: "legacy-blinding-marker" },
+    };
+    return Promise.all([
+      store.write(MINT_URL, `operation:${options.operationId}`, {
+        version: 1,
+        fingerprint: JSON.stringify({
+          kind: "lock",
+          funding: `legacy-funding-${options.operationId}`,
+          amount: options.requestedAmountSats.toString(),
+          condition: { lockPublicKey: options.lockPublicKey },
+        }),
+        kind: "lock",
+        status: "submitted_unknown",
+        ...(options.includePrepared === false ? {} : { prepared }),
+        allowedPublicKeys: [options.lockPublicKey],
+      }),
+      store.write(MINT_URL, "exposure-ledger", {
+        version: 1,
+        reservations: {
+          [options.operationId]: {
+            amountSats: options.reservationSats.toString(),
+            status: "locked",
+          },
+        },
+      }),
+    ]).then(() => undefined);
+  }
+
+  function legacyAdapter(backend: FakeCashuBackend, store: CashuPrivateStore) {
+    return createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(500n) },
+      backend,
+      privateStore: store,
+    });
+  }
+
+  it("heals a directly-seeded pre-PR#48 legacy ambiguous lock with a durable recovery winner", async () => {
+    const backend = new FakeCashuBackend();
+    const store = createInMemoryCashuPrivateStore();
+    const lockKey = spendingKey();
+    await seedLegacyAmbiguousLock(store, {
+      operationId: "legacy-prefix-ambiguous-win",
+      lockPublicKey: lockKey.publicKey,
+      inputProofs: [proof(400n, "legacy-input-win")],
+      requestedAmountSats: 350n,
+      reservationSats: 351n,
+    });
+    const adapter = legacyAdapter(backend, store);
+
+    const fresh = await adapter.prepareLockedValue({
+      operationId: "fresh-after-legacy-win",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "fresh-after-legacy-win")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    });
+    expect(fresh.status).toBe("succeeded");
+    // The legacy lock is terminalized via a shared single-use input, never by
+    // an UNSPENT observation, and only after recovery success is durable.
+    await expect(store.read(MINT_URL, "operation:legacy-prefix-ambiguous-win"))
+      .resolves.toMatchObject({ status: "failed_definitively", errorCode: "proof_already_spent" });
+    await expect(store.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "fresh-after-legacy-win": { amountSats: "201", status: "locked" },
+      },
+    });
+    // One recovery spend (shared inputs) + one fresh lock submission.
+    expect(backend.submitCalls).toBe(2);
+    expect(backend.prepareCalls).toBe(2);
+  });
+
+  it("preserves a directly-seeded legacy lock as counted when the original lock won", async () => {
+    const backend = new FakeCashuBackend();
+    backend.states = [{ state: "spent" }];
+    vi.spyOn(backend, "restore").mockImplementation(async (prepared) => {
+      backend.restoreCalls += 1;
+      return prepared.kind === "lock" ? backend.resultFor(prepared) : undefined;
+    });
+    const store = createInMemoryCashuPrivateStore();
+    const lockKey = spendingKey();
+    await seedLegacyAmbiguousLock(store, {
+      operationId: "legacy-prefix-original-won",
+      lockPublicKey: lockKey.publicKey,
+      inputProofs: [proof(400n, "legacy-input-original")],
+      requestedAmountSats: 350n,
+      reservationSats: 351n,
+    });
+    const adapter = legacyAdapter(backend, store);
+
+    await expect(adapter.prepareLockedValue({
+      operationId: "fresh-after-legacy-original",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "fresh-after-legacy-original")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    })).rejects.toMatchObject({ code: "insufficient_value" });
+    // NUT-09 restoration proved the original lock won; exposure stays counted.
+    await expect(store.read(MINT_URL, "operation:legacy-prefix-original-won"))
+      .resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "legacy-prefix-original-won": { amountSats: "351", status: "locked" },
+      },
+    });
+    expect(backend.submitCalls).toBe(0);
+    vi.mocked(backend.restore).mockRestore();
+  });
+
+  it("retains a directly-seeded legacy lock fail-closed when proof states are not yet terminal", async () => {
+    const backend = new FakeCashuBackend();
+    backend.states = [{ state: "pending" }];
+    const store = createInMemoryCashuPrivateStore();
+    const lockKey = spendingKey();
+    await seedLegacyAmbiguousLock(store, {
+      operationId: "legacy-prefix-pending",
+      lockPublicKey: lockKey.publicKey,
+      inputProofs: [proof(400n, "legacy-input-pending")],
+      requestedAmountSats: 350n,
+      reservationSats: 351n,
+      includeExposureAmount: false,
+    });
+    const adapter = legacyAdapter(backend, store);
+
+    await expect(adapter.prepareLockedValue({
+      operationId: "fresh-after-legacy-pending",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "fresh-after-legacy-pending")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    })).rejects.toMatchObject({ code: "insufficient_value" });
+    await expect(store.read(MINT_URL, "operation:legacy-prefix-pending"))
+      .resolves.toMatchObject({ status: "submitted_unknown" });
+    await expect(store.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "legacy-prefix-pending": { amountSats: "351", status: "locked" },
+      },
+    });
+    expect(backend.submitCalls).toBe(0);
+  });
+
+  it("retains a directly-seeded legacy lock fail-closed when recovery metadata is insufficient", async () => {
+    const backend = new FakeCashuBackend();
+    const store = createInMemoryCashuPrivateStore();
+    const lockKey = spendingKey();
+    await seedLegacyAmbiguousLock(store, {
+      operationId: "legacy-prefix-no-prepared",
+      lockPublicKey: lockKey.publicKey,
+      inputProofs: [proof(400n, "legacy-input-missing")],
+      requestedAmountSats: 350n,
+      reservationSats: 351n,
+      includePrepared: false,
+    });
+    const adapter = legacyAdapter(backend, store);
+
+    await expect(adapter.prepareLockedValue({
+      operationId: "fresh-after-legacy-missing",
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: [proof(400n, "fresh-after-legacy-missing")],
+      }),
+      amountSats: sats(200n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    })).rejects.toMatchObject({ code: "insufficient_value" });
+    // Without persisted inputs there is no terminality fence; never discount.
+    await expect(store.read(MINT_URL, "operation:legacy-prefix-no-prepared"))
+      .resolves.toMatchObject({ status: "submitted_unknown" });
+    await expect(store.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "legacy-prefix-no-prepared": { amountSats: "351", status: "locked" },
+      },
+    });
+    expect(backend.submitCalls).toBe(0);
+    expect(backend.inspectCalls).toBe(0);
   });
 
   it("never submits or leaks exposure when the submission-capable operation checkpoint fails", async () => {
