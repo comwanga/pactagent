@@ -75,12 +75,14 @@ export const PRIVATE_TASK_GIFT_WRAP_MAX_PAGES = 20;
  * - events.maxEventSize applies to normalized event JSON;
  * - relay.maxWebsocketPayloadSize applies to the complete WebSocket message.
  *
- * The local relay reserves 256 bytes above the normalized-event limit for the
- * `["EVENT", event]` JSON envelope. PactAgent measures both representations
- * before funding, so neither limit is inferred from the other.
+ * A maximum accepted source is represented as bounded base64 inside the
+ * encrypted task message. The measured maximum task wrap is 3,495,765 bytes;
+ * the 4 MiB event ceiling leaves 698,539 bytes for bounded protocol evolution.
+ * The relay reserves another 256 bytes for the `["EVENT", event]` envelope.
+ * PactAgent measures both representations before funding.
  */
-export const MAX_NOSTR_NORMALIZED_EVENT_BYTES = 1_048_576;
-export const MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES = 1_048_832;
+export const MAX_NOSTR_NORMALIZED_EVENT_BYTES = 4 * 1024 * 1024;
+export const MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES = MAX_NOSTR_NORMALIZED_EVENT_BYTES + 256;
 
 export interface NostrEventTransportSize {
   readonly normalizedEventBytes: number;
@@ -295,6 +297,19 @@ async function buildGiftWrap(
 export interface SealedTaskResult {
   readonly wrapEvent: SignedNostrEvent;
   readonly payloadHash: string;
+  readonly measurements: PrivateTaskTransportMeasurements;
+}
+
+export interface PrivateTaskTransportMeasurements {
+  readonly originalDocumentBytes: number;
+  readonly encodedDocumentBytes: number;
+  readonly taskPayloadBytes: number;
+  readonly privateMessageBytes: number;
+  readonly innerEventBytes: number;
+  readonly encryptedPayloadBytes: number;
+  readonly giftWrappedPayloadBytes: number;
+  readonly normalizedEventBytes: number;
+  readonly websocketPayloadBytes: number;
 }
 
 export interface SealedResultResult {
@@ -319,13 +334,30 @@ export async function sealPrivateTask(
     validatedProvenance,
   );
   const messageJson = JSON.stringify(message);
-  const { wrapEvent } = await buildGiftWrap(
+  const { rumorEvent, sealEvent, wrapEvent } = await buildGiftWrap(
     messageJson,
     senderEncrypter,
     validatedProvenance,
     createdAt,
   );
-  return { wrapEvent, payloadHash: computeHash(messageJson) };
+  const transportSize = measureNostrEventTransportSize(wrapEvent);
+  const originalDocumentBytes = payload.input_media_type === "text/plain"
+    ? Buffer.byteLength(payload.source_document, "utf8")
+    : Buffer.from(payload.source_document, "base64").byteLength;
+  return {
+    wrapEvent,
+    payloadHash: computeHash(messageJson),
+    measurements: Object.freeze({
+      originalDocumentBytes,
+      encodedDocumentBytes: Buffer.byteLength(message.payload.source_document, "utf8"),
+      taskPayloadBytes: Buffer.byteLength(JSON.stringify(message.payload), "utf8"),
+      privateMessageBytes: Buffer.byteLength(messageJson, "utf8"),
+      innerEventBytes: Buffer.byteLength(JSON.stringify(rumorEvent), "utf8"),
+      encryptedPayloadBytes: Buffer.byteLength(sealEvent.content, "utf8"),
+      giftWrappedPayloadBytes: Buffer.byteLength(wrapEvent.content, "utf8"),
+      ...transportSize,
+    }),
+  };
 }
 
 export async function sealPrivateResult(

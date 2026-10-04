@@ -268,7 +268,7 @@ values stay in memory and are never printed.
 judge flow in a real browser and then runs a relay privacy scan:
 
 - Start Demo → 1000 Demo sats wallet;
-- synthetic document + prompt, budget 500;
+- synthetic document + prompt (original document limit: 1 MiB inclusive), budget 500;
 - 350-sat signed offer discovery;
 - advisory deterministic recommendation + deterministic policy authorization;
 - agreement → escrow → NIP-59 private transport → provider result →

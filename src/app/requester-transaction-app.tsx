@@ -92,6 +92,7 @@ const OPERATIONAL_COPY: Readonly<Record<RequesterOperationalState, string>> = {
 const ERROR_COPY: Readonly<Partial<Record<RequesterApiErrorCode, string>>> = {
   unauthorized: "This requester is not authorized to use the transaction service.",
   invalid_request: "The transaction request was rejected as invalid.",
+  document_too_large: "The document exceeds the 1 MiB upload limit.",
   result_not_available: "The private result is not available yet.",
   report_not_available: "The safe transaction report is not available yet.",
   runtime_unavailable: "The transaction service is temporarily unavailable.",
@@ -120,7 +121,7 @@ function documentError(error: unknown): string {
     case "unsupported_media_type":
       return "Choose a text/plain or application/pdf document.";
     case "document_too_large":
-      return `The API representation must not exceed ${formatByteSize(REQUESTER_DOCUMENT_MAXIMUM_BYTES)}.`;
+      return `The original document must not exceed ${formatByteSize(REQUESTER_DOCUMENT_MAXIMUM_BYTES)}.`;
     case "document_empty":
       return "Choose a non-empty document.";
     default:
@@ -410,7 +411,7 @@ export function TransactionStatusView({
         {status.failureCode ? <p><span>Failure code</span><code>{status.failureCode}</code></p> : null}
         {status.failureReason === "private_task_transport_too_large" ? (
           <div className="failureReasonNotice" role="alert">
-            File too large for private delivery. Choose a smaller PDF or document.
+            Private delivery capacity is temporarily unavailable. No escrow was funded; please retry later.
           </div>
         ) : null}
       </div>
@@ -924,7 +925,7 @@ export function RequesterTransactionApp({
             <fieldset>
               <legend>Private document</legend>
               <p id="document-description" className="fieldHelp">
-                <code>text/plain</code> or <code>application/pdf</code>. Maximum API representation: {formatByteSize(REQUESTER_DOCUMENT_MAXIMUM_BYTES)}.
+                <code>text/plain</code> or <code>application/pdf</code>. Maximum original file size: {formatByteSize(REQUESTER_DOCUMENT_MAXIMUM_BYTES)}.
                 PDF bytes are encoded for the existing API and are not parsed in the browser.
               </p>
               <label className="filePicker" htmlFor="request-document">

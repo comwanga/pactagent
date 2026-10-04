@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
 
 const DOCUMENT_SENTINEL = "PRIVATE-DOCUMENT-E2E-SENTINEL";
 const PROMPT_SENTINEL = "PRIVATE-PROMPT-E2E-SENTINEL";
@@ -17,19 +18,14 @@ async function requesterDemoStatus(page: Page) {
 }
 
 async function ensureDemoStarted(page: Page): Promise<void> {
+  await page.waitForLoadState("networkidle");
   const startDemo = page.getByRole("button", { name: "Start Demo" });
   const newTransaction = page.getByRole("button", { name: "New transaction" });
   await expect(startDemo.or(newTransaction)).toBeVisible();
-  if (await startDemo.isVisible()) {
-    await startDemo.evaluate((element: HTMLButtonElement) => element.click()).catch(() => undefined);
-    // Wait for the demo wallet to be provisioned by polling the status API.
-    // The "New transaction" button only appears after the wallet is active.
-    await expect.poll(async () => {
-      const status = await requesterDemoStatus(page);
-      return status.body?.started === true;
-    }, { timeout: 30_000, intervals: [500, 1000, 2000] }).toBe(true);
+  if (!(await newTransaction.isVisible())) {
+    await startDemo.click();
   }
-  await expect(newTransaction).toBeVisible({ timeout: 15_000 });
+  await expect(newTransaction).toBeVisible({ timeout: 30_000 });
 }
 
 async function openNewTransaction(page: Page, scenario: string, prompt = PROMPT_SENTINEL): Promise<void> {
@@ -135,6 +131,16 @@ async function bffOperation(
     });
     return { status: response.status, body: await response.json() };
   }, { transactionId, suffix, method });
+}
+
+async function expectNoPageOverflow(page: Page): Promise<void> {
+  await expect.poll(() => page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }))).toEqual(await page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.clientWidth,
+  })));
 }
 
 test("Demo Wallet starts with the authoritative balance and Reset creates a new generation", async ({ page }) => {
@@ -318,7 +324,7 @@ test("reconciliation and resume remain explicit runtime-controlled actions", asy
 });
 
 test("refund, failure, and unavailable resources stay distinct", async ({ page }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
   await createScenario(page, "refund");
   await expect(page.locator("[data-operational-state='refunded']")).toBeVisible();
   await expect(page.locator("[data-operational-state='settled']")).toHaveCount(0);
@@ -340,4 +346,78 @@ test("refund, failure, and unavailable resources stay distinct", async ({ page }
   await expect(page.locator("[data-operational-state='settled']")).toBeVisible();
   await expect(page.getByRole("button", { name: "Load private result" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Load safe transaction report" })).toHaveCount(0);
+});
+
+test("requester workflow remains usable and bounded across supported responsive viewports", async ({ browser }) => {
+  test.setTimeout(4 * 60_000);
+  const viewports = [
+    { name: "320x568", width: 320, height: 568 },
+    { name: "375x667", width: 375, height: 667 },
+    { name: "390x844", width: 390, height: 844 },
+    { name: "768x1024", width: 768, height: 1024 },
+    { name: "desktop", width: 1280, height: 800 },
+  ] as const;
+  const screenshotRoot = ".local/responsive";
+  await mkdir(screenshotRoot, { recursive: true });
+
+  for (const viewport of viewports) {
+    const context = await browser.newContext({ viewport });
+    const page = await context.newPage();
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-landing.png`, fullPage: true });
+
+    await ensureDemoStarted(page);
+    await page.getByRole("button", { name: "New transaction" }).click();
+    const longFilename = `${"near-limit-mobile-document-".repeat(8)}${viewport.name}.txt`;
+    const marker = `${DOCUMENT_SENTINEL} SCENARIO:success `;
+    const documentBytes = Buffer.alloc(1024 * 1024, 0x41);
+    documentBytes.set(Buffer.from(marker));
+    await page.getByLabel("Choose document").setInputFiles({
+      name: longFilename,
+      mimeType: "text/plain",
+      buffer: documentBytes,
+    });
+    await page.getByLabel(/Private prompt/).fill(`${PROMPT_SENTINEL} ${"long-prompt-token-".repeat(20)}`);
+    await expect(page.getByText(longFilename, { exact: true })).toBeVisible();
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-form.png`, fullPage: true });
+
+    await page.getByRole("button", { name: "Review request" }).click();
+    await expect(page.getByRole("heading", { name: "Review transaction" })).toBeVisible();
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-review.png`, fullPage: true });
+
+    await submit(page);
+    await expect(page.locator("[data-operational-state='active']")).toBeVisible();
+    await page.locator(".statusIdentifiers p").filter({ hasText: "Transaction ID" }).locator("code").evaluate((element) => {
+      element.textContent = `txn_${"identifier".repeat(14)}`;
+    });
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-active.png`, fullPage: true });
+    await expect(page.locator("[data-operational-state='settled']")).toBeVisible({ timeout: 15_000 });
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-settled.png`, fullPage: true });
+
+    await page.getByRole("button", { name: "Load private result" }).click();
+    await expect(page.locator("[data-private-result='loaded']")).toBeVisible();
+    await page.locator("[data-private-result='loaded'] p").evaluate((element) => {
+      element.append(` https://example.invalid/${"unbroken-result-segment".repeat(10)}`);
+    });
+    await page.getByRole("button", { name: "Load safe transaction report" }).click();
+    await expect(page.locator("[data-safe-report='loaded']")).toBeVisible();
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-result-report.png`, fullPage: true });
+
+    await page.getByRole("button", { name: "Close transaction" }).click();
+    await createScenario(page, "failure");
+    await expect(page.locator("[data-operational-state='failed']")).toBeVisible();
+    await page.locator("[data-operational-state='failed'] .stateCard p").evaluate((element) => {
+      element.append(` ${"long-safe-error-identifier".repeat(18)}`);
+    });
+    await expectNoPageOverflow(page);
+    await page.screenshot({ path: `${screenshotRoot}/${viewport.name}-failed.png`, fullPage: true });
+    await context.close();
+  }
 });

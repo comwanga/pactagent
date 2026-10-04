@@ -55,7 +55,10 @@ import {
   type NostrEncrypter,
   type PrivateTaskPayload,
 } from "./private-task-transport";
-import type { PrivateTaskProvenance } from "../domain/private-task-transport";
+import {
+  PrivateTaskTransportError,
+  type PrivateTaskProvenance,
+} from "../domain/private-task-transport";
 import {
   createPactCashuEscrowSettlementCoordinator,
   PactCashuSettlementError,
@@ -755,6 +758,12 @@ export class PactAgentWorkflow {
       );
     } catch (error) {
       if (error instanceof PactAgentWorkflowError) throw error;
+      if (error instanceof PrivateTaskTransportError && error.code === "payload_too_large") {
+        workflowError(
+          "private_task_transport_too_large",
+          "Private task exceeds the supported source or transport limit",
+        );
+      }
       workflowError("private_transport_failed", "Private task sealing failed during size validation");
     }
     if (nostrEventTransportLimitViolation(sealed!.wrapEvent) !== undefined) {

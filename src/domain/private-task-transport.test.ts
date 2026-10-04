@@ -4,6 +4,7 @@ import {
   PrivateTaskTransportError,
   PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES,
   PRIVATE_RESULT_MAX_SUMMARY_BYTES,
+  PRIVATE_TASK_MAX_DOCUMENT_BYTES,
   PRIVATE_TASK_MAX_PROMPT_BYTES,
   validatePrivateResultPayload,
   validatePrivateTaskPayload,
@@ -88,14 +89,17 @@ describe("Private task transport domain", () => {
     });
 
     it("rejects a document exceeding the maximum size", () => {
-      const oversized = "x".repeat(1_000_001);
+      const oversized = "x".repeat(PRIVATE_TASK_MAX_DOCUMENT_BYTES + 1);
       expect(() =>
         validatePrivateTaskPayload({ ...createValidPayload(), source_document: oversized }),
       ).toThrow(PrivateTaskTransportError);
     });
 
     it("accepts application/pdf media type", () => {
-      const payload = createValidPayload({ input_media_type: "application/pdf" });
+      const payload = createValidPayload({
+        source_document: Buffer.from("%PDF-test", "utf8").toString("base64"),
+        input_media_type: "application/pdf",
+      });
       expect(() => validatePrivateTaskPayload(payload)).not.toThrow();
     });
 

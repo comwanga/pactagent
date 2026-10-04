@@ -104,7 +104,7 @@ Cashu tokens/proofs, preimages, credentials, payout instructions, and sensitive
 evidence cannot enter public event content or tags. `result_submitted` accepts
 only an opaque `sha256:<lowercase hex digest>` reference. The
 `document-summary@1` profile accepts `text/plain` and `application/pdf` inputs up
-to 1,000,000 bytes, enforces the documented 300-second execution ceiling, and
+to 1 MiB (1,048,576 original bytes), enforces the documented 300-second execution ceiling, and
 requires a non-empty summary. No numeric summary-size limit is imposed because
 the issue, repository policy, and fixtures do not define one.
 

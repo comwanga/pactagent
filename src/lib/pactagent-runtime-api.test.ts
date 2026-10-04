@@ -211,7 +211,11 @@ describe("PactAgent HTTP transaction API", () => {
 
   it.each([
     ["document", { ...startBody(), privateDocument: "x".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1) }],
-    ["encoded PDF", { ...startBody(), mediaType: "application/pdf", privateDocument: "A".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1) }],
+    ["encoded PDF", {
+      ...startBody(),
+      mediaType: "application/pdf",
+      privateDocument: Buffer.alloc(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1).toString("base64"),
+    }],
     ["prompt", { ...startBody(), privatePrompt: "p".repeat(PRIVATE_TASK_MAX_PROMPT_BYTES + 1) }],
   ])("rejects an oversized %s before runtime effects", async (_label, body) => {
     const idempotencyKey = `oversized-${_label.replaceAll(" ", "-")}`;
@@ -238,7 +242,7 @@ describe("PactAgent HTTP transaction API", () => {
       authed("http://localhost/api/transactions", {
         method: "POST",
         headers: { "content-type": "application/json", "idempotency-key": "raw-body-limit" },
-        body: JSON.stringify({ ...startBody(), padding: "z".repeat(1_200_000) }),
+        body: JSON.stringify({ ...startBody(), padding: "z".repeat(7_000_000) }),
       }),
     );
     expect(response.status).toBe(413);

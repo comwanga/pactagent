@@ -20,6 +20,10 @@ import {
   type PontmoreEscrowDescriptor,
 } from "./pontmore-escrow";
 import { findForbiddenPublicMaterial } from "./forbidden-material";
+import {
+  DOCUMENT_SOURCE_MAXIMUM_BYTES,
+  documentIsWithinSourceLimit,
+} from "./document-size";
 
 /** PactAgent-owned provisional/unregistered regular kind; not a Pontmore PIP or Nostr standard. */
 export const PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND = 3921;
@@ -28,7 +32,7 @@ export const PACT_AGREEMENT_TRANSITION_TYPE = "pactagent/service-agreement-trans
 export const PACT_ESCROW_AUTHORITY_SOURCE_TYPE = "pactagent/escrow-authority@1";
 export const DOCUMENT_SUMMARY_PROFILE_ID = "document-summary@1";
 export const PACT_TERMS_COMMITMENT_SCHEME = "sha256-salted-canonical-json-v1";
-export const DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES = 1_000_000;
+export const DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES = DOCUMENT_SOURCE_MAXIMUM_BYTES;
 export const DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS = 5 * 60;
 export const DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
 /** Longest acyclic document-summary@1 path from proposed to a terminal state. */
@@ -260,9 +264,11 @@ const DOCUMENT_SUMMARY_PROFILE: PactCapabilityProfile<
     if (
       typeof value.source_document !== "string" ||
       value.source_document.length === 0 ||
-      new TextEncoder().encode(value.source_document).length >
-        DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES ||
       !DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES.includes(
+        value.input_media_type as (typeof DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES)[number],
+      ) ||
+      !documentIsWithinSourceLimit(
+        value.source_document,
         value.input_media_type as (typeof DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES)[number],
       ) ||
       (value.private_prompt !== undefined && typeof value.private_prompt !== "string")
