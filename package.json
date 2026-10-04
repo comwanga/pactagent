@@ -34,6 +34,7 @@
     "test:strfry-boundary:live": "vitest run --configLoader runner --config vitest.live.config.ts src/lib/strfry-size-boundary.live.test.ts",
     "audit:client-bundle": "node scripts/audit-requester-client-bundle.mjs",
     "test:hosted-nostr:live": "node scripts/run-hosted-protocol-acceptance.mjs",
+    "test:demo-repeatability:e2e": "node scripts/run-hosted-protocol-acceptance.mjs --repeatability",
     "test:provider:live": "vitest run --configLoader runner --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-provider-service.live.test.ts",
     "test:hosted-protocol:live": "vitest run --configLoader runner --config vitest.live.config.ts --maxWorkers=1 src/lib/pactagent-provider-service.live.test.ts src/lib/strfry-size-boundary.live.test.ts",
     "test:hosted-e2e:live": "vitest run --configLoader runner --config vitest.live.config.ts --maxWorkers=1 src/lib/hosted-protocol-full-e2e.live.test.ts",

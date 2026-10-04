@@ -1273,7 +1273,11 @@ export class PactAgentRuntime {
       resultAvailable: record.resultReference !== undefined,
       reportAvailable,
       ...(operationalState === "failed" ? { failureCode: "transaction_failed" as const } : {}),
-      ...(record.failureReason !== undefined && operationalState === "failed"
+      ...(operationalState === "resolved_not_funded"
+        ? { failureCode: "transaction_failed" as const }
+        : {}),
+      ...(record.failureReason !== undefined &&
+        (operationalState === "failed" || operationalState === "resolved_not_funded")
         ? { failureReason: record.failureReason }
         : {}),
       ...(record.agreementRootEventId === undefined

@@ -1861,38 +1861,84 @@ class CashuTestMintAdapter implements CashuTestMintPort {
    */
   private async reconcileExposureLedger(
     ledger: StoredExposureLedger,
+    excludeOperationId: string,
   ): Promise<StoredExposureLedger> {
+    const operations = new Map<string, StoredOperation | undefined>();
+    for (const operationId of Object.keys(ledger.reservations)) {
+      try {
+        operations.set(operationId, await this.readOperation(operationId));
+      } catch {
+        // An unreadable operation is retained fail-closed below.
+      }
+    }
+    const succeededInputProofs = [...operations.entries()].flatMap(
+      ([operationId, operation]) =>
+        operation?.status === "succeeded" && operation.prepared !== undefined
+          ? [Object.freeze({
+              operationId,
+              proofs: new Set(operation.prepared.inputProofs.map((proof) => proof.secret)),
+            })]
+          : [],
+    );
     const reservations: Record<
       string,
       Readonly<{ amountSats: string; status: "reserved" | "locked" | "released" }>
     > = {};
     let changed = false;
     for (const [operationId, reservation] of Object.entries(ledger.reservations)) {
-      let operation: StoredOperation | undefined;
-      try {
-        operation = await this.readOperation(operationId);
-      } catch {
+      if (operationId === excludeOperationId || !operations.has(operationId)) {
         reservations[operationId] = reservation;
         continue;
       }
+      const operation = operations.get(operationId);
       let stale =
         operation === undefined ||
-        operation.status === "not_submitted" ||
+        (operation.status === "not_submitted" && operation.prepared === undefined) ||
         operation.status === "failed_definitively";
       if (!stale && operation?.status === "succeeded") {
-        if (operation.kind === "spend" && operation.spentExposureOperationId === operationId) {
-          stale = true;
-        } else if (operation.kind === "lock") {
+        if (operation.kind === "lock") {
           try {
             const raw = await this.store.read(
               this.configuration.testMintUrl,
               `value:${operationPrivateReference("cashu_private", operationId, "value")}`,
             );
-            if (raw === undefined || parsePrivateValueRecord(raw).consumedByOperationId !== undefined) {
+            if (raw !== undefined && parsePrivateValueRecord(raw).consumedByOperationId !== undefined) {
               stale = true;
             }
           } catch {
             // A malformed or unreadable live value is retained fail-closed.
+          }
+        }
+      }
+      if (
+        !stale &&
+        operation?.status === "submitted_unknown" &&
+        operation.kind === "lock" &&
+        operation.prepared !== undefined
+      ) {
+        const inputSecrets = new Set(operation.prepared.inputProofs.map((proof) => proof.secret));
+        const winner = succeededInputProofs.find((candidate) =>
+          candidate.operationId !== operationId &&
+          [...candidate.proofs].some((secret) => inputSecrets.has(secret))
+        );
+        if (winner) {
+          // A successful swap consumed at least one input required by this
+          // operation. The ambiguous operation therefore cannot complete now
+          // or later, even if its original HTTP request was delayed.
+          stale = true;
+          try {
+            await this.writeOperation(operationId, {
+              fingerprint: operation.fingerprint,
+              kind: operation.kind,
+              status: "failed_definitively",
+              errorCode: "proof_already_spent",
+              allowedPublicKeys: operation.allowedPublicKeys,
+              spentExposureOperationId: operation.spentExposureOperationId,
+            });
+          } catch {
+            // Keep the reservation unless both terminal operation state and
+            // the reconciled ledger can be persisted.
+            stale = false;
           }
         }
       }
@@ -1919,6 +1965,41 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     return reconciled;
   }
 
+  private async accountedExposure(
+    reservations: StoredExposureLedger["reservations"],
+  ): Promise<bigint> {
+    let exposure = 0n;
+    const ambiguousByInputSet = new Map<string, bigint>();
+    for (const [operationId, reservation] of Object.entries(reservations)) {
+      if (reservation.status === "released") continue;
+      const amount = amountToBigInt(reservation.amountSats);
+      if (reservation.status === "locked") {
+        exposure += amount;
+        continue;
+      }
+      let operation: StoredOperation | undefined;
+      try {
+        operation = await this.readOperation(operationId);
+      } catch {
+        exposure += amount;
+        continue;
+      }
+      if (
+        !["not_submitted", "submitted_unknown"].includes(operation?.status ?? "") ||
+        operation?.kind !== "lock" ||
+        operation.prepared === undefined
+      ) {
+        exposure += amount;
+        continue;
+      }
+      const inputSet = fingerprintPrivateProofs(operation.prepared.inputProofs);
+      const existing = ambiguousByInputSet.get(inputSet) ?? 0n;
+      if (amount > existing) ambiguousByInputSet.set(inputSet, amount);
+    }
+    for (const amount of ambiguousByInputSet.values()) exposure += amount;
+    return exposure;
+  }
+
   private async updateExposure(
     operationId: string,
     amountSats: bigint,
@@ -1934,7 +2015,10 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         } catch {
           cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
         }
-        const ledger = await this.reconcileExposureLedger(parseExposureLedger(stored));
+        const ledger = await this.reconcileExposureLedger(
+          parseExposureLedger(stored),
+          operationId,
+        );
         const existing = ledger.reservations[operationId];
         if (
           existing &&
@@ -1944,14 +2028,11 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           cashuError("operation_rejected", "Cashu exposure operation was reused");
         }
         if (nextStatus === "reserved" && existing?.status !== "locked") {
-          const activeExposure = Object.values(ledger.reservations).reduce(
-            (total, reservation) =>
-              reservation.status === "released" || reservation === existing
-                ? total
-                : total + amountToBigInt(reservation.amountSats),
-            0n,
-          );
-          if (activeExposure + amountSats > this.configuration.maximumExposureSats) {
+          const proposedReservations = {
+            ...ledger.reservations,
+            [operationId]: Object.freeze({ amountSats: amountSats.toString(), status: "reserved" as const }),
+          };
+          if (await this.accountedExposure(proposedReservations) > this.configuration.maximumExposureSats) {
             cashuError(
               "insufficient_value",
               "Requested Cashu value exceeds the configured aggregate exposure cap",
@@ -1966,7 +2047,10 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         } else {
           nextReservations[operationId] = Object.freeze({
             amountSats: amountSats.toString(),
-            status: nextStatus,
+            status:
+              nextStatus === "reserved" && existing?.status === "locked"
+                ? "locked"
+                : nextStatus,
           });
         }
         const reservations = Object.freeze(nextReservations);
@@ -2069,7 +2153,12 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           existing.status !== "not_submitted" ||
           existing.prepared !== undefined)
       ) {
-        return this.resumeExisting(operationId, fingerprint, existing);
+        return this.resumeExisting(
+          operationId,
+          fingerprint,
+          existing,
+          input.allowFreshPreparation !== false,
+        );
       }
       if (input.allowFreshPreparation === false) {
         cashuError(
@@ -2141,7 +2230,43 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         });
         throw error;
       }
+      await this.writeOperation(operationId, {
+        fingerprint,
+        kind: "lock",
+        status: "not_submitted",
+        prepared,
+        allowedPublicKeys: condition.allowedPublicKeys,
+      });
       try {
+        await this.updateExposure(
+          operationId,
+          prepared.exposureAmountSats,
+          "reserved",
+        );
+      } catch (error) {
+        const normalized =
+          error instanceof CashuTestMintError
+            ? error
+            : new CashuTestMintError(
+                "operation_rejected",
+                "Cashu exposure reservation failed",
+                "not_submitted",
+                operationId,
+              );
+        await this.writeOperation(operationId, {
+          fingerprint,
+          kind: "lock",
+          status: "not_submitted",
+          errorCode: normalized.code,
+          allowedPublicKeys: condition.allowedPublicKeys,
+        });
+        throw normalized;
+      }
+      try {
+        // The reservation is the durable economic write-ahead record. It
+        // must exist before an operation can become submission-capable: a
+        // process death after submitted_unknown was persisted but before the
+        // reservation was written would otherwise permit an uncapped replay.
         await this.writeOperation(operationId, {
           fingerprint,
           kind: "lock",
@@ -2150,13 +2275,27 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           allowedPublicKeys: condition.allowedPublicKeys,
         });
       } catch (error) {
+        // No mint request has been made yet, so rollback is authoritative.
+        // If rollback storage itself fails, the orphan reservation remains
+        // fail-closed and is safe for later ledger reconciliation.
+        try {
+          await this.writeOperation(operationId, {
+            fingerprint,
+            kind: "lock",
+            status: "not_submitted",
+            errorCode: "operation_rejected",
+            allowedPublicKeys: condition.allowedPublicKeys,
+          });
+          await this.updateExposure(
+            operationId,
+            prepared.exposureAmountSats,
+            "released",
+          );
+        } catch {
+          // Preserve the original operation-storage failure.
+        }
         throw error;
       }
-      await this.updateExposure(
-        operationId,
-        prepared.exposureAmountSats,
-        "reserved",
-      );
       return this.submitPrepared(
         operationId,
         fingerprint,
@@ -2216,7 +2355,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
           existing.prepared !== undefined)
       ) {
         const tombstone = { handle: input.handle, value };
-        const resumed = await this.resumeExisting(operationId, fingerprint, existing, tombstone);
+        const resumed = await this.resumeExisting(
+          operationId,
+          fingerprint,
+          existing,
+          input.allowFreshPreparation !== false,
+          tombstone,
+        );
         if (resumed.status === "succeeded" && existing.status === "succeeded") {
           await this.markValueConsumed(input.handle, value, operationId);
         }
@@ -2303,6 +2448,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     operationId: string,
     fingerprint: string,
     existing: StoredOperation,
+    allowExactReplay: boolean,
     tombstone?: SpendSourceTombstone,
   ): Promise<CashuMutationResult> {
     if (existing.fingerprint !== fingerprint) {
@@ -2328,7 +2474,16 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       return existing.result;
     }
     if (existing.status === "submitted_unknown" && existing.prepared) {
-      return this.reconcilePrepared(operationId, existing, tombstone);
+      if (existing.kind === "lock") {
+        // Repair ledgers produced by an interrupted older ordering before
+        // inspecting or replaying the ambiguous swap.
+        await this.updateExposure(
+          operationId,
+          existing.prepared.exposureAmountSats,
+          "reserved",
+        );
+      }
+      return this.reconcilePrepared(operationId, existing, allowExactReplay, tombstone);
     }
     if (existing.status === "failed_definitively") {
       cashuError(
@@ -2339,7 +2494,44 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       );
     }
     if (existing.prepared) {
-      return this.reconcilePrepared(operationId, existing, tombstone);
+      if (existing.kind === "lock" && existing.status === "not_submitted") {
+        if (!allowExactReplay) {
+          // This checkpoint is written before submitted_unknown and before
+          // backend.submit. Once fresh funding is no longer viable, it is
+          // authoritatively dead and must not leave a permanent reservation.
+          await this.writeOperation(operationId, {
+            fingerprint: existing.fingerprint,
+            kind: existing.kind,
+            status: "not_submitted",
+            errorCode: "operation_rejected",
+            allowedPublicKeys: existing.allowedPublicKeys,
+          });
+          await this.updateExposure(
+            operationId,
+            existing.prepared.exposureAmountSats,
+            "released",
+          );
+          cashuError(
+            "operation_rejected",
+            "Escrow locktime has passed; fresh funding is not viable",
+            "not_submitted",
+            operationId,
+          );
+        }
+        // A restart may land after the prepared checkpoint but before the
+        // reservation/submission checkpoint. Re-establish the reservation
+        // under the aggregate lock before making the exact swap replayable.
+        await this.updateExposure(
+          operationId,
+          existing.prepared.exposureAmountSats,
+          "reserved",
+        );
+        await this.writeOperation(operationId, {
+          ...existing,
+          status: "submitted_unknown",
+        });
+      }
+      return this.reconcilePrepared(operationId, existing, allowExactReplay, tombstone);
     }
     cashuError(
       existing.errorCode ?? "operation_rejected",
@@ -2398,13 +2590,6 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         return reconciliationRequired(operationId);
       }
       const normalized = mapBackendError(error, operationId);
-      if (kind === "lock") {
-        await this.updateExposure(
-          operationId,
-          prepared.exposureAmountSats,
-          "released",
-        );
-      }
       await this.writeOperation(operationId, {
         fingerprint,
         kind,
@@ -2413,6 +2598,13 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         allowedPublicKeys,
         spentExposureOperationId,
       });
+      if (kind === "lock") {
+        await this.updateExposure(
+          operationId,
+          prepared.exposureAmountSats,
+          "released",
+        );
+      }
       throw normalized;
     }
   }
@@ -2420,6 +2612,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
   private async reconcilePrepared(
     operationId: string,
     operation: StoredOperation,
+    allowExactReplay: boolean,
     tombstone?: SpendSourceTombstone,
   ): Promise<CashuMutationResult> {
     const prepared = operation.prepared;
@@ -2446,62 +2639,34 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       return reconciliationRequired(operationId);
     }
     if (allUnspent) {
-      if (operation.kind === "lock") {
-        await this.updateExposure(
+      // NUT-07 is a point-in-time observation, not a cancellation fence: an
+      // earlier timed-out HTTP request can still consume these proofs after an
+      // UNSPENT response. Re-submit only the exact persisted swap. Its inputs
+      // and blinded outputs are identical, so the original and recovery
+      // request cannot create distinct economic outcomes; NUT-09 below can
+      // restore the same outputs if the response is interrupted again.
+      if (!allowExactReplay) return reconciliationRequired(operationId);
+      try {
+        const replayed = await this.backend.submit(prepared);
+        return await this.completeSuccessfulOperation(
           operationId,
-          prepared.exposureAmountSats,
-          "released",
-        );
-      } else if (operation.spentExposureOperationId !== undefined) {
-        await this.updateExposure(
+          operation.fingerprint,
+          operation.kind,
+          prepared,
+          operation.allowedPublicKeys,
+          replayed,
           operation.spentExposureOperationId,
-          prepared.requestedAmountSats,
-          "released",
+          tombstone,
         );
+      } catch {
+        return reconciliationRequired(operationId);
       }
-      await this.writeOperation(operationId, {
-        fingerprint: operation.fingerprint,
-        kind: operation.kind,
-        status: "not_submitted",
-        errorCode: "operation_rejected",
-        allowedPublicKeys: operation.allowedPublicKeys,
-        spentExposureOperationId: operation.spentExposureOperationId,
-      });
-      cashuError(
-        "operation_rejected",
-        "Cashu swap did not take effect",
-        "not_submitted",
-        operationId,
-      );
     }
     if (!restored) {
-      if (operation.kind === "lock") {
-        await this.updateExposure(
-          operationId,
-          prepared.exposureAmountSats,
-          "released",
-        );
-      } else if (operation.spentExposureOperationId !== undefined) {
-        await this.updateExposure(
-          operation.spentExposureOperationId,
-          prepared.requestedAmountSats,
-          "released",
-        );
-      }
-      await this.writeOperation(operationId, {
-        fingerprint: operation.fingerprint,
-        kind: operation.kind,
-        status: "failed_definitively",
-        errorCode: "proof_already_spent",
-        allowedPublicKeys: operation.allowedPublicKeys,
-        spentExposureOperationId: operation.spentExposureOperationId,
-      });
-      cashuError(
-        "proof_already_spent",
-        "Cashu inputs were spent by another operation",
-        "failed_definitively",
-        operationId,
-      );
+      // SPENT with no restored outputs can be observed while the original
+      // mint request is still completing. Retain exposure unless a persisted
+      // successful competing operation proves this swap can no longer win.
+      return reconciliationRequired(operationId);
     }
     return this.completeSuccessfulOperation(
       operationId,
@@ -2598,6 +2763,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
       fingerprint,
       kind,
       status: "succeeded",
+      ...(kind === "lock" ? { prepared } : {}),
       result: succeeded,
       allowedPublicKeys,
       spentExposureOperationId,

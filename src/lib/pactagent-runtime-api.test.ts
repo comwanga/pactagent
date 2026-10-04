@@ -29,6 +29,7 @@ import {
   sharedStores,
   transactionId,
 } from "@/lib/pactagent-runtime-test-fixture";
+import { CashuTestMintError } from "@/lib/cashu-test-mint";
 
 const TOKEN = "test-runtime-token";
 let observed: ReturnType<typeof buildRuntimeConfig>;
@@ -462,6 +463,42 @@ describe("PactAgent HTTP transaction API", () => {
       reportAvailable: false,
     });
     expect(JSON.stringify(failed)).not.toContain("decline");
+  }, 60_000);
+
+  it("surfaces a specific safe reason when funding is definitively not completed", async () => {
+    observed.cashu.prepareLockedValue = async (input) => {
+      throw new CashuTestMintError(
+        "insufficient_value",
+        "private diagnostic must not cross the API boundary",
+        "not_submitted",
+        input.operationId,
+      );
+    };
+    const started = await postTransaction(
+      authed("http://localhost/api/transactions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": "resolved-not-funded-0001",
+        },
+        body: JSON.stringify(startBody()),
+      }),
+    );
+    const { transactionId: id } = await started.json() as { transactionId: string };
+    const failed = await waitForStatus(
+      id,
+      (status) => status.operationalState === "resolved_not_funded",
+    );
+    expect(failed).toMatchObject({
+      phase: "accepted",
+      operationalState: "resolved_not_funded",
+      failureCode: "transaction_failed",
+      failureReason: "escrow_failed",
+      availableActions: { resume: false, reconcile: false, refund: false },
+      resultAvailable: false,
+      reportAvailable: false,
+    });
+    expect(JSON.stringify(failed)).not.toContain("private diagnostic");
   }, 60_000);
 
   it("returns the same transaction for a repeated idempotency key", async () => {
