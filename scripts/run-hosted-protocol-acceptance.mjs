@@ -209,7 +209,7 @@ async function startNextServer(environment) {
   return child;
 }
 
-async function runAcceptanceTest(environment) {
+async function runAcceptanceTest(environment, testFile = "src/lib/hosted-protocol-full-e2e.live.test.ts") {
   console.log("Running hosted protocol full E2E acceptance tests...");
   const result = await runCommand(process.execPath, [
     resolve(PROJECT_ROOT, "node_modules", "vitest", "vitest.mjs"),
@@ -217,7 +217,7 @@ async function runAcceptanceTest(environment) {
     "--configLoader", "runner",
     "--config", "vitest.live.config.ts",
     "--maxWorkers=1",
-    "src/lib/hosted-protocol-full-e2e.live.test.ts",
+    testFile,
   ], {
     cwd: PROJECT_ROOT,
     env: environment,
@@ -384,6 +384,7 @@ async function stopChild(child) {
 }
 
 async function main() {
+  const repeatabilityAcceptance = process.argv.includes("--repeatability");
   const baseEnv = loadLocalEnvironment();
   const runId = uniqueRunId();
   const runtimePort = await reserveEphemeralPort();
@@ -462,7 +463,19 @@ async function main() {
     await ensureInfrastructure(runtimeEnvironment, runId, composeEnv);
     providerChild = await startProviderService(providerEnvironment);
     nextChild = await startNextServer(runtimeEnvironment);
-    await runAcceptanceTest(runtimeEnvironment);
+    const acceptanceTestFile = repeatabilityAcceptance
+      ? "src/lib/demo-repeatability-full-e2e.live.test.ts"
+      : "src/lib/hosted-protocol-full-e2e.live.test.ts";
+    await runAcceptanceTest(runtimeEnvironment, acceptanceTestFile);
+    if (repeatabilityAcceptance) {
+      console.log("Restarting the runtime against the same persisted Demo state...");
+      await stopChild(nextChild);
+      nextChild = await startNextServer(runtimeEnvironment);
+      await runAcceptanceTest(
+        { ...runtimeEnvironment, PACTAGENT_REPEATABILITY_RESTART_PHASE: "true" },
+        acceptanceTestFile,
+      );
+    }
     await runHostedDoctor({
       ...runtimeEnvironment,
       PACTAGENT_PROVIDER_MODE: "hosted",

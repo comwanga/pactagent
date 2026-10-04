@@ -1673,7 +1673,7 @@ describe("PactAgent Cashu escrow settlement coordinator", () => {
 });
 
 describe("integrated expired-agreement recovery with real Cashu adapter", () => {
-  it("composes prepareEscrow → fundEscrow → reconcilePrepared → all-unspent → not_submitted → blocks fresh funding after locktime", async () => {
+  it("keeps all-unspent ambiguity recoverable without replaying after locktime", async () => {
     const data = setup();
     const backend = new FakeCashuBackend();
     const privateStore = createInMemoryCashuPrivateStore();
@@ -1736,7 +1736,10 @@ describe("integrated expired-agreement recovery with real Cashu adapter", () => 
       context: data.context,
       history: data.history,
       funding: fund,
-    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+    })).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "funding_reconciliation_required" },
+    });
 
     expect(backend.inspectCalls).toBe(1);
     expect(backend.restoreCalls).toBe(0);
@@ -1749,7 +1752,10 @@ describe("integrated expired-agreement recovery with real Cashu adapter", () => 
       context: data.context,
       history: data.history,
       funding: fund,
-    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+    })).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "funding_reconciliation_required" },
+    });
 
     expect(backend.submitCalls).toBe(1);
     expect(backend.prepareCalls).toBe(1);
@@ -1802,7 +1808,7 @@ describe("integrated expired-agreement recovery with real Cashu adapter", () => 
     expect(backend.submitCalls).toBe(0);
   });
 
-  it("allows reconciliation from funding_pending with submitted_unknown after expired locktime", async () => {
+  it("retains submitted_unknown funding after locktime without a fresh mint submission", async () => {
     const data = setup();
     const backend = new FakeCashuBackend();
     const privateStore = createInMemoryCashuPrivateStore();
@@ -1855,7 +1861,10 @@ describe("integrated expired-agreement recovery with real Cashu adapter", () => 
       context: data.context,
       history: data.history,
       funding: fund,
-    })).rejects.toMatchObject({ code: "funding_not_confirmed" });
+    })).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "funding_reconciliation_required" },
+    });
 
     expect(backend.inspectCalls).toBe(1);
     expect(backend.submitCalls).toBe(1);
