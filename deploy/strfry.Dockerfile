@@ -2,8 +2,8 @@
 #
 # Pins the same verified image/version used by compose.local.yml and
 # compose.hosted.yml, layers the hosted relay configuration into the image,
-# and replaces the upstream backgrounding/group-kill wrapper with a direct
-# foreground exec entrypoint (B39-01: normal Railway restart recovery).
+# and replaces the upstream process-group broadcast with a bounded, single-child
+# shutdown wrapper (B39-01: normal Railway restart recovery).
 #
 # Data lives on the Railway volume mounted at /app/strfry-db.
 

@@ -89,10 +89,14 @@ Strfry and the Demo mint have no public domains and no public DNS records.
 10. Requester sessions and Demo wallet state survive restarts (Railway volume
     under `PACTAGENT_DEMO_STATE_DIRECTORY=/data`).
 
-Strfry is exec'd directly as PID 1 instead of using the upstream image's
-backgrounding/process-group-kill wrapper. A normal Railway restart therefore
-delivers SIGTERM to Strfry, remounts the same volume, and starts the same
-deployment without requiring a redeploy.
+Strfry runs under a bounded PID 1 shutdown wrapper instead of the upstream
+process-group broadcast. The wrapper forwards an intentional Railway SIGTERM
+to the Strfry child, waits up to ten seconds for it to be fully reaped, and
+returns a controlled retryable status instead of the signal-derived status 143.
+The bounded `ON_FAILURE` policy then remounts the persistent volume once the
+old process is gone. Unexpected Strfry exits still propagate their original
+status to Railway. A normal Railway restart therefore starts the same deployment
+without requiring a redeploy.
 
 ## 4. Persistence volumes
 

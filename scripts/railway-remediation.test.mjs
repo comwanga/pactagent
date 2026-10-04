@@ -6,7 +6,7 @@ async function source(path) {
 }
 
 describe("Issue #39 Railway remediation", () => {
-  it("execs Strfry as PID 1 without the upstream process-group broadcast", async () => {
+  it("turns intentional Strfry shutdown into a bounded Railway retry", async () => {
     const entrypoint = await source("deploy/strfry-entrypoint.sh");
     const dockerfile = await source("deploy/strfry.Dockerfile");
     const executableLines = entrypoint
@@ -14,9 +14,12 @@ describe("Issue #39 Railway remediation", () => {
       .filter((line) => !line.trimStart().startsWith("#"))
       .join("\n");
 
-    expect(executableLines).toContain("exec /app/strfry relay");
+    expect(executableLines).toContain("trap shutdown TERM INT");
+    expect(executableLines).toContain('kill -TERM "$child_pid"');
+    expect(executableLines).toContain('exit "$child_status"');
+    expect(entrypoint).toContain("controlled retryable status");
+    expect(executableLines.match(/exit 75/gu)?.length).toBeGreaterThanOrEqual(2);
     expect(executableLines).not.toContain("kill -- -$$");
-    expect(executableLines).not.toMatch(/\/app\/strfry relay\s*&/u);
     expect(dockerfile).toContain("COPY deploy/strfry-entrypoint.sh /app/entrypoint.sh");
     expect(dockerfile).toContain('ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]');
   });
@@ -30,7 +33,7 @@ describe("Issue #39 Railway remediation", () => {
     expect(healthBlock).not.toMatch(/respond\s+"?ok"?\s+200/iu);
   });
 
-  it("bounds Strfry failures and pins safe mint logging thresholds", async () => {
+  it("bounds Strfry restart attempts and pins safe mint logging thresholds", async () => {
     const railway = await source(".railway/railway.ts");
 
     expect(railway).toContain('restartPolicyType: "ON_FAILURE"');
