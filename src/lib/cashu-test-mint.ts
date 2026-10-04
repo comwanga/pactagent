@@ -1850,6 +1850,75 @@ class CashuTestMintAdapter implements CashuTestMintPort {
     }
   }
 
+  /**
+   * Remove only exposure reservations that cannot represent a live lock.
+   *
+   * A crash can occur after the bounded exposure reservation is written but
+   * before the operation reaches a terminal record. Conversely, a completed
+   * spend can leave a consumed lock reservation behind if the process stops
+   * during cleanup. Such entries must not accumulate across independent Demo
+   * transactions, but uncertain operations remain fail-closed and are kept.
+   */
+  private async reconcileExposureLedger(
+    ledger: StoredExposureLedger,
+  ): Promise<StoredExposureLedger> {
+    const reservations: Record<
+      string,
+      Readonly<{ amountSats: string; status: "reserved" | "locked" | "released" }>
+    > = {};
+    let changed = false;
+    for (const [operationId, reservation] of Object.entries(ledger.reservations)) {
+      let operation: StoredOperation | undefined;
+      try {
+        operation = await this.readOperation(operationId);
+      } catch {
+        reservations[operationId] = reservation;
+        continue;
+      }
+      let stale =
+        operation === undefined ||
+        operation.status === "not_submitted" ||
+        operation.status === "failed_definitively";
+      if (!stale && operation?.status === "succeeded") {
+        if (operation.kind === "spend" && operation.spentExposureOperationId === operationId) {
+          stale = true;
+        } else if (operation.kind === "lock") {
+          try {
+            const raw = await this.store.read(
+              this.configuration.testMintUrl,
+              `value:${operationPrivateReference("cashu_private", operationId, "value")}`,
+            );
+            if (raw === undefined || parsePrivateValueRecord(raw).consumedByOperationId !== undefined) {
+              stale = true;
+            }
+          } catch {
+            // A malformed or unreadable live value is retained fail-closed.
+          }
+        }
+      }
+      if (stale) {
+        changed = true;
+      } else {
+        reservations[operationId] = reservation;
+      }
+    }
+    if (!changed) return ledger;
+    const reconciled = Object.freeze({
+      version: 1 as const,
+      reservations: Object.freeze(reservations),
+    });
+    try {
+      await this.store.write(
+        this.configuration.testMintUrl,
+        "exposure-ledger",
+        reconciled,
+      );
+    } catch {
+      cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
+    }
+    return reconciled;
+  }
+
   private async updateExposure(
     operationId: string,
     amountSats: bigint,
@@ -1865,7 +1934,7 @@ class CashuTestMintAdapter implements CashuTestMintPort {
         } catch {
           cashuError("operation_rejected", "Private Cashu exposure storage is unavailable");
         }
-        const ledger = parseExposureLedger(stored);
+        const ledger = await this.reconcileExposureLedger(parseExposureLedger(stored));
         const existing = ledger.reservations[operationId];
         if (
           existing &&
