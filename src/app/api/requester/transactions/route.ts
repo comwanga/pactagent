@@ -4,6 +4,7 @@ import {
   isTrustedRequesterRequest,
   readRequesterCreateInput,
   requesterJson,
+  RequesterDocumentTooLargeError,
   runtimeTransport,
   transportResponse,
   unauthorizedRequester,
@@ -30,6 +31,12 @@ export async function POST(request: Request): Promise<NextResponse> {
   try {
     input = await readRequesterCreateInput(request);
   } catch (error) {
+    if (error instanceof RequesterDocumentTooLargeError) {
+      return requesterJson(
+        { error: "The document exceeds the 1 MiB upload limit", code: "document_too_large" },
+        { status: 413 },
+      );
+    }
     return requesterJson(
       { error: "The transaction request is invalid", code: "invalid_request" },
       { status: error instanceof RangeError ? 413 : 400 },

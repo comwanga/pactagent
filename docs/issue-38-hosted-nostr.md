@@ -64,8 +64,8 @@ Requester/Runtime
   - Local: `./.local/strfry-db:/app/strfry-db`
   - Hosted: named volume `strfry-db`
 - **Limits** (two-limit contract):
-  - `maxEventSize`: 1,048,576 bytes (normalized event JSON)
-  - `maxWebsocketPayloadSize`: 1,048,832 bytes (complete `["EVENT", event]` frame)
+  - `maxEventSize`: 4,194,304 bytes (normalized event JSON)
+  - `maxWebsocketPayloadSize`: 4,194,560 bytes (complete `["EVENT", event]` frame)
   - The 256-byte envelope allowance is intentionally finite
 - **Health**: HTTP 200 on `http://localhost:7777/`
 - **Config files**:
@@ -149,11 +149,16 @@ default.
 
 Two limits are enforced:
 
-1. **Normalized signed Nostr event size** (`maxEventSize`): 1,048,576 bytes
-2. **Full WebSocket EVENT frame size** (`maxWebsocketPayloadSize`): 1,048,832 bytes
+1. **Normalized signed Nostr event size** (`maxEventSize`): 4,194,304 bytes
+2. **Full WebSocket EVENT frame size** (`maxWebsocketPayloadSize`): 4,194,560 bytes
 
 Both are validated before an irreversible economic action. The application
 limits and Strfry configuration agree. The doctor verifies this agreement.
+Accepted task documents and prompts are base64-normalized inside the encrypted
+private message, so JSON escaping cannot make one media type exceed the bound.
+At the inclusive 1 MiB source limit with a maximum prompt, the measured
+normalized event is 3,495,765 bytes and the complete WebSocket frame is
+3,495,775 bytes, leaving a 698,539-byte normalized-event margin.
 
 ## Privacy Model
 
@@ -173,8 +178,8 @@ NIP-59 gift wrap is used for all private transport. No plaintext HTTP.
 ## Resource/Abuse Controls
 
 Strfry enforces:
-- Maximum event size (1 MiB normalized)
-- Maximum WebSocket payload (1 MiB + 256 bytes)
+- Maximum event size (4 MiB normalized)
+- Maximum WebSocket payload (4 MiB + 256 bytes)
 - No public relay access (internal network only in hosted mode)
 
 Application enforces:

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { InvalidDomainInputError } from "./errors";
 import { extractPdfText, PdfTextExtractError } from "./pdf-text-extract";
+import { documentSourceBytes } from "./document-size";
 import {
   canonicalizePactJson,
   createPactResultReference,
@@ -150,8 +151,9 @@ function failShapeForMediaType(value: unknown): never {
   throw new DocumentSummaryServiceError("unsupported_media_type", "Document-summary input_media_type is not supported");
 }
 
-function checkSize(sourceDocument: string): DocumentSummaryFailure | undefined {
-  if (Buffer.byteLength(sourceDocument, "utf8") > DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES) {
+function checkSize(request: DocumentSummaryRequest): DocumentSummaryFailure | undefined {
+  const sourceBytes = documentSourceBytes(request.source_document, request.input_media_type);
+  if (sourceBytes !== undefined && sourceBytes > DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES) {
     return fail("input_too_large", "Document exceeds the maximum supported input size");
   }
   return undefined;
@@ -290,7 +292,7 @@ function computeResultReference(agreementRoot: string, summary: string): string 
 export function summarizeDocument(input: unknown): DocumentSummaryOutcome {
   const request = validateRequestShape(input);
 
-  const oversized = checkSize(request.source_document);
+  const oversized = checkSize(request);
   if (oversized !== undefined) return oversized;
 
   const deadlineSeconds = request.deadlineSeconds ?? DOCUMENT_SUMMARY_DEFAULT_DEADLINE_SECONDS;

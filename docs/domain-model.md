@@ -51,7 +51,7 @@ advancement.
 ## Application roles
 
 - **P001 Requester:** allows only `document-summary`, has a 500-sat total budget, a 450-sat provider-price ceiling, a 15-minute escrow maximum, Cashu-only settlement, and auto-release only after deterministic completion checks.
-- **P002 Provider:** advertises `document-summary`, requires at least 200 sats, accepts text/plain or PDF up to 1 MB, and limits execution to five minutes.
+- **P002 Provider:** advertises `document-summary`, requires at least 200 sats, accepts text/plain or PDF up to 1 MiB (inclusive), and limits execution to five minutes.
 
 `discoverCompatibleProviders` performs local fixture discovery. `evaluateServiceOffer` applies deterministic capability, identity, price, budget, settlement-network, escrow-reference, and duration constraints. It returns a structured authorization result; it neither signs nor executes anything.
 

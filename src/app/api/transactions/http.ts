@@ -5,7 +5,7 @@ import { PRIVATE_TASK_MAX_PROMPT_BYTES } from "@/domain/private-task-transport";
 
 export const NO_STORE = Object.freeze({ "Cache-Control": "no-store" });
 export const TRANSACTION_MAXIMUM_REQUEST_BYTES =
-  DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + PRIVATE_TASK_MAX_PROMPT_BYTES + 16 * 1024;
+  6 * (DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + PRIVATE_TASK_MAX_PROMPT_BYTES) + 16 * 1024;
 
 export function transactionJson(
   body: unknown,

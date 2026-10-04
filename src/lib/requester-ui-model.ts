@@ -73,7 +73,7 @@ export async function prepareRequesterDocument(file: File): Promise<PreparedRequ
     if (privateDocument.length === 0) {
       throw new RequesterDocumentValidationError("document_empty");
     }
-    if (utf8Bytes(privateDocument) > REQUESTER_DOCUMENT_MAXIMUM_BYTES) {
+    if (file.type === "text/plain" && utf8Bytes(privateDocument) > REQUESTER_DOCUMENT_MAXIMUM_BYTES) {
       throw new RequesterDocumentValidationError("document_too_large");
     }
     return Object.freeze({
@@ -89,9 +89,9 @@ export async function prepareRequesterDocument(file: File): Promise<PreparedRequ
 }
 
 export function formatByteSize(bytes: number): string {
-  if (bytes < 1_000) return `${bytes} B`;
-  if (bytes < 1_000_000) return `${(bytes / 1_000).toFixed(bytes < 10_000 ? 1 : 0)} KB`;
-  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 export function abbreviateReference(value: string, head = 12, tail = 8): string {

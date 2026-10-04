@@ -1,5 +1,10 @@
 import { findForbiddenPublicMaterial } from "./forbidden-material";
 import type { NostrPublicKey } from "./nostr";
+import {
+  DOCUMENT_SOURCE_MAXIMUM_BYTES,
+  documentSourceBytes,
+  standardBase64DecodedBytes,
+} from "./document-size";
 
 /*
  * Private task companion transport (NIP-59 Gift Wrap).
@@ -74,6 +79,13 @@ export interface PrivateTaskPayload {
   readonly private_prompt?: string;
 }
 
+interface PrivateTaskWirePayload {
+  readonly source_document: string;
+  readonly input_media_type: "text/plain" | "application/pdf";
+  readonly private_prompt?: string;
+  readonly content_encoding: "base64";
+}
+
 /*
  * Private result payload — compatible with DocumentSummaryPrivateResult from #10:
  *   - summary: the complete summary
@@ -95,13 +107,18 @@ export interface PrivateTaskMessage extends PrivateMessageBinding {
   readonly payload: PrivateTaskPayload;
 }
 
+interface PrivateTaskWireMessage extends PrivateMessageBinding {
+  readonly message_type: "task";
+  readonly payload: PrivateTaskWirePayload;
+}
+
 export interface PrivateResultMessage extends PrivateMessageBinding {
   readonly message_type: "result";
   readonly payload: PrivateResultPayload;
 }
 
 const ALLOWED_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
-const MAX_DOCUMENT_BYTES = 1_000_000;
+export const PRIVATE_TASK_MAX_DOCUMENT_BYTES = DOCUMENT_SOURCE_MAXIMUM_BYTES;
 export const PRIVATE_TASK_MAX_PROMPT_BYTES = 64 * 1024;
 export const PRIVATE_RESULT_MAX_SUMMARY_BYTES = 1_000_000;
 export const PRIVATE_MESSAGE_MAX_AGREEMENT_ID_BYTES = 128;
@@ -131,11 +148,18 @@ export function validatePrivateTaskPayload(input: unknown): PrivateTaskPayload {
   if (typeof candidate.source_document !== "string" || candidate.source_document.length === 0) {
     transportError("invalid_payload", "Private task source_document must be a non-empty string");
   }
-  if (Buffer.byteLength(candidate.source_document as string, "utf8") > MAX_DOCUMENT_BYTES) {
-    transportError("payload_too_large", "Private task source_document exceeds the maximum document size");
-  }
   if (!ALLOWED_MEDIA_TYPES.includes(candidate.input_media_type as (typeof ALLOWED_MEDIA_TYPES)[number])) {
     transportError("invalid_payload", "Private task input_media_type must be text/plain or application/pdf");
+  }
+  const sourceBytes = documentSourceBytes(
+    candidate.source_document as string,
+    candidate.input_media_type as (typeof ALLOWED_MEDIA_TYPES)[number],
+  );
+  if (sourceBytes === undefined) {
+    transportError("invalid_payload", "Private task PDF source_document must use standard base64");
+  }
+  if (sourceBytes > PRIVATE_TASK_MAX_DOCUMENT_BYTES) {
+    transportError("payload_too_large", "Private task source_document exceeds the maximum document size");
   }
   if (candidate.private_prompt !== undefined && (typeof candidate.private_prompt !== "string" || candidate.private_prompt.length === 0)) {
     transportError("invalid_payload", "Private task private_prompt must be a non-empty string if present");
@@ -301,12 +325,22 @@ function privateMessageBinding(provenance: PrivateTaskProvenance): PrivateMessag
 export function createPrivateTaskMessage(
   payload: PrivateTaskPayload,
   provenance: PrivateTaskProvenance,
-): PrivateTaskMessage {
+): PrivateTaskWireMessage {
   const binding = validateProvenance(provenance);
+  const validated = validatePrivateTaskPayload(payload);
   return {
     ...privateMessageBinding(binding),
     message_type: "task",
-    payload: validatePrivateTaskPayload(payload),
+    payload: {
+      source_document: validated.input_media_type === "text/plain"
+        ? Buffer.from(validated.source_document, "utf8").toString("base64")
+        : validated.source_document,
+      input_media_type: validated.input_media_type,
+      ...(validated.private_prompt === undefined
+        ? {}
+        : { private_prompt: Buffer.from(validated.private_prompt, "utf8").toString("base64") }),
+      content_encoding: "base64",
+    },
   };
 }
 
@@ -328,6 +362,44 @@ export function parsePrivateTaskMessage(
 ): PrivateTaskMessage {
   const binding = validateProvenance(provenance);
   const candidate = parsePrivateMessageBinding(input, "task", binding);
+  if (typeof candidate.payload !== "object" || candidate.payload === null) {
+    transportError("invalid_rumor", "Private task wire payload is invalid");
+  }
+  const wire = candidate.payload as Record<string, unknown>;
+  if (wire.content_encoding === "base64") {
+    const allowedKeys = ["source_document", "input_media_type", "private_prompt", "content_encoding"];
+    if (
+      Object.keys(wire).some((key) => !allowedKeys.includes(key)) ||
+      typeof wire.source_document !== "string" ||
+      (wire.input_media_type !== "text/plain" && wire.input_media_type !== "application/pdf") ||
+      (wire.private_prompt !== undefined && typeof wire.private_prompt !== "string") ||
+      standardBase64DecodedBytes(wire.source_document) === undefined ||
+      (typeof wire.private_prompt === "string" && standardBase64DecodedBytes(wire.private_prompt) === undefined)
+    ) {
+      transportError("invalid_rumor", "Private task base64 wire payload is invalid");
+    }
+    let sourceDocument: string;
+    let privatePrompt: string | undefined;
+    try {
+      sourceDocument = wire.input_media_type === "text/plain"
+        ? new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(wire.source_document, "base64"))
+        : wire.source_document;
+      privatePrompt = typeof wire.private_prompt === "string"
+        ? new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(wire.private_prompt, "base64"))
+        : undefined;
+    } catch {
+      transportError("invalid_rumor", "Private task base64 text is not valid UTF-8");
+    }
+    return {
+      ...privateMessageBinding(binding),
+      message_type: "task",
+      payload: validatePrivateTaskPayload({
+        source_document: sourceDocument!,
+        input_media_type: wire.input_media_type,
+        ...(privatePrompt === undefined ? {} : { private_prompt: privatePrompt }),
+      }),
+    };
+  }
   return {
     ...privateMessageBinding(binding),
     message_type: "task",

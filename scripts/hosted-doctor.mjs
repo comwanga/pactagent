@@ -10,8 +10,8 @@ import { parsePontmoreAgentDefinitionEvent } from "../src/domain/pontmore-agent.
 import { parsePactServiceOfferEvent } from "../src/domain/pact-service-offer.ts";
 import { parseCashuEscrowDescriptorEvent } from "../src/domain/pontmore-escrow.ts";
 
-const STRFRY_EVENT_SIZE = 1_048_576;
-const STRFRY_WEBSOCKET_PAYLOAD_SIZE = 1_048_832;
+const STRFRY_EVENT_SIZE = 4_194_304;
+const STRFRY_WEBSOCKET_PAYLOAD_SIZE = 4_194_560;
 
 function checkPort(port, host = "127.0.0.1") {
   return new Promise((resolvePromise) => {

@@ -105,8 +105,8 @@ New transaction -> review safe metadata -> submit once -> authoritative status
 The client accepts only `text/plain` and `application/pdf`. Text is read as the
 API's UTF-8 string input. PDF bytes are base64-encoded for the existing #33
 contract; the browser does not parse, inspect, upload, or OCR the PDF. The
-runtime-aligned limits are 1,000,000 UTF-8 bytes for the API document
-representation and 65,536 UTF-8 bytes for the optional prompt. The BFF's larger
+runtime-aligned limits are 1 MiB of original text/PDF bytes for the document
+and 65,536 UTF-8 bytes for the optional prompt. The BFF's larger
 wire limit only accommodates worst-case JSON escaping and does not change those
 input limits.
 

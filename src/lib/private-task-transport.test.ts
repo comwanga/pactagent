@@ -4,6 +4,7 @@ import { getEventHash } from "nostr-tools/pure";
 
 import { type SignedNostrEvent } from "../domain/nostr";
 import {
+  PRIVATE_TASK_MAX_DOCUMENT_BYTES,
   NIP17_PRIVATE_DIRECT_MESSAGE_KIND,
   NIP59_GIFT_WRAP_KIND,
   NIP59_SEAL_KIND,
@@ -17,6 +18,9 @@ import type { NostrFilter, NostrRelayAdapter, NostrRelayPublishOptions } from ".
 import {
   createLocalNostrEncrypter,
   generateNostrPrivateKeyForEncrypter,
+  MAX_NOSTR_NORMALIZED_EVENT_BYTES,
+  MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES,
+  nostrEventTransportLimitViolation,
   openPrivateResult,
   openPrivateTask,
   PrivateTaskPublicationError,
@@ -44,6 +48,17 @@ function createValidResult() {
   return {
     summary: "The document discusses private matters.",
   };
+}
+
+function deterministicText(bytes: number, marker = ""): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789 .,;:-_";
+  let state = 0x39c0ffee;
+  let output = marker;
+  while (output.length < bytes) {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    output += alphabet[state % alphabet.length];
+  }
+  return output.slice(0, bytes);
 }
 
 class MemoryNostrRelay implements NostrRelayAdapter {
@@ -296,6 +311,113 @@ describe("Private task transport (NIP-59 Gift Wrap)", () => {
         }),
       ).toThrowError(expect.objectContaining({ code: "agreement_mismatch" }));
     });
+
+    it.each([1_024, 100 * 1_024, 500 * 1_024, 900 * 1_024, 1_023 * 1_024, 1_024 * 1_024])(
+      "delivers a %s-byte original document within both relay limits",
+      async (documentBytes) => {
+        const { requester, provider } = createEncrypterPair();
+        const provenance = taskProvenance(requester, provider);
+        const sourceDocument = deterministicText(documentBytes);
+        const result = await sealPrivateTask(
+          {
+            source_document: sourceDocument,
+            input_media_type: "text/plain",
+            private_prompt: "p".repeat(65_536),
+          },
+          requester,
+          provenance,
+          TEST_TIMESTAMP,
+        );
+
+        expect(result.measurements.originalDocumentBytes).toBe(documentBytes);
+        expect(result.measurements.normalizedEventBytes).toBeLessThanOrEqual(
+          MAX_NOSTR_NORMALIZED_EVENT_BYTES,
+        );
+        expect(result.measurements.websocketPayloadBytes).toBeLessThanOrEqual(
+          MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES,
+        );
+        expect(nostrEventTransportLimitViolation(result.wrapEvent)).toBeUndefined();
+        expect(openPrivateTask(result.wrapEvent, provider, provenance).source_document).toBe(sourceDocument);
+      },
+      30_000,
+    );
+
+    it("supports an exact 1 MiB PDF after API base64 expansion", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const provenance = taskProvenance(requester, provider);
+      const bytes = Buffer.alloc(PRIVATE_TASK_MAX_DOCUMENT_BYTES, 0xa5);
+      bytes.set(Buffer.from("%PDF-"));
+      const sourceDocument = bytes.toString("base64");
+      const result = await sealPrivateTask(
+        { source_document: sourceDocument, input_media_type: "application/pdf" },
+        requester,
+        provenance,
+        TEST_TIMESTAMP,
+      );
+
+      expect(result.measurements).toMatchObject({
+        originalDocumentBytes: PRIVATE_TASK_MAX_DOCUMENT_BYTES,
+        encodedDocumentBytes: sourceDocument.length,
+      });
+      expect(nostrEventTransportLimitViolation(result.wrapEvent)).toBeUndefined();
+      expect(openPrivateTask(result.wrapEvent, provider, provenance).source_document).toBe(sourceDocument);
+    }, 30_000);
+
+    it("base64-bounds JSON-hostile text and rejects the first source byte over the limit", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const provenance = taskProvenance(requester, provider);
+      const sourceDocument = "\u0000".repeat(PRIVATE_TASK_MAX_DOCUMENT_BYTES);
+      const result = await sealPrivateTask(
+        {
+          source_document: sourceDocument,
+          input_media_type: "text/plain",
+          private_prompt: "\u0000".repeat(65_536),
+        },
+        requester,
+        provenance,
+        TEST_TIMESTAMP,
+      );
+      expect(result.measurements.normalizedEventBytes).toBeLessThanOrEqual(
+        MAX_NOSTR_NORMALIZED_EVENT_BYTES,
+      );
+      expect(nostrEventTransportLimitViolation(result.wrapEvent)).toBeUndefined();
+      expect(openPrivateTask(result.wrapEvent, provider, provenance).source_document).toBe(sourceDocument);
+
+      await expect(sealPrivateTask(
+        {
+          source_document: `${sourceDocument}x`,
+          input_media_type: "text/plain",
+        },
+        requester,
+        provenance,
+        TEST_TIMESTAMP,
+      )).rejects.toMatchObject({ code: "payload_too_large" });
+    }, 30_000);
+
+    it("keeps three near-limit transactions independent without payload accumulation", async () => {
+      const { requester, provider } = createEncrypterPair();
+      const provenance = taskProvenance(requester, provider);
+      const markers = ["TX1-PRIVATE-MARKER", "TX2-PRIVATE-MARKER", "TX3-PRIVATE-MARKER"];
+      const measurements: number[] = [];
+      for (const marker of markers) {
+        const sourceDocument = deterministicText(900 * 1_024, marker);
+        const sealed = await sealPrivateTask(
+          { source_document: sourceDocument, input_media_type: "text/plain" },
+          requester,
+          provenance,
+          TEST_TIMESTAMP,
+        );
+        measurements.push(sealed.measurements.websocketPayloadBytes);
+        const publicEvent = JSON.stringify(sealed.wrapEvent);
+        for (const privateMarker of markers) expect(publicEvent).not.toContain(privateMarker);
+        const opened = openPrivateTask(sealed.wrapEvent, provider, provenance);
+        expect(opened.source_document).toContain(marker);
+        for (const previousMarker of markers.filter((value) => value !== marker)) {
+          expect(opened.source_document).not.toContain(previousMarker);
+        }
+      }
+      expect(new Set(measurements).size).toBe(1);
+    }, 60_000);
   });
 
   describe("sealPrivateResult / openPrivateResult", () => {

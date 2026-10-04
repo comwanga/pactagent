@@ -6,6 +6,7 @@ import {
   parseRequesterTransactionCreateInput,
   REQUESTER_DOCUMENT_MAXIMUM_BYTES,
   REQUESTER_PROMPT_MAXIMUM_BYTES,
+  RequesterDocumentTooLargeError,
   type RequesterApiErrorDto,
   type RequesterTransactionCreateInput,
 } from "@/lib/requester-api-contracts";
@@ -20,7 +21,7 @@ import { readRequesterSession } from "@/lib/requester-session.server";
 
 // JSON may escape one input byte as six ASCII bytes (for example, control
 // characters). This is a wire limit only; the contract parser enforces the
-// authoritative 1,000,000/65,536-byte private-input limits after decoding.
+// authoritative 1 MiB source-document and 65,536-byte prompt limits after decoding.
 const MAXIMUM_BROWSER_REQUEST_BYTES =
   6 * (REQUESTER_DOCUMENT_MAXIMUM_BYTES + REQUESTER_PROMPT_MAXIMUM_BYTES) + 16 * 1024;
 const RESPONSE_HEADERS = Object.freeze({
@@ -156,3 +157,5 @@ export async function readRequesterCreateInput(request: Request): Promise<Reques
   const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   return parseRequesterTransactionCreateInput(JSON.parse(raw) as unknown);
 }
+
+export { RequesterDocumentTooLargeError };

@@ -11,6 +11,7 @@ import { createPontmoreAgentDefinition } from "./pontmore-agent";
 import { createCashuEscrowDescriptor } from "./pontmore-escrow";
 import {
   DOCUMENT_SUMMARY_PROFILE_ID,
+  DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES,
   PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
   PACT_TERMS_COMMITMENT_SCHEME,
   PactPrivateCommitmentSalt,
@@ -271,7 +272,7 @@ describe("PactAgent service agreement kernel", () => {
     ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
     expect(() =>
       createPactTermsCommitment(DOCUMENT_SUMMARY_PROFILE_ID, {
-        source_document: "x".repeat(1_000_001),
+        source_document: "x".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1),
         input_media_type: "text/plain",
       }),
     ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
@@ -301,7 +302,7 @@ describe("PactAgent service agreement kernel", () => {
 
     expect(() =>
       createPactTermsCommitment(DOCUMENT_SUMMARY_PROFILE_ID, {
-        source_document: "%PDF-1.7",
+        source_document: Buffer.from("%PDF-1.7", "utf8").toString("base64"),
         input_media_type: "application/pdf",
       }),
     ).not.toThrow();

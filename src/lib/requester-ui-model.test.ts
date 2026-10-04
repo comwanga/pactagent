@@ -42,10 +42,15 @@ describe("requester UI input model", () => {
     expect(pdf.mediaType).toBe("application/pdf");
   });
 
-  it("enforces the API representation limit after PDF base64 expansion", async () => {
-    const rawBytes = new Uint8Array(750_001);
-    rawBytes.set(new TextEncoder().encode("%PDF-"));
-    await expect(prepareRequesterDocument(new File([rawBytes], "large.pdf", { type: "application/pdf" })))
+  it("enforces the original PDF size rather than rejecting base64 expansion", async () => {
+    const acceptedBytes = new Uint8Array(REQUESTER_DOCUMENT_MAXIMUM_BYTES);
+    acceptedBytes.set(new TextEncoder().encode("%PDF-"));
+    await expect(prepareRequesterDocument(new File([acceptedBytes], "limit.pdf", { type: "application/pdf" })))
+      .resolves.toMatchObject({ size: REQUESTER_DOCUMENT_MAXIMUM_BYTES });
+
+    const oversizedBytes = new Uint8Array(REQUESTER_DOCUMENT_MAXIMUM_BYTES + 1);
+    oversizedBytes.set(new TextEncoder().encode("%PDF-"));
+    await expect(prepareRequesterDocument(new File([oversizedBytes], "large.pdf", { type: "application/pdf" })))
       .rejects.toMatchObject({ code: "document_too_large" });
   });
 });

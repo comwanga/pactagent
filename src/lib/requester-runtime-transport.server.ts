@@ -25,6 +25,7 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 const SAFE_ERROR_MESSAGES: Readonly<Record<RequesterApiErrorCode, string>> = Object.freeze({
   unauthorized: "Unauthorized",
   invalid_request: "The transaction request is invalid",
+  document_too_large: "The document exceeds the 1 MiB upload limit",
   result_not_available: "The private result is not available",
   report_not_available: "The report is not available",
   transaction_in_progress: "The transaction is already in progress",

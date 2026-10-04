@@ -14,6 +14,7 @@ import {
   createSqliteRequesterSessionStore,
   type RequesterSessionStore,
 } from "@/lib/requester-session-store.server";
+import { REQUESTER_DOCUMENT_MAXIMUM_BYTES } from "@/lib/requester-api-contracts";
 
 let temporaryDirectory: string;
 let sessionStore: RequesterSessionStore;
@@ -109,6 +110,46 @@ describe("requester BFF routes", () => {
     expect(visible).not.toContain(fundingReference);
     expect(visible).not.toContain("PRIVATE-BFF-DOCUMENT");
     expect(visible).not.toContain("PRIVATE-BFF-PROMPT");
+  });
+
+  it("accepts an exact-limit PDF representation and returns 413 for the first source byte over", async () => {
+    vi.stubEnv("PACTAGENT_RUNTIME_API_BASE", "http://runtime.internal:3000");
+    vi.stubEnv("PACTAGENT_REQUESTER_UI_ORIGIN", "http://pactagent.local");
+    vi.stubEnv("PACTAGENT_RUNTIME_API_TOKEN", "SERVER-ONLY-RUNTIME-TOKEN");
+    vi.stubEnv("PACTAGENT_LIVE_FUNDING_REFERENCE", "SERVER-ONLY-FUNDING-REFERENCE");
+    const fetcher = vi.fn(async () => new Response(
+      JSON.stringify({ transactionId: "txn_0123456789abcdef0123456789abcdef" }),
+      { status: 202, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetcher);
+    const requestForBytes = (bytes: number) => new Request(
+      "http://pactagent.local/api/requester/transactions",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": `pdf-boundary-${bytes}`,
+          origin: "http://pactagent.local",
+        },
+        body: JSON.stringify({
+          privateDocument: Buffer.alloc(bytes, 0xa5).toString("base64"),
+          mediaType: "application/pdf",
+          maximumBudgetSats: 500,
+        }),
+      },
+    );
+
+    const accepted = await createTransaction(requestForBytes(REQUESTER_DOCUMENT_MAXIMUM_BYTES));
+    expect(accepted.status).toBe(202);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const rejected = await createTransaction(requestForBytes(REQUESTER_DOCUMENT_MAXIMUM_BYTES + 1));
+    expect(rejected.status).toBe(413);
+    expect(await rejected.json()).toEqual({
+      error: "The document exceeds the 1 MiB upload limit",
+      code: "document_too_large",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("requires Start Demo before a demo requester can create a transaction", async () => {

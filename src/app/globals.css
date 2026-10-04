@@ -17,14 +17,17 @@
 }
 
 * { box-sizing: border-box; }
-html { background: var(--paper); color: var(--ink); scroll-behavior: smooth; }
+html { max-width: 100%; background: var(--paper); color: var(--ink); scroll-behavior: smooth; }
 body { margin: 0; font-family: Arial, Helvetica, sans-serif; }
-button, input, textarea { font: inherit; }
+body, .requesterApp { max-width: 100%; }
+main, section, article, header, footer, form, fieldset, nav, div { min-width: 0; }
+button, input, textarea { max-width: 100%; font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .58; }
 a, button, input, textarea { outline-offset: 4px; }
 :focus-visible { outline: 3px solid #6a9200; }
-code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; }
+code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; word-break: break-word; }
+p, li, dd, label, span, strong { overflow-wrap: anywhere; }
 
 .requesterApp { min-height: 100vh; }
 .appHeader {
@@ -43,7 +46,7 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; ov
 .brandGlyph { fill: var(--ink); }
 .brandRibbon { fill: var(--paper); }
 .brandJoint { fill: var(--ink); opacity: .88; }
-.brandWordmark { font-size: 12px; font-weight: 500; letter-spacing: .16em; }
+.brandWordmark { font-size: 12px; font-weight: 500; letter-spacing: .16em; white-space: nowrap; }
 .brandWordmark strong { font-weight: 900; }
 .phase { margin-left: auto; color: var(--acid); font-size: 11px; letter-spacing: .12em; }
 .environmentFlag {
@@ -124,7 +127,7 @@ legend, .fieldGroup > label { display: block; padding: 0; font-size: 19px; font-
 .fieldGroup > label span { color: var(--muted); font-weight: 400; font-size: 14px; }
 .fieldGroup { padding: 34px 0; border-bottom: 1px solid var(--line); }
 .fieldHelp { margin: 10px 0 16px; color: var(--muted); font-size: 14px; line-height: 1.55; }
-.filePicker { display: inline-flex; align-items: center; gap: 16px; }
+.filePicker { width: 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
 .filePicker > span {
   padding: 13px 18px;
   color: white;
@@ -132,7 +135,7 @@ legend, .fieldGroup > label { display: block; padding: 0; font-size: 19px; font-
   border-radius: 4px;
   font-weight: 700;
 }
-.filePicker input { max-width: min(100%, 430px); }
+.filePicker input { min-width: 0; width: min(100%, 430px); }
 .fileMetadata, .reviewMetadata { margin: 28px 0 0; }
 .fileMetadata { display: grid; grid-template-columns: 1.4fr 1fr .7fr; border: 1px solid var(--line); }
 .fileMetadata div, .reviewMetadata div { min-width: 0; }
@@ -178,6 +181,7 @@ textarea { width: 100%; margin-top: 14px; padding: 14px; resize: vertical; borde
 .stateCard p { margin: 10px 0 0; color: var(--muted); line-height: 1.5; }
 .statusIdentifiers { margin: 42px 0; display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .statusIdentifiers p { min-width: 0; margin: 0; padding: 18px; border-right: 1px solid var(--line); }
+.statusIdentifiers > * { min-width: 0; }
 .statusIdentifiers p:first-child { padding-left: 0; }
 .statusIdentifiers p:last-child { border-right: 0; }
 .statusIdentifiers span, .waitingState span { display: block; margin-bottom: 8px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
@@ -205,7 +209,7 @@ textarea { width: 100%; margin-top: 14px; padding: 14px; resize: vertical; borde
 .policyCard .decisionType { color: #bdc6be; }
 .compactDetails { margin: 0; }
 .policyChecks { list-style: none; margin: 0; padding: 0; }
-.policyChecks li { display: grid; grid-template-columns: 20px 1fr auto; gap: 9px; padding: 10px 0; border-bottom: 1px solid #3d4740; font-size: 13px; }
+.policyChecks li { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 9px; padding: 10px 0; border-bottom: 1px solid #3d4740; font-size: 13px; }
 .policyChecks li > span:first-child { color: var(--acid); font-weight: 900; }
 .policyChecks strong { color: var(--acid); text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
 .authorizationOutcome { margin: 20px 0 0; padding-top: 18px; border-top: 1px solid #687269; }
@@ -232,7 +236,7 @@ textarea { width: 100%; margin-top: 14px; padding: 14px; resize: vertical; borde
   color: var(--muted);
   line-height: 1.55;
 }
-.recoveryActions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+.recoveryActions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; }
 .recoveryActions > p { max-width: 360px; margin: 0; color: var(--muted); line-height: 1.5; }
 .terminalResources { margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
 .privateResultPanel, .safeReportPanel {
@@ -258,7 +262,7 @@ textarea { width: 100%; margin-top: 14px; padding: 14px; resize: vertical; borde
 .reportDetails > div { min-width: 0; padding: 15px 14px 15px 0; border-bottom: 1px solid var(--line); }
 .reportLifecycleHeading { margin-top: 30px; font-size: 20px; letter-spacing: -.02em; }
 .reportLifecycle { margin: 18px 0 0; padding: 0; list-style: none; border-left: 3px solid #66755b; }
-.reportLifecycle li { padding: 11px 0 11px 18px; display: flex; justify-content: space-between; gap: 18px; }
+.reportLifecycle li { min-width: 0; padding: 11px 0 11px 18px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px 18px; }
 .reportLifecycle li > span { color: var(--muted); font-size: 12px; }
 .closeTransactionPanel {
   margin-top: 32px;
@@ -328,9 +332,18 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 28px
   .reportDetails { grid-template-columns: 1fr; }
   .closeTransactionPanel, .confirmationActions { align-items: stretch; flex-direction: column; }
   .closeTransactionPanel button, .confirmationActions button { width: 100%; }
+  .primaryAction.compact { min-width: 0; }
 }
 
 @media (max-width: 480px) {
+  .appHeader { padding: 18px 16px; }
+  .requesterHero { min-height: calc(100vh - 118px); padding-left: 16px; padding-right: 16px; gap: 48px; }
+  .transactionWorkspace, .statusWorkspace { padding: 40px 16px; }
+  .transactionForm, .reviewCard, .waitingState { padding: 20px; }
+  .workspaceHeading { margin-bottom: 32px; }
+  .workspaceHeading h1, .waitingState h1, .statusSummary h1 { font-size: clamp(36px, 13vw, 52px); }
+  .confirmationBackdrop { padding: 12px; }
+  .confirmationDialog { padding: 22px 18px; max-height: calc(100vh - 24px); overflow-y: auto; }
   .protocolRail, .statusIdentifiers, .lifecycleList { grid-template-columns: 1fr; }
   .protocolRail li { padding-bottom: 14px; }
   .statusIdentifiers p { padding-left: 0; border-right: 0; border-top: 1px solid var(--line); }
@@ -338,6 +351,10 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 28px
   .lifecycleList { padding-left: 12px; }
   .lifecycleList li { padding: 7px 0 22px 36px; border-top: 0; border-left: 3px solid #b7bcb7; }
   .lifecycleList li > span { top: 0; left: -13px; }
+  .policyChecks li { grid-template-columns: 20px minmax(0, 1fr); }
+  .policyChecks strong { grid-column: 2; justify-self: start; }
+  .filePicker > span, .filePicker input { width: 100%; }
+  .filePicker > span { justify-content: center; text-align: center; }
   footer { flex-direction: column; line-height: 1.6; }
 }
 

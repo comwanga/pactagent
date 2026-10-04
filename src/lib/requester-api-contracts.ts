@@ -6,9 +6,14 @@
  * boundary instead of trusting arbitrary JSON.
  */
 
+import {
+  DOCUMENT_SOURCE_MAXIMUM_BYTES,
+  documentSourceBytes,
+} from "../domain/document-size";
+
 export type RequesterDocumentMediaType = "text/plain" | "application/pdf";
 
-export const REQUESTER_DOCUMENT_MAXIMUM_BYTES = 1_000_000;
+export const REQUESTER_DOCUMENT_MAXIMUM_BYTES = DOCUMENT_SOURCE_MAXIMUM_BYTES;
 export const REQUESTER_PROMPT_MAXIMUM_BYTES = 64 * 1024;
 
 export interface RequesterTransactionCreateInput {
@@ -189,6 +194,7 @@ export interface RequesterSafeReport {
 export type RequesterApiErrorCode =
   | "unauthorized"
   | "invalid_request"
+  | "document_too_large"
   | "result_not_available"
   | "report_not_available"
   | "transaction_in_progress"
@@ -213,6 +219,13 @@ export class RequesterContractError extends Error {
   }
 }
 
+export class RequesterDocumentTooLargeError extends RequesterContractError {
+  constructor() {
+    super("Document exceeds the 1 MiB source limit");
+    this.name = "RequesterDocumentTooLargeError";
+  }
+}
+
 export function parseRequesterTransactionCreateInput(value: unknown): RequesterTransactionCreateInput {
   const parsed = object(value);
   exactKeys(
@@ -233,8 +246,10 @@ export function parseRequesterTransactionCreateInput(value: unknown): RequesterT
     throw new RequesterContractError();
   }
   const privateDocument = nonEmptyText(parsed.privateDocument);
-  if (new TextEncoder().encode(privateDocument).byteLength > REQUESTER_DOCUMENT_MAXIMUM_BYTES) {
-    throw new RequesterContractError();
+  const sourceBytes = documentSourceBytes(privateDocument, parsed.mediaType);
+  if (sourceBytes === undefined) throw new RequesterContractError();
+  if (sourceBytes > REQUESTER_DOCUMENT_MAXIMUM_BYTES) {
+    throw new RequesterDocumentTooLargeError();
   }
   if (
     parsed.privatePrompt !== undefined &&
@@ -305,6 +320,7 @@ const RECONCILIATION_STATES = new Set<RequesterReconciliationState>([
 const ERROR_CODES = new Set<RequesterApiErrorCode>([
   "unauthorized",
   "invalid_request",
+  "document_too_large",
   "result_not_available",
   "report_not_available",
   "transaction_in_progress",

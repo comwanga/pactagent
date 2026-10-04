@@ -17,6 +17,7 @@ import {
   PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID,
 } from "../domain/pact-service-offer";
 import {
+  DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES,
   type PactAgreementReferences,
 } from "../domain/pact-service-agreement";
 
@@ -423,26 +424,25 @@ function sharedStores(): SharedStores {
 const fixture = buildFixture();
 
 describe("Pre-#37 recovery remediation", () => {
-  it("oversized private task fails with private_task_transport_too_large BEFORE escrow funding", async () => {
+  it("oversized private task fails at the profile boundary BEFORE escrow funding", async () => {
     const shared = sharedStores();
     const { runtime, cashu, relay } = buildRuntime(fixture, shared);
 
     await runtime.start();
-    const largeDoc = "A".repeat(900_000);
+    const largeDoc = "A".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1);
     await expect(
       runtime.startTransaction({
         ...startInput("oversized-task-key-001"),
         privateDocument: largeDoc,
       }),
-    ).rejects.toMatchObject({ code: "private_task_transport_too_large" });
+    ).rejects.toMatchObject({ code: "privacy_boundary_violation" });
 
     expect(cashu.prepareCalls).toBe(0);
     expect(cashu.spendCalls).toBe(0);
     const id = `txn_${createHash("sha256").update("oversized-task-key-001").digest("hex").slice(0, 32)}`;
     const status = await runtime.status(id);
-    expect(status.phase).toBe("accepted");
-    expect(status.agreementRootEventId).toBeDefined();
-    expect(await shared.settlementStore.read(`agreement-escrow:${status.agreementRootEventId}`)).toBeUndefined();
+    expect(status.phase).toBe("initialized");
+    expect(status.agreementRootEventId).toBeUndefined();
     expect(relay.events.filter((event) => event.kind === NIP59_GIFT_WRAP_KIND)).toHaveLength(0);
     expect(relay.events.some((event) => event.content.includes('"state":"task_delivered"'))).toBe(false);
     await runtime.shutdown();
@@ -858,8 +858,11 @@ describe("Pre-#37 recovery remediation", () => {
     const noEscrowKey = "action-matrix-no-escrow-001";
     const noEscrowId = `txn_${createHash("sha256").update(noEscrowKey).digest("hex").slice(0, 32)}`;
     await expect(
-      runtime.startTransaction({ ...startInput(noEscrowKey), privateDocument: "A".repeat(900_000) }),
-    ).rejects.toMatchObject({ code: "private_task_transport_too_large" });
+      runtime.startTransaction({
+        ...startInput(noEscrowKey),
+        privateDocument: "A".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1),
+      }),
+    ).rejects.toMatchObject({ code: "privacy_boundary_violation" });
     expect((await runtime.status(noEscrowId)).availableActions).toEqual({
       resume: true,
       reconcile: false,
