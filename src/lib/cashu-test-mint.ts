@@ -2883,6 +2883,11 @@ class CashuTsMintBackend implements CashuMintPrivateBackend {
     readonly options: P2PKOptions;
   }): Promise<CashuPrivatePreparedSwap> {
     await this.ensureWallet();
+    console.error(
+      "cashu lock preparation input",
+      input.amountSats.toString(),
+      sumProofAmounts(input.proofs).toString(),
+    );
     try {
       const preview = await this.wallet.ops
         .send(input.amountSats, [...input.proofs])
