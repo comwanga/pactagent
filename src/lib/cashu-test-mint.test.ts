@@ -1485,6 +1485,191 @@ describe("Cashu test-mint retry and reconciliation", () => {
     expect(backend.submitCalls).toBe(2);
   });
 
+  it("clears stale terminal and orphan exposure reservations before a fresh lock", async () => {
+    const baseStore = createInMemoryCashuPrivateStore();
+    const backend = new FakeCashuBackend();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(1000n),
+      },
+      backend,
+      privateStore: baseStore,
+    });
+    await baseStore.write(MINT_URL, "operation:stale-rejected-lock", {
+      version: 1,
+      fingerprint: "stale-rejected",
+      kind: "lock",
+      status: "not_submitted",
+      errorCode: "insufficient_value",
+      allowedPublicKeys: [],
+    });
+    await baseStore.write(MINT_URL, "operation:stale-failed-lock", {
+      version: 1,
+      fingerprint: "stale-failed",
+      kind: "lock",
+      status: "failed_definitively",
+      errorCode: "proof_already_spent",
+      allowedPublicKeys: [],
+    });
+    await baseStore.write(MINT_URL, "exposure-ledger", {
+      version: 1,
+      reservations: {
+        "orphan-reservation-0": { amountSats: "351", status: "reserved" },
+        "stale-rejected-lock": { amountSats: "300", status: "reserved" },
+        "stale-failed-lock": { amountSats: "349", status: "locked" },
+      },
+    });
+
+    const fresh = await adapter.prepareLockedValue({
+      operationId: "fresh-lock-after-stale",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    });
+    expect(fresh.status).toBe("succeeded");
+    await expect(baseStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "fresh-lock-after-stale": { amountSats: "351", status: "locked" },
+      },
+    });
+  });
+
+  it("retains uncertain submitted_unknown exposure fail-closed inside the cap", async () => {
+    const backend = new FakeCashuBackend();
+    backend.submitFailures.push(
+      new CashuPrivateBackendError("timeout", "submitted_unknown"),
+    );
+    const baseStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore: baseStore,
+    });
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "ambiguous-lock-01",
+        funding: funding(),
+        amountSats: sats(350n),
+        spendingCondition: { lockPublicKey: spendingKey().publicKey },
+      }),
+    ).resolves.toMatchObject({ outcome: "reconciliation_required" });
+
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "over-cap-lock-01",
+        funding: funding(),
+        amountSats: sats(200n),
+        spendingCondition: { lockPublicKey: spendingKey().publicKey },
+      }),
+    ).rejects.toMatchObject({
+      code: "insufficient_value",
+      operationStatus: "not_submitted",
+    });
+    expect(backend.submitCalls).toBe(1);
+    await expect(baseStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "ambiguous-lock-01": { amountSats: "351", status: "reserved" },
+      },
+    });
+  });
+
+  it("retains a live succeeded lock reservation inside the exposure cap", async () => {
+    const backend = new FakeCashuBackend();
+    const baseStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore: baseStore,
+    });
+    const live = await adapter.prepareLockedValue({
+      operationId: "live-lock-0001",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    });
+    expect(live.status).toBe("succeeded");
+
+    await expect(
+      adapter.prepareLockedValue({
+        operationId: "over-cap-lock-02",
+        funding: funding(),
+        amountSats: sats(200n),
+        spendingCondition: { lockPublicKey: spendingKey().publicKey },
+      }),
+    ).rejects.toMatchObject({
+      code: "insufficient_value",
+      operationStatus: "not_submitted",
+    });
+    await expect(baseStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "live-lock-0001": { amountSats: "351", status: "locked" },
+      },
+    });
+  });
+
+  it("clears a consumed lock reservation left behind by a completed spend", async () => {
+    const backend = new FakeCashuBackend();
+    const baseStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: {
+        testMintUrl: MINT_URL,
+        unit: "sat",
+        maximumExposureSats: sats(500n),
+      },
+      backend,
+      privateStore: baseStore,
+    });
+    const lockKey = spendingKey();
+    const locked = await adapter.prepareLockedValue({
+      operationId: "consumed-lock-01",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: lockKey.publicKey },
+    });
+    if (locked.status !== "succeeded") throw new Error("lock preparation did not succeed");
+    await expect(
+      adapter.spendLockedValue({
+        operationId: "settling-spend-01",
+        handle: locked.handle,
+        spendingKey: lockKey,
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+
+    await baseStore.write(MINT_URL, "exposure-ledger", {
+      version: 1,
+      reservations: {
+        "consumed-lock-01": { amountSats: "351", status: "locked" },
+      },
+    });
+
+    const fresh = await adapter.prepareLockedValue({
+      operationId: "fresh-lock-after-consumed",
+      funding: funding(),
+      amountSats: sats(350n),
+      spendingCondition: { lockPublicKey: spendingKey().publicKey },
+    });
+    expect(fresh.status).toBe("succeeded");
+    await expect(baseStore.read(MINT_URL, "exposure-ledger")).resolves.toEqual({
+      version: 1,
+      reservations: {
+        "fresh-lock-after-consumed": { amountSats: "351", status: "locked" },
+      },
+    });
+  });
+
   it("terminates reconciliation when spent inputs have none of this operation's outputs", async () => {
     const backend = new FakeCashuBackend();
     backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
