@@ -34,6 +34,8 @@ const SAFE_ERROR_MESSAGES: Readonly<Record<RequesterApiErrorCode, string>> = Obj
   invalid_configuration: "The transaction service is not configured",
   not_running: "The transaction service is not running",
   reconciliation_required: "The transaction requires reconciliation",
+  transaction_not_completed:
+    "The transaction could not be completed; check its status or refund after the timeout",
   internal_error: "The transaction service could not complete the request",
   runtime_unavailable: "The transaction service is unavailable",
   upstream_invalid_response: "The transaction service returned an invalid response",
