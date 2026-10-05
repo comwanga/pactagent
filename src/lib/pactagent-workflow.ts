@@ -779,7 +779,7 @@ export class PactAgentWorkflow {
     // Catching it now means an unsummarizable document (for example a PDF whose
     // text cannot be extracted) fails before the requester locks any value,
     // instead of leaving the escrow funded and stuck until a timeout refund.
-    const preflight = summarizeDocument({
+    const preflight = await summarizeDocument({
       source_document: privateTerms.source_document,
       input_media_type: privateTerms.input_media_type,
       ...(privateTerms.private_prompt !== undefined
@@ -848,7 +848,7 @@ export class PactAgentWorkflow {
     history: SignedNostrEvent[],
     task: PrivateTaskPayload,
   ): Promise<string> {
-    const outcome = summarizeDocument({
+    const outcome = await summarizeDocument({
       source_document: task.source_document,
       input_media_type: task.input_media_type,
       ...(task.private_prompt !== undefined

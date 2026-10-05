@@ -159,7 +159,9 @@ function checkSize(request: DocumentSummaryRequest): DocumentSummaryFailure | un
   return undefined;
 }
 
-function extractPlainText(request: DocumentSummaryRequest): string | DocumentSummaryFailure {
+async function extractPlainText(
+  request: DocumentSummaryRequest,
+): Promise<string | DocumentSummaryFailure> {
   if (request.source_document.length === 0) {
     return fail("empty_document", "Document is empty");
   }
@@ -171,11 +173,11 @@ function extractPlainText(request: DocumentSummaryRequest): string | DocumentSum
   return extractPdfDocument(request.source_document);
 }
 
-function extractPdfDocument(source: string): string | DocumentSummaryFailure {
+async function extractPdfDocument(source: string): Promise<string | DocumentSummaryFailure> {
   const bytes = decodeBase64Pdf(source);
   if (typeof bytes === "string") return fail("unsupported_pdf", bytes);
   try {
-    const result = extractPdfText(bytes);
+    const result = await extractPdfText(bytes);
     if (result.text.length === 0) return fail("empty_document", "PDF does not contain extractable text");
     return result.text;
   } catch (error) {
@@ -289,7 +291,7 @@ function computeResultReference(agreementRoot: string, summary: string): string 
   return createPactResultReference(DOCUMENT_SUMMARY_PROFILE_ID, agreementRoot, { summary });
 }
 
-export function summarizeDocument(input: unknown): DocumentSummaryOutcome {
+export async function summarizeDocument(input: unknown): Promise<DocumentSummaryOutcome> {
   const request = validateRequestShape(input);
 
   const oversized = checkSize(request);
@@ -299,7 +301,7 @@ export function summarizeDocument(input: unknown): DocumentSummaryOutcome {
   const startedAt = clock();
   const deadline = createDeadline(startedAt, deadlineSeconds * 1000);
 
-  const extracted = extractPlainText(request);
+  const extracted = await extractPlainText(request);
   if (typeof extracted !== "string") return extracted;
   if (extracted.trim().length === 0) return fail("empty_document", "Document contains no extractable text");
 
