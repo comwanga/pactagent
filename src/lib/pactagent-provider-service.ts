@@ -1130,7 +1130,7 @@ export class PactAgentProviderService {
       throw new ProviderServiceError("task_retrieval_failed", "Failed to retrieve private task");
     }
 
-    const outcome = summarizeDocument({
+    const outcome = await summarizeDocument({
       source_document: task.source_document,
       input_media_type: task.input_media_type,
       ...(task.private_prompt !== undefined ? { private_prompt: task.private_prompt } : {}),

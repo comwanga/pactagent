@@ -76,8 +76,8 @@ afterEach(() => {
 
 describe("document-summary service", () => {
   describe("valid text documents", () => {
-    it("summarizes a short plain-text document", () => {
-      const outcome = summarizeDocument({
+    it("summarizes a short plain-text document", async () => {
+      const outcome = await summarizeDocument({
         source_document: "The quick brown fox jumps over the lazy dog.",
         input_media_type: "text/plain",
       });
@@ -87,15 +87,15 @@ describe("document-summary service", () => {
       expect(success.resultHash).toBe(canonicalResultHash(success.summary));
     });
 
-    it("returns the full text when it fits within the summary bound", () => {
+    it("returns the full text when it fits within the summary bound", async () => {
       const text = "PactAgent settles agreements over open Bitcoin protocols.";
-      const outcome = summarizeDocument({ source_document: text, input_media_type: "text/plain" });
+      const outcome = await summarizeDocument({ source_document: text, input_media_type: "text/plain" });
       const success = expectSuccess(outcome);
       expect(success.summary).toBe(text);
       expect(success.extractedChars).toBe(text.length);
     });
 
-    it("produces a deterministic summary for the same input", () => {
+    it("produces a deterministic summary for the same input", async () => {
       const document = [
         "Bitcoin enables decentralized settlement.",
         "Nostr carries signed events between independent agents.",
@@ -108,24 +108,24 @@ describe("document-summary service", () => {
         "Input is bounded to one megabyte of text or PDF.",
         "Result references commit to a SHA-256 hash.",
       ].join(" ");
-      const first = summarizeDocument({ source_document: document, input_media_type: "text/plain" });
-      const second = summarizeDocument({ source_document: document, input_media_type: "text/plain" });
+      const first = await summarizeDocument({ source_document: document, input_media_type: "text/plain" });
+      const second = await summarizeDocument({ source_document: document, input_media_type: "text/plain" });
       expect(second).toEqual(first);
     });
 
-    it("truncates long documents to the maximum summary length", () => {
+    it("truncates long documents to the maximum summary length", async () => {
       const sentence =
         "PactAgent agents negotiate narrow service agreements over Nostr and settle through Cashu ecash escrow. ";
       const document = sentence.repeat(120);
-      const outcome = summarizeDocument({ source_document: document, input_media_type: "text/plain" });
+      const outcome = await summarizeDocument({ source_document: document, input_media_type: "text/plain" });
       const success = expectSuccess(outcome);
       expect(success.summary.length).toBeLessThanOrEqual(DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS);
     });
   });
 
   describe("result hash and reference", () => {
-    it("generates a SHA-256 result hash", () => {
-      const outcome = summarizeDocument({
+    it("generates a SHA-256 result hash", async () => {
+      const outcome = await summarizeDocument({
         source_document: "Hash reference generation is required.",
         input_media_type: "text/plain",
       });
@@ -134,8 +134,8 @@ describe("document-summary service", () => {
       expect(success.resultHash).toBe(canonicalResultHash(success.summary));
     });
 
-    it("generates an agreement-bound result reference when an agreement root is supplied", () => {
-      const outcome = summarizeDocument({
+    it("generates an agreement-bound result reference when an agreement root is supplied", async () => {
+      const outcome = await summarizeDocument({
         source_document: "Reference generation must match the capability profile.",
         input_media_type: "text/plain",
         agreementRoot: AGREEMENT_ROOT,
@@ -144,8 +144,8 @@ describe("document-summary service", () => {
       expect(success.resultReference).toBe(canonicalResultReference(AGREEMENT_ROOT, success.summary));
     });
 
-    it("does not emit a result reference when no agreement root is supplied", () => {
-      const outcome = summarizeDocument({
+    it("does not emit a result reference when no agreement root is supplied", async () => {
+      const outcome = await summarizeDocument({
         source_document: "No agreement root means no bound reference.",
         input_media_type: "text/plain",
       });
@@ -155,9 +155,9 @@ describe("document-summary service", () => {
   });
 
   describe("oversized input", () => {
-    it("rejects input exceeding the maximum document size", () => {
+    it("rejects input exceeding the maximum document size", async () => {
       const oversized = "x".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES + 1);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: oversized,
         input_media_type: "text/plain",
       });
@@ -165,9 +165,9 @@ describe("document-summary service", () => {
       expect((outcome as { errorCode: string }).errorCode).toBe("input_too_large");
     });
 
-    it("accepts input exactly at the maximum document size", () => {
+    it("accepts input exactly at the maximum document size", async () => {
       const atLimit = "a".repeat(DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: atLimit,
         input_media_type: "text/plain",
       });
@@ -176,35 +176,35 @@ describe("document-summary service", () => {
   });
 
   describe("unsupported types", () => {
-    it("rejects an unsupported media type", () => {
-      expect(() =>
+    it("rejects an unsupported media type", async () => {
+      await expect(
         summarizeDocument({ source_document: "x", input_media_type: "text/html" as never }),
-      ).toThrow(/Unsupported document media type/);
+      ).rejects.toThrow(/Unsupported document media type/);
     });
 
-    it("rejects an empty media type", () => {
-      expect(() => summarizeDocument({ source_document: "x", input_media_type: "" as never })).toThrow(
+    it("rejects an empty media type", async () => {
+      await expect(summarizeDocument({ source_document: "x", input_media_type: "" as never })).rejects.toThrow(
         /not supported/,
       );
     });
   });
 
   describe("empty documents", () => {
-    it("rejects an empty plain-text document", () => {
-      const outcome = summarizeDocument({ source_document: "", input_media_type: "text/plain" });
+    it("rejects an empty plain-text document", async () => {
+      const outcome = await summarizeDocument({ source_document: "", input_media_type: "text/plain" });
       expect(outcome.status).toBe("failed");
       expect((outcome as { errorCode: string }).errorCode).toBe("empty_document");
     });
 
-    it("rejects a whitespace-only plain-text document", () => {
-      const outcome = summarizeDocument({ source_document: "   \n\t  ", input_media_type: "text/plain" });
+    it("rejects a whitespace-only plain-text document", async () => {
+      const outcome = await summarizeDocument({ source_document: "   \n\t  ", input_media_type: "text/plain" });
       expect(outcome.status).toBe("failed");
       expect((outcome as { errorCode: string }).errorCode).toBe("empty_document");
     });
   });
 
   describe("execution bounding", () => {
-    it("rejects a summary when the deadline elapses during execution", () => {
+    it("rejects a summary when the deadline elapses during execution", async () => {
       const steppingClock = (() => {
         let step = 0;
         return () => {
@@ -214,7 +214,7 @@ describe("document-summary service", () => {
         };
       })();
       __setDocumentSummaryClockForTesting(steppingClock);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: "This document must be summarized before the deadline.",
         input_media_type: "text/plain",
         deadlineSeconds: 1,
@@ -223,9 +223,9 @@ describe("document-summary service", () => {
       expect((outcome as { errorCode: string }).errorCode).toBe("execution_deadline_exceeded");
     });
 
-    it("completes when execution stays within the configured deadline", () => {
+    it("completes when execution stays within the configured deadline", async () => {
       __setDocumentSummaryClockForTesting(() => 5_000_000);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: "A bounded deadline must be respected when execution is fast.",
         input_media_type: "text/plain",
         deadlineSeconds: 1,
@@ -233,11 +233,11 @@ describe("document-summary service", () => {
       expect(outcome.status).toBe("completed");
     });
 
-    it("completes exactly one millisecond before the deadline boundary", () => {
+    it("completes exactly one millisecond before the deadline boundary", async () => {
       const start = 2_000_000;
       let ticks = 0;
       __setDocumentSummaryClockForTesting(() => start + ticks++);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: "Execution finishing just before the deadline succeeds.",
         input_media_type: "text/plain",
         deadlineSeconds: 1,
@@ -245,7 +245,7 @@ describe("document-summary service", () => {
       expect(outcome.status).toBe("completed");
     });
 
-    it("fails exactly at the deadline boundary (expiry is inclusive)", () => {
+    it("fails exactly at the deadline boundary (expiry is inclusive)", async () => {
       let ticks = 0;
       const start = 3_000_000;
       __setDocumentSummaryClockForTesting(() => {
@@ -253,7 +253,7 @@ describe("document-summary service", () => {
         ticks += 1;
         return value;
       });
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: "Execution reaching the exact deadline fails.",
         input_media_type: "text/plain",
         deadlineSeconds: 1,
@@ -262,19 +262,19 @@ describe("document-summary service", () => {
       expect((outcome as { errorCode: string }).errorCode).toBe("execution_deadline_exceeded");
     });
 
-    it("rejects deadlineSeconds exceeding the profile maximum", () => {
-      expect(() =>
+    it("rejects deadlineSeconds exceeding the profile maximum", async () => {
+      await expect(
         summarizeDocument({
           source_document: "x",
           input_media_type: "text/plain",
           deadlineSeconds: DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS + 1,
         }),
-      ).toThrow(/capability profile maximum/);
+      ).rejects.toThrow(/capability profile maximum/);
     });
 
-    it("accepts deadlineSeconds exactly at the profile maximum", () => {
+    it("accepts deadlineSeconds exactly at the profile maximum", async () => {
       __setDocumentSummaryClockForTesting(() => 7_000_000);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: "The profile maximum deadline is acceptable.",
         input_media_type: "text/plain",
         deadlineSeconds: DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS,
@@ -284,12 +284,12 @@ describe("document-summary service", () => {
   });
 
   describe("PDF documents", () => {
-    it("summarizes a supported PDF document", () => {
+    it("summarizes a supported PDF document", async () => {
       const pdf = buildPdfFixture([
         "PactAgent summarizes documents through a bounded service.",
         "The provider extracts text and returns a deterministic summary.",
       ]);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: pdf,
         input_media_type: "application/pdf",
       });
@@ -299,9 +299,9 @@ describe("document-summary service", () => {
       expect(success.resultHash).toBe(canonicalResultHash(success.summary));
     });
 
-    it("rejects a PDF with no extractable text", () => {
+    it("rejects a PDF with no extractable text", async () => {
       const pdf = buildPdfFixture(["   "]);
-      const outcome = summarizeDocument({
+      const outcome = await summarizeDocument({
         source_document: pdf,
         input_media_type: "application/pdf",
       });
@@ -311,10 +311,10 @@ describe("document-summary service", () => {
   });
 
   describe("private_prompt", () => {
-    it("accepts a private_prompt without altering the deterministic output", () => {
+    it("accepts a private_prompt without altering the deterministic output", async () => {
       const document = "PactAgent provides a bounded document-summary service.";
-      const withoutPrompt = summarizeDocument({ source_document: document, input_media_type: "text/plain" });
-      const withPrompt = summarizeDocument({
+      const withoutPrompt = await summarizeDocument({ source_document: document, input_media_type: "text/plain" });
+      const withPrompt = await summarizeDocument({
         source_document: document,
         input_media_type: "text/plain",
         private_prompt: "Summarize this in 200 words.",
@@ -324,8 +324,8 @@ describe("document-summary service", () => {
   });
 
   describe("provider failure representation", () => {
-    it("represents an unsupported PDF as a clean failure outcome", () => {
-      const outcome = summarizeDocument({
+    it("represents an unsupported PDF as a clean failure outcome", async () => {
+      const outcome = await summarizeDocument({
         source_document: "not-a-pdf",
         input_media_type: "application/pdf",
       });
@@ -333,8 +333,8 @@ describe("document-summary service", () => {
       expect((outcome as { errorCode: string }).errorCode).toBe("unsupported_pdf");
     });
 
-    it("represents an invalid base64 PDF as a clean failure outcome", () => {
-      const outcome = summarizeDocument({
+    it("represents an invalid base64 PDF as a clean failure outcome", async () => {
+      const outcome = await summarizeDocument({
         source_document: "!!!not-base64!!!",
         input_media_type: "application/pdf",
       });
