@@ -772,6 +772,27 @@ export class PactAgentWorkflow {
         "Private task gift wrap exceeds the configured relay transport limits",
       );
     }
+
+    // Preflight the deterministic document-summary execution before any escrow
+    // is funded. The provider runs the exact same pure summarizer, so if it
+    // cannot produce a summary here it cannot produce one after funding either.
+    // Catching it now means an unsummarizable document (for example a PDF whose
+    // text cannot be extracted) fails before the requester locks any value,
+    // instead of leaving the escrow funded and stuck until a timeout refund.
+    const preflight = summarizeDocument({
+      source_document: privateTerms.source_document,
+      input_media_type: privateTerms.input_media_type,
+      ...(privateTerms.private_prompt !== undefined
+        ? { private_prompt: privateTerms.private_prompt }
+        : {}),
+      agreementRoot: context.root.event.id,
+    });
+    if (preflight.status !== "completed") {
+      workflowError(
+        "execution_failed",
+        `Document cannot be summarized before funding: ${preflight.errorCode}`,
+      );
+    }
   }
 
   async #providerReceivesAndDeliversTask(

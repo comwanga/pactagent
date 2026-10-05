@@ -575,6 +575,27 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(s.cashu.spendCalls).toBe(1);
     }, 30_000);
 
+    it("rejects an unsummarizable document before funding any escrow", async () => {
+      const s = buildWorkflow();
+      // A whitespace-only document cannot be summarized. Without a pre-funding
+      // check it would fund the escrow and only fail at provider execution,
+      // leaving the requester's value locked until a timeout refund. The
+      // preflight runs the deterministic summarizer first, so the transaction
+      // fails before any Cashu lock is prepared.
+      await expect(
+        s.workflow.runSuccessfulTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument: "   \n\t   ",
+          mediaType: "text/plain",
+          privatePrompt: "PRIVATE-PROMPT Summarize concisely.",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        }),
+      ).rejects.toMatchObject({ code: "execution_failed" });
+      expect(s.cashu.prepareCalls).toBe(0);
+      expect(s.cashu.spendCalls).toBe(0);
+    }, 30_000);
+
     it("uses discovery rather than hard-coding P002", async () => {
       const s = buildWorkflow();
       const report = await s.workflow.runSuccessfulTransaction({
