@@ -719,6 +719,14 @@ export interface CashuPrivateStore {
   read(scope: string, key: string): Promise<unknown | undefined>;
   write(scope: string, key: string, value: unknown): Promise<void>;
   withExclusiveLock<T>(scope: string, key: string, operation: () => Promise<T>): Promise<T>;
+  /**
+   * Optional enumeration of the keys persisted under a scope. Durable and
+   * in-memory stores implement it; narrow test doubles may omit it. Callers
+   * that depend on enumeration (e.g. the runtime's expired-funded-escrow
+   * reclaim sweep) must treat its absence as "no enumeration available" and
+   * fail safe rather than assuming an empty store.
+   */
+  list?(scope: string): Promise<readonly string[]>;
 }
 
 export class PrivateCashuProofImport {
@@ -739,6 +747,14 @@ export function createInMemoryCashuPrivateStore(): CashuPrivateStore {
     },
     async write(scope: string, key: string, value: unknown): Promise<void> {
       records.set(`${scope}:${key}`, value);
+    },
+    async list(scope: string): Promise<readonly string[]> {
+      const prefix = `${scope}:`;
+      return Object.freeze(
+        [...records.keys()]
+          .filter((composite) => composite.startsWith(prefix))
+          .map((composite) => composite.slice(prefix.length)),
+      );
     },
     async withExclusiveLock<T>(
       scope: string,
@@ -860,6 +876,9 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
   const readStatement = database.prepare(
     "SELECT value_json FROM pact_cashu_private_values WHERE scope = ? AND store_key = ?",
   );
+  const listStatement = database.prepare(
+    "SELECT store_key FROM pact_cashu_private_values WHERE scope = ?",
+  );
   const writeStatement = database.prepare(`
     INSERT INTO pact_cashu_private_values (scope, store_key, value_json)
     VALUES (?, ?, ?)
@@ -963,6 +982,18 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
           privateStoreIdentifier(key),
         ) as { value_json: string } | undefined;
         return row === undefined ? undefined : parsePrivateStoreValue(row.value_json);
+      } catch (error) {
+        if (error instanceof CashuTestMintError) throw error;
+        return privateStoreFailure();
+      }
+    },
+    async list(scope: string): Promise<readonly string[]> {
+      ensureOpen();
+      try {
+        const rows = listStatement.all(privateStoreIdentifier(scope)) as {
+          store_key: string;
+        }[];
+        return Object.freeze(rows.map((row) => row.store_key));
       } catch (error) {
         if (error instanceof CashuTestMintError) throw error;
         return privateStoreFailure();

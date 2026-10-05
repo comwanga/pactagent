@@ -1004,6 +1004,16 @@ export class PactAgentRuntime {
     if (this.#executions.has(record.transactionId)) return;
     const execution = Promise.resolve()
       .then(async () => {
+        // Just-in-time exposure relief: before a newly accepted transaction
+        // funds its escrow, reclaim any abandoned expired funded escrows so a
+        // full cap left behind by prior abandoned transactions cannot block
+        // this funding. Reclaim never touches this not-yet-funded transaction
+        // and fails closed internally, so it is always safe to run first.
+        try {
+          await this.reclaimExpiredFundedEscrows();
+        } catch {
+          // Funding proceeds regardless; reclaim is strictly additive relief.
+        }
         try {
           await this.#executeAndPersist(record);
         } catch (error) {
@@ -1407,6 +1417,61 @@ export class PactAgentRuntime {
     });
   }
 
+  /**
+   * Reclaim the exposure held by abandoned, expired funded escrows by driving
+   * each to an authoritative timeout refund through the existing, tested
+   * per-transaction {@link refund} path. Enumerates every persisted
+   * transaction record and, for each whose escrow is funded (or
+   * release-authorized) with a passed locktime, invokes the idempotent refund
+   * — returning the locked value to the requester wallet and releasing its
+   * Cashu exposure reservation. This is the deployed-reconciliation remedy for
+   * the repeatability defect where abandoned funded escrows accumulate and
+   * exhaust the demo exposure cap, blocking all subsequent funding.
+   *
+   * Each transaction is handled independently; any per-transaction failure is
+   * swallowed so one unresolvable record never blocks reclaiming the rest, and
+   * genuinely unresolved exposure simply remains counted (fail-closed). When
+   * the private store cannot enumerate keys, this is a safe no-op.
+   */
+  async reclaimExpiredFundedEscrows(): Promise<
+    Readonly<{ inspected: number; reclaimed: number }>
+  > {
+    this.#ensureRunning();
+    const store = this.#config.privateStore;
+    if (typeof store.list !== "function") {
+      return Object.freeze({ inspected: 0, reclaimed: 0 });
+    }
+    await this.#ensureRelayConnected();
+    let transactionIds: readonly string[];
+    try {
+      transactionIds = await store.list(TRANSACTION_SCOPE);
+    } catch {
+      return Object.freeze({ inspected: 0, reclaimed: 0 });
+    }
+    let reclaimed = 0;
+    for (const transactionId of transactionIds) {
+      try {
+        const record = await this.#loadRecord(transactionId);
+        if (!record || record.phase === "settled" || record.phase === "refunded") continue;
+        if (!record.agreementRootEventId) continue;
+        const escrow = await this.#readEscrowReferenceAndVersion(record.agreementRootEventId);
+        if (!escrow) continue;
+        const now = this.#config.dependencies.clock.now();
+        const fundedNotReleased =
+          escrow.operationalState === "funded" ||
+          escrow.operationalState === "release_authorized";
+        const locktimePassed = escrow.locktime !== undefined && now >= escrow.locktime;
+        if (!(fundedNotReleased && locktimePassed)) continue;
+        const report = await this.refund(transactionId);
+        if (report.finalOutcome === "refunded") reclaimed += 1;
+      } catch {
+        // Fail closed per-transaction: an unresolvable record keeps its
+        // exposure counted rather than risking an unsafe release.
+      }
+    }
+    return Object.freeze({ inspected: transactionIds.length, reclaimed });
+  }
+
   async #executeRefund(
     record: DurableTransactionRecord,
     escrow: { reference: string; revision: number },
@@ -1622,6 +1687,14 @@ export class PactAgentRuntime {
     const capabilities = await this.#config.dependencies.cashu.inspectCapabilities();
     if (capabilities.unit !== "sat") {
       throw new PactAgentRuntimeError("invalid_configuration", "Configured mint does not use sat");
+    }
+    // Heal abandoned, expired funded escrows on every readiness check so a
+    // restarted runtime reclaims exposure the previous process left behind.
+    // Best-effort: reclaim never blocks readiness (it fails closed internally).
+    try {
+      await this.reclaimExpiredFundedEscrows();
+    } catch {
+      // Readiness is independent of reclaim; a later trigger retries safely.
     }
     return Object.freeze({ mintUrl: capabilities.mintUrl, unit: "sat", ready: true });
   }
