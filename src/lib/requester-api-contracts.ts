@@ -203,6 +203,7 @@ export type RequesterApiErrorCode =
   | "invalid_configuration"
   | "not_running"
   | "reconciliation_required"
+  | "transaction_not_completed"
   | "internal_error"
   | "runtime_unavailable"
   | "upstream_invalid_response";
@@ -329,6 +330,7 @@ const ERROR_CODES = new Set<RequesterApiErrorCode>([
   "invalid_configuration",
   "not_running",
   "reconciliation_required",
+  "transaction_not_completed",
   "internal_error",
   "runtime_unavailable",
   "upstream_invalid_response",

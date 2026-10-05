@@ -99,6 +99,8 @@ const ERROR_COPY: Readonly<Partial<Record<RequesterApiErrorCode, string>>> = {
   transaction_not_found: "The transaction was not found.",
   transaction_in_progress: "The transaction is already in progress.",
   reconciliation_required: "The runtime reports that reconciliation is required.",
+  transaction_not_completed:
+    "The transaction could not be completed yet. You can try again, or refund the escrow once the timeout has passed.",
   internal_error: "The transaction service could not complete the request.",
   upstream_invalid_response: "The transaction service returned an invalid response.",
   corrupt_record: "The transaction record is unavailable.",

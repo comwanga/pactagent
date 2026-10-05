@@ -61,7 +61,8 @@ import {
   createPactAgentRuntimeFromEnv,
   publishRuntimeBootstrapArtifacts,
 } from "./pactagent-runtime.live";
-import { toApiError } from "./pactagent-runtime-singleton";
+import { apiStatusForError, toApiError } from "./pactagent-runtime-singleton";
+import { PactAgentWorkflowError } from "./pactagent-workflow";
 import type { PactAgentLiveDemoConfig } from "./pactagent-workflow.live";
 
 const ROOT_TIME = 1_900_000_000;
@@ -567,6 +568,35 @@ describe("PactAgent runtime", () => {
     expect(closeCalls).toBe(1);
     expect(toApiError(caught)).toEqual({ error: "Internal error", code: "internal_error" });
     expect(JSON.stringify(toApiError(caught))).not.toContain(privateMarker);
+  });
+
+  it("maps a handled workflow failure to a safe non-500 recovery outcome", () => {
+    // A resume/reconcile that re-runs the workflow and cannot progress (for
+    // example the external provider has not delivered a result) throws a
+    // PactAgentWorkflowError. The durable failure is authoritative and
+    // observable through status, so the API must surface a handled outcome,
+    // never a bare 500 "internal_error".
+    const providerTimeout = new PactAgentWorkflowError(
+      "unexpected_state",
+      "Timed out waiting for external provider state: result_submitted (last seen: escrow_funded)",
+    );
+    expect(apiStatusForError(providerTimeout)).toBe(409);
+    expect(toApiError(providerTimeout)).toEqual({
+      error: "The transaction could not be completed; check its status or refund after the timeout",
+      code: "transaction_not_completed",
+    });
+    // No internal workflow/state detail crosses the API boundary.
+    expect(JSON.stringify(toApiError(providerTimeout))).not.toContain("escrow_funded");
+
+    // Reconciliation keeps its own dedicated handled code.
+    const reconcile = new PactAgentWorkflowError("reconciliation_required", "needs reconcile");
+    expect(apiStatusForError(reconcile)).toBe(409);
+    expect(toApiError(reconcile).code).toBe("reconciliation_required");
+
+    // A privacy-boundary assertion must stay an opaque internal error.
+    const privacy = new PactAgentWorkflowError("privacy_boundary_violation", "secret detail");
+    expect(apiStatusForError(privacy)).toBe(500);
+    expect(toApiError(privacy)).toEqual({ error: "Internal error", code: "internal_error" });
   });
 
   it("persists the transaction identity before publishing the agreement root", async () => {

@@ -134,16 +134,32 @@ export function toApiError(error: unknown): { error: string; code: string } {
   if (error instanceof PactAgentRuntimeError) {
     return { error: error.message, code: error.code };
   }
-  if (
-    error instanceof PactAgentWorkflowError &&
-    error.code === "reconciliation_required"
-  ) {
-    return { error: "Transaction requires reconciliation", code: "reconciliation_required" };
+  if (error instanceof PactAgentWorkflowError) {
+    // A workflow error is a handled, durably-persisted transaction outcome
+    // (the authoritative failure is observable through status), not a server
+    // fault — with the sole exception of a privacy-boundary assertion, whose
+    // detail must never surface to a caller.
+    if (error.code === "privacy_boundary_violation") {
+      return { error: "Internal error", code: "internal_error" };
+    }
+    if (error.code === "reconciliation_required") {
+      return { error: "Transaction requires reconciliation", code: "reconciliation_required" };
+    }
+    return {
+      error: "The transaction could not be completed; check its status or refund after the timeout",
+      code: "transaction_not_completed",
+    };
   }
   return { error: "Internal error", code: "internal_error" };
 }
 
 export function apiStatusForError(error: unknown): number {
+  if (error instanceof PactAgentWorkflowError) {
+    // Handled, durably-recorded workflow outcomes are not internal faults; the
+    // client should re-read the authoritative status. Only an internal
+    // privacy-boundary assertion is treated as a genuine 500.
+    return error.code === "privacy_boundary_violation" ? 500 : 409;
+  }
   if (!(error instanceof PactAgentRuntimeError)) return 500;
   switch (error.code) {
     case "transaction_not_found":
