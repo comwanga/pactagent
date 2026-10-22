@@ -1,0 +1,65 @@
+{
+  "name": "Protect main",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "pull_request"
+    }
+  ],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "allowed_merge_methods": ["merge", "squash", "rebase"],
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": true,
+        "require_extra_approval_for_unattributed_changes": true,
+        "require_last_push_approval": false,
+        "required_approving_review_count": 1,
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "Lint, type-check, and test", "integration_id": 15368 },
+          { "context": "Production build", "integration_id": 15368 },
+          { "context": "Cross-boundary privacy and authority invariants", "integration_id": 15368 },
+          { "context": "Process recovery acceptance", "integration_id": 15368 },
+          { "context": "Requester browser acceptance", "integration_id": 15368 },
+          { "context": "CodeQL (javascript-typescript)", "integration_id": 15368 },
+          { "context": "CodeQL (actions)", "integration_id": 15368 },
+          { "context": "Dependency review", "integration_id": 15368 }
+        ]
+      }
+    },
+    {
+      "type": "copilot_code_review",
+      "parameters": {
+        "review_draft_pull_requests": true,
+        "review_on_push": true
+      }
+    },
+    {
+      "type": "code_quality",
+      "parameters": {
+        "severity": "errors"
+      }
+    }
+  ]
+}
