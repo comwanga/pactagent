@@ -1,0 +1,8 @@
+# Economic, protocol and CI paths need approval from a code owner other than the
+# PR author. The merge rules live in .github/rulesets/main.json.
+/src/lib/cashu-*                    @comwanga @mk-Denver
+/src/lib/pactagent-runtime*         @comwanga @mk-Denver
+/src/lib/pactagent-workflow*        @comwanga @mk-Denver
+/src/domain/pact-service-agreement* @comwanga @mk-Denver
+/src/domain/pontmore-*              @comwanga @mk-Denver
+/.github/                           @comwanga @mk-Denver

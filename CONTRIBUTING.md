@@ -59,6 +59,26 @@ npm audit --omit=dev --audit-level=high
 If a check is not relevant or cannot run in your environment, explain why in the
 pull request.
 
+Continuous integration also runs `npm run test:process` and
+`npm run test:e2e:requester`. Run them locally when you change recovery,
+runtime, or requester UI code.
+
+## Merge requirements
+
+The `main` ruleset is kept in [`.github/rulesets/main.json`](.github/rulesets/main.json).
+Change that file in a pull request before applying a ruleset change. A pull
+request can merge into `main` only when:
+
+- every required check passes on a branch that is up to date with `main`;
+- it has one approving review, and changes to paths listed in
+  [`.github/CODEOWNERS`](.github/CODEOWNERS) (Cashu, runtime, workflow,
+  protocol, and CI files) are approved by a code owner other than the author;
+  and
+- all review threads are resolved.
+
+Repository admins can bypass these rules only when merging a pull request, for
+emergencies. Explain any bypass in the pull request.
+
 ## Open a pull request
 
 In the pull request description:
