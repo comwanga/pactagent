@@ -1,3 +1,4 @@
+// Throwaway #57 ruleset verification; this change is never merged.
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
