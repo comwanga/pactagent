@@ -348,7 +348,7 @@ async function installLegacyAuthoritySource(directory: string, offsetSeconds: nu
 }
 
 describe("PactAgent separate-process restart acceptance", () => {
-  it("recovers a legacy +4 authority source through ALL-UNSPENT cleanup without submission", async () => {
+  it("recovers a legacy +4 authority source by replaying the exact prepared swap after ALL-UNSPENT", async () => {
     const directory = await stateDirectory();
     const started = await runToExit(directory, {
       action: "start",
@@ -377,21 +377,31 @@ describe("PactAgent separate-process restart acceptance", () => {
       action: "resume",
       transactionId: transactionId(IDEMPOTENCY_KEY),
     });
+    // An ALL-UNSPENT inspection is not a cancellation fence: the original
+    // request could still land. Resume therefore replays only the exact
+    // persisted swap (same inputs and blinded outputs), never a fresh lock.
     expect(recovered.message).toMatchObject({
-      type: "error",
-      name: "PactAgentWorkflowError",
-      message: "Escrow prepare or fund failed",
+      type: "result",
+      report: { finalOutcome: "settled" },
     });
-    expect(cashuRecoveryState(directory)).toEqual({
-      operationStatus: "not_submitted",
-      preparedPresent: false,
+    expect(cashuRecoveryState(directory)).toMatchObject({
+      operationStatus: "succeeded",
       activeExposureSats: "0",
     });
     const after = backendState(directory);
-    expect(after.submitLockCalls).toBe(before.submitLockCalls);
-    expect(after.submitSpendCalls).toBe(before.submitSpendCalls);
+    expect(after.prepareLockCalls).toBe(before.prepareLockCalls);
+    expect(after.submitLockCalls).toBe(before.submitLockCalls + 1);
+    expect(after.submitSpendCalls).toBe(before.submitSpendCalls + 1);
     expect(after.inspectCalls).toBe(before.inspectCalls + 1);
     expect(after.restoreCalls).toBe(before.restoreCalls);
+    expect(after.callLog.slice(before.callLog.length, before.callLog.length + 2)).toEqual([
+      "inspect",
+      "submit:lock",
+    ]);
+    expect(settlementState(directory)).toBe("settled");
+    expect(publicStates(directory).filter((state) => state === "escrow_funded")).toHaveLength(1);
+    expect(publicStates(directory).filter((state) => state === "settled")).toHaveLength(1);
+    expect(agreementRoots(directory)).toHaveLength(1);
   }, 90_000);
 
   it("kills after agreement publication and resumes the same agreement before economic work", async () => {
@@ -563,7 +573,7 @@ describe("PactAgent separate-process restart acceptance", () => {
         method: "POST",
         headers,
       });
-      expect(reconciled.status).toBe(500);
+      expect(reconciled.status).toBe(409);
       await expect(reconciled.json()).resolves.toMatchObject({
         code: "reconciliation_required",
       });
@@ -583,7 +593,7 @@ describe("PactAgent separate-process restart acceptance", () => {
     90_000,
   );
 
-  it("returns the authoritative accepted status after ALL-UNSPENT funding cleanup", async () => {
+  it("keeps ALL-UNSPENT funding ambiguity in reconciliation_required through HTTP reconcile without replaying", async () => {
     const directory = await stateDirectory();
     const running = spawnRuntime(directory, {
       action: "http",
@@ -623,34 +633,35 @@ describe("PactAgent separate-process restart acceptance", () => {
       method: "POST",
       headers,
     });
-    expect(reconciled.status).toBe(200);
-    const reconciledBody = await reconciled.json() as Record<string, unknown>;
-    expect(reconciledBody).toEqual(expect.objectContaining({
-      transactionId: transaction,
-      kind: "successful",
-      phase: "accepted",
-    }));
-    expect(reconciledBody.reconciliationRequired).toBeUndefined();
-    expect(reconciledBody.reconciliationState).toBeUndefined();
-    expect(reconciledBody.finalOutcome).toBeUndefined();
-    expect(reconciledBody).toMatchObject({
-      operationalState: "resolved_not_funded",
-      availableActions: { resume: false, reconcile: false },
-      resultAvailable: false,
-      reportAvailable: false,
+    // Reconcile is inspection-only: an ALL-UNSPENT observation can still be
+    // overtaken by the original request, so exposure stays reserved and no
+    // swap is replayed or resubmitted.
+    expect(reconciled.status).toBe(409);
+    await expect(reconciled.json()).resolves.toMatchObject({
+      code: "reconciliation_required",
     });
     const after = backendState(directory);
+    expect(after.prepareLockCalls).toBe(before.prepareLockCalls);
     expect(after.submitLockCalls).toBe(before.submitLockCalls);
     expect(after.submitSpendCalls).toBe(before.submitSpendCalls);
     expect(after.inspectCalls).toBe(before.inspectCalls + 1);
     expect(after.restoreCalls).toBe(before.restoreCalls);
     expect(cashuRecoveryState(directory)).toEqual({
-      operationStatus: "not_submitted",
-      preparedPresent: false,
-      activeExposureSats: "0",
+      operationStatus: "submitted_unknown",
+      preparedPresent: true,
+      activeExposureSats: "351",
     });
-    expect(settlementState(directory)).toBe("prepared");
+    expect(settlementState(directory)).toBe("funding_reconciliation_required");
     expect(publicStates(directory)).not.toContain("escrow_funded");
+    const status = await fetch(`${baseUrl}/api/transactions/${transaction}`, { headers });
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toMatchObject({
+      transactionId: transaction,
+      operationalState: "reconciliation_required",
+      reconciliationRequired: true,
+      reconciliationState: "funding_reconciliation_required",
+      availableActions: { reconcile: true },
+    });
 
     running.child.send?.("shutdown-http");
     expect(await running.waitForExit()).toEqual({ code: 0, signal: null });
