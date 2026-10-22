@@ -68,6 +68,11 @@ PACTAGENT LOCAL ENVIRONMENT READY
 | `npm run requester:model:doctor` | One bounded provider call; no PactAgent transaction or economic operation |
 | `npm run test:local:testnut` | Explicitly opt-in; consumes Testnut ecash in exactly one golden-path transaction |
 
+`test:process` takes about four to five minutes. Vitest runs the parent test with
+`vitest.process.config.ts`, while each runtime child runs through `vite-node` with
+`vite.process.config.ts`. The two configurations must keep the same module aliases (including the
+`server-only` test stub), or every child exits at import time before reaching its first checkpoint.
+
 `test:local:testnut` must own port 3000, so stop a separately running local runtime first. It runs
 the doctor, builds and starts a runtime child, bootstraps, attempts exactly one fresh transaction,
 checks one funding and one release operation, scans public API/relay/runtime-log surfaces for its
