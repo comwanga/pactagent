@@ -5,6 +5,7 @@ const root = process.cwd();
 const runtimeToken = "E2E-RUNTIME-TOKEN-SERVER-ONLY";
 const commonEnvironment = {
   ...process.env,
+  PACTAGENT_ECONOMIC_MODE: "demo",
   PACTAGENT_RUNTIME_API_BASE: "http://127.0.0.1:3411",
   PACTAGENT_RUNTIME_API_TOKEN: runtimeToken,
   PACTAGENT_LIVE_FUNDING_REFERENCE: "E2E-FUNDING-SERVER-ONLY",
