@@ -137,6 +137,12 @@ state-reset details.
 
 ## Test lanes
 
+GitHub Actions runs these on every pull request to `main`:
+- `CI`: the deterministic lane, lint, type-check, the production build, and the client-bundle privacy audit (`npm run audit:client-bundle`);
+- `Acceptance`: the process lane and the requester browser lane.
+
+The economic and live lanes run only locally, by explicit opt-in.
+
 ### Deterministic
 
 ```sh

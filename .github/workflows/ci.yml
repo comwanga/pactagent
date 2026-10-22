@@ -70,3 +70,6 @@ jobs:
 
       - name: Build with webpack
         run: npm run build -- --webpack
+
+      - name: Audit client bundle for server-only values
+        run: npm run audit:client-bundle
