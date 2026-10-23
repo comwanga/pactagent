@@ -65,6 +65,25 @@ human intent + private document
 accepted → escrow_funded → locktime reached → refund_authorized → Cashu refund → refunded
 ```
 
+### Recovery path (provider abandoned execution, rule revision 1.1)
+
+```text
+… → task_delivered [→ result_submitted] → execution deadline reached
+  → refund_authorized (execution_deadline_elapsed) → Cashu refund → refunded
+```
+
+`resumeRefundTransaction` publishes the requester's authorization only once
+trusted time reaches the execution deadline. It reuses an authorization that is
+already on the relay rather than publishing another, never authorizes during
+reconcile-only recovery, and refuses forked histories. The runtime offers a
+manual refund from either execution state after the deadline. Automatic reclaim
+(`reclaimExpiredFundedEscrows`, run at bootstrap and before new funding) refunds
+an abandoned `task_delivered` at the deadline. It leaves a `result_submitted`
+agreement to the success path until locktime, and finishes refunds interrupted
+after authorization. The runtime decides eligibility from the relay history, not
+from the possibly stale persisted phase, and logs reclaim failures once per
+transaction and failure code, with no private material.
+
 ## Clean-machine setup
 
 ### Requirements

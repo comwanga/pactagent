@@ -8,8 +8,10 @@ import type { NostrPublicKey, NostrSigner, SignedNostrEvent } from "../domain/no
 import { sats } from "../domain/money";
 import {
   DOCUMENT_SUMMARY_PROFILE_ID,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PactServiceAgreementError,
   createPactAgreementTransition,
+  pactAgreementExecutionDeadline,
   parsePactAgreementTransitionEvent,
   reconstructPactAgreementHistory,
   type PactAgreementContext,
@@ -404,7 +406,15 @@ interface StoredSettlementOperation {
   readonly type: SettlementOperationType;
   readonly fingerprint: string;
   readonly status: "pending" | "reconciliation_required" | "publication_pending" | "succeeded" | "failed";
+  /**
+   * NUT-11 key chosen at the first release/refund submission. Retries reuse it
+   * so a refund begun before locktime is reconciled as the same Cashu
+   * operation after locktime instead of conflicting with it.
+   */
+  readonly spendingKey?: "normal" | "refund";
 }
+
+export type PactCashuRefundBasis = "timeout" | "rejected" | "execution_deadline";
 
 interface StoredReleaseAuthorization {
   readonly eventId: string;
@@ -419,8 +429,9 @@ interface StoredRefundAuthorization {
   readonly eventId: string;
   readonly predecessor: string;
   readonly authorizer: NostrPublicKey;
-  readonly basis: "timeout" | "rejected";
+  readonly basis: PactCashuRefundBasis;
   readonly operationKey: string;
+  readonly executionDeadline?: number;
 }
 
 interface StoredCashuFacts {
@@ -453,6 +464,8 @@ interface StoredEscrowRecord {
   readonly timeoutPolicy: "refund-trigger timeout";
   readonly timeoutDurationSeconds: number;
   readonly locktime: number;
+  /** Rule revision 1.1 deadline; absent on escrows prepared before it existed. */
+  readonly executionDeadline?: number;
   readonly clockSkewSeconds: 1;
   readonly spendingCondition: CashuP2PKSpendingCondition;
   readonly state: PactCashuEscrowOperationalState;
@@ -774,7 +787,7 @@ export interface SubmitRefundAuthorizationInput {
   readonly expectedVersion: number;
   readonly context: PactAgreementContext;
   readonly history: readonly SignedNostrEvent[];
-  readonly basis: "timeout" | "rejected";
+  readonly basis: PactCashuRefundBasis;
 }
 
 export interface RefundPactCashuEscrowInput {
@@ -1036,6 +1049,14 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       if (locktime <= now) {
         settlementError("invalid_request", "Escrow locktime is invalid");
       }
+      // Fail closed before any value is locked: an agreement whose execution
+      // deadline does not precede the locktime would have no deadline refund.
+      let executionDeadline: number;
+      try {
+        executionDeadline = pactAgreementExecutionDeadline(input.context, input.history);
+      } catch {
+        settlementError("invalid_request", "Agreement execution deadline must precede the escrow locktime");
+      }
       const operationFingerprintValue = fingerprint({
         request_fingerprint: requestFingerprint,
         escrow_reference: escrowReference,
@@ -1060,6 +1081,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         timeoutPolicy: "refund-trigger timeout",
         timeoutDurationSeconds: descriptor.content.dispute_rules.timeout.duration_seconds,
         locktime,
+        executionDeadline,
         clockSkewSeconds: 1,
         spendingCondition: Object.freeze({
           lockPublicKey: this.dependencies.normalSpendKey.publicKey,
@@ -1394,6 +1416,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       if (authorization.content.actor !== record.requester) {
         settlementError("unauthorized_operation", "Refund signer is not the bound requester");
       }
+      let executionDeadline: number | undefined;
       if (input.basis === "timeout") {
         if (now < record.locktime || authorization.event.created_at < record.locktime) {
           settlementError("timeout_not_reached", "Escrow refund locktime has not been reached");
@@ -1405,8 +1428,32 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         ) {
           settlementError("invalid_state", "Timeout refund does not follow an eligible state");
         }
-      } else if (previous !== "rejected") {
-        settlementError("invalid_state", "Rejected refund does not follow a rejected result");
+      } else if (input.basis === "execution_deadline") {
+        if (
+          (previous !== "task_delivered" && previous !== "result_submitted") ||
+          authorization.content.reason_code !== PACT_EXECUTION_DEADLINE_REASON_CODE
+        ) {
+          settlementError("invalid_state", "Execution-deadline refund does not follow provider execution");
+        }
+        // Recomputed from the validated history and checked against this
+        // coordinator's clock; the requester's signed timestamp is not trusted.
+        try {
+          executionDeadline = pactAgreementExecutionDeadline(input.context, input.history);
+        } catch (error) {
+          return mapAgreementFailure(error);
+        }
+        if (record.executionDeadline !== undefined && record.executionDeadline !== executionDeadline) {
+          settlementError("agreement_mismatch", "Execution deadline does not match the escrow");
+        }
+        if (now < executionDeadline || authorization.event.created_at < executionDeadline) {
+          settlementError("timeout_not_reached", "Agreement execution deadline has not been reached");
+        }
+      } else if (input.basis === "rejected") {
+        if (previous !== "rejected") {
+          settlementError("invalid_state", "Rejected refund does not follow a rejected result");
+        }
+      } else {
+        settlementError("invalid_request", "Refund basis is invalid");
       }
       const operationFingerprintValue = operationFingerprint({
         record,
@@ -1428,6 +1475,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       if (
         !record.fundingHandle ||
         !["funded", "release_authorized"].includes(record.state) ||
+        (input.basis === "execution_deadline" && record.state !== "funded") ||
         record.economicClaim !== "none"
       ) {
         settlementError("funding_not_confirmed", "Escrow funding is not confirmed");
@@ -1444,6 +1492,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
             authorizer: authorization.event.pubkey,
             basis: input.basis,
             operationKey: key,
+            ...(executionDeadline === undefined ? {} : { executionDeadline }),
           }),
         },
       );
@@ -1646,6 +1695,16 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       if (type === "refund" && record.refundAuthorization?.basis === "timeout" && now < record.locktime) {
         settlementError("timeout_not_reached", "Escrow refund locktime has not been reached");
       }
+      if (
+        type === "refund" &&
+        record.refundAuthorization?.basis === "execution_deadline" &&
+        (record.refundAuthorization.executionDeadline === undefined ||
+          now < record.refundAuthorization.executionDeadline)
+      ) {
+        settlementError("timeout_not_reached", "Agreement execution deadline has not been reached");
+      }
+      const spendingKeyRole: "normal" | "refund" =
+        existing?.spendingKey ?? (type === "release" || now < record.locktime ? "normal" : "refund");
       const confirmedState = type === "release" ? "release_confirmed" : "refund_confirmed";
       if (record.state === confirmedState) {
         const published = await this.publishConfirmedTransition({
@@ -1668,7 +1727,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
         record = await this.setOperation(
           record,
           key,
-          { type, fingerprint: operationFingerprintValue, status: "pending" },
+          { type, fingerprint: operationFingerprintValue, status: "pending", spendingKey: spendingKeyRole },
           {
             state: type === "release" ? "release_pending" : "refund_pending",
             economicClaim: type,
@@ -1679,7 +1738,7 @@ class PactCashuCoordinator implements PactCashuEscrowSettlementCoordinator {
       let cashuResult: CashuMutationResult;
       try {
         const spendingKey =
-          type === "release" || now < record.locktime
+          spendingKeyRole === "normal"
             ? this.dependencies.normalSpendKey
             : this.dependencies.refundSpendKey;
         cashuResult = await this.dependencies.cashu.spendLockedValue({

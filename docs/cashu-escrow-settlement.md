@@ -86,9 +86,13 @@ escrow authority/source, selected PIP-01 descriptor, configured HTTPS test mint,
 `sat`, exactly 350 sats, `document-summary@1`, agreement expiry, descriptor
 timeout policy, service version, and NUT-11 condition.
 
-The purpose-specific normal key controls release and an authorized early
-rejection refund. A distinct purpose-specific refund key becomes usable through
-the NUT-11 refund path at locktime. Neither key is a Nostr signing key. The exact
+The purpose-specific normal key controls release and an authorized refund that
+first executes before locktime: an early rejection refund or a rule revision 1.1
+execution-deadline refund. A distinct purpose-specific refund key becomes usable
+through the NUT-11 refund path at locktime. The key chosen at an operation's first
+submission is persisted with it and reused on every retry. A refund that begins
+before locktime and has an ambiguous outcome is therefore reconciled after
+locktime as the same Cashu operation, not as a conflicting one. Neither key is a Nostr signing key. The exact
 locktime is:
 
 ```text
@@ -123,8 +127,23 @@ is persisted before the authority signs/publishes `escrow_funded`.
 Release requires canonical `release_authorized` history whose immediate chain
 contains the exact profile-validated result reference. The authorization expires
 at locktime and is consumed once. Refund requires canonical
-`refund_authorized` history and either a `rejected` predecessor or the
-deterministic timeout boundary. Authorization and execution remain separate.
+`refund_authorized` history signed by the bound requester, on one of three
+bases:
+
+- `timeout`: an `accepted`, `escrow_funded`, or `release_authorized` predecessor
+  and the deterministic locktime boundary.
+- `rejected`: a `rejected` predecessor.
+- `execution_deadline`: a `task_delivered` or `result_submitted` predecessor and
+  reason `execution_deadline_elapsed` (see `docs/pact-service-agreements.md`).
+  The coordinator recomputes the deadline from the validated history, compares
+  it with the deadline stored at preparation (absent on older escrows), and
+  requires both its own clock and the authorization timestamp to be at or after
+  it. It re-checks the deadline before spending.
+
+A claimed basis that does not match the history is rejected. Each escrow consumes
+at most one refund authorization, and only while no economic claim exists.
+Authorization and execution remain separate. Preparation fails closed when the
+agreement's execution deadline would not precede the locktime.
 
 An ambiguous #12 result is persisted as `reconciliation_required`; the
 coordinator calls #12 again with the same private operation id so that #12 uses

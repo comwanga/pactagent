@@ -37,7 +37,10 @@ import {
   type DemoWalletStatus,
   type EconomicMode,
 } from "./economic-environment";
-import type { PactCashuEscrowOperationalState } from "./cashu-escrow-settlement";
+import {
+  PactCashuSettlementError,
+  type PactCashuEscrowOperationalState,
+} from "./cashu-escrow-settlement";
 import { type CashuPrivateStore, type PrivateCashuFunding } from "./cashu-test-mint";
 import { type ApprovedRequesterDecision } from "./requester-decision";
 import { type SelectedProviderReferences } from "./provider-discovery";
@@ -535,6 +538,61 @@ function isRefundRecoveryState(
   return state !== undefined && REFUND_RECOVERY_STATES.has(state);
 }
 
+type RefundTrigger = "manual" | "reclaim";
+
+/**
+ * Agreement phases from which a funded escrow is refundable once its rule
+ * revision 1.1 execution deadline has passed. A requester may manually refund
+ * a submitted result it cannot complete; automatic reclaim leaves a submitted
+ * result alone while release is still possible (it is reclaimed at locktime).
+ */
+const EXECUTION_DEADLINE_REFUND_PHASES: Readonly<Record<RefundTrigger, ReadonlySet<string>>> = {
+  manual: new Set(["task_delivered", "result_submitted", "refund_authorized"]),
+  reclaim: new Set(["task_delivered", "refund_authorized"]),
+};
+
+interface EscrowRefundProjection {
+  readonly operationalState?: string;
+  readonly locktime?: number;
+  readonly executionDeadline?: number;
+}
+
+function timeoutRefundEligible(escrow: EscrowRefundProjection, now: number): boolean {
+  return (
+    (escrow.operationalState === "funded" || escrow.operationalState === "release_authorized") &&
+    escrow.locktime !== undefined &&
+    now >= escrow.locktime
+  );
+}
+
+/** Escrows prepared before rule revision 1.1 carry no deadline and wait for locktime. */
+function executionDeadlinePassed(escrow: EscrowRefundProjection, now: number): boolean {
+  return (
+    escrow.operationalState === "funded" &&
+    escrow.executionDeadline !== undefined &&
+    now >= escrow.executionDeadline
+  );
+}
+
+interface ReconstructedAgreementState {
+  readonly root: PactServiceAgreementRoot<SignedNostrEvent>;
+  readonly context: PactAgreementContext;
+  readonly history: PactAgreementHistory;
+  readonly phase: PactAgentWorkflowResumePhase;
+  readonly completionDecision?: PactCompletionDecision;
+}
+
+/** Bounds the per-transaction reclaim diagnostics kept to de-duplicate logs. */
+const MAX_TRACKED_RECLAIM_FAILURES = 1_000;
+
+function safeFailureCode(error: unknown): string {
+  return error instanceof PactAgentWorkflowError ||
+    error instanceof PactAgentRuntimeError ||
+    error instanceof PactCashuSettlementError
+    ? error.code
+    : "unexpected_error";
+}
+
 function buildSelectedOffer(selectedReferences: SelectedProviderReferences): PactAgentRuntimeSelectedOffer {
   return Object.freeze({
     ...selectedReferences,
@@ -708,6 +766,7 @@ export class PactAgentRuntime {
   readonly #decisionSource: "deterministic" | "model";
   readonly #externalProvider: boolean;
   readonly #executions = new Map<string, Promise<void>>();
+  readonly #reclaimFailures = new Map<string, string>();
   #started = false;
 
   constructor(config: PactAgentRuntimeConfig) {
@@ -777,13 +836,7 @@ export class PactAgentRuntime {
     agreementId: string,
     privateTerms: DocumentSummaryPrivateTerms,
     privateSaltHex: string,
-  ): Promise<{
-    root: PactServiceAgreementRoot<SignedNostrEvent>;
-    context: PactAgreementContext;
-    history: PactAgreementHistory;
-    phase: PactAgentWorkflowResumePhase;
-    completionDecision?: PactCompletionDecision;
-  }> {
+  ): Promise<ReconstructedAgreementState> {
     const root = await retrievePactServiceAgreementRoot({
       agreementId,
       references: this.#config.references,
@@ -869,6 +922,7 @@ export class PactAgentRuntime {
     operationalState?: string;
     fundingOperationStatus?: string;
     locktime?: number;
+    executionDeadline?: number;
   } | undefined> {
     const binding = (await this.#config.dependencies.settlementStore.read(
       `agreement-escrow:${rootEventId}`,
@@ -881,6 +935,7 @@ export class PactAgentRuntime {
       state?: unknown;
       operations?: Record<string, { status?: unknown }>;
       locktime?: unknown;
+      executionDeadline?: unknown;
     } | undefined;
     if (typeof record?.revision !== "number") return undefined;
     const reconciliationState =
@@ -895,6 +950,9 @@ export class PactAgentRuntime {
         ? { fundingOperationStatus: record.operations["wf-fund-escrow-001"].status }
         : {}),
       ...(typeof record.locktime === "number" ? { locktime: record.locktime } : {}),
+      ...(Number.isSafeInteger(record.executionDeadline)
+        ? { executionDeadline: record.executionDeadline as number }
+        : {}),
       ...(reconciliationState === undefined ? {} : { reconciliationState }),
     };
   }
@@ -1247,7 +1305,14 @@ export class PactAgentRuntime {
       escrowState === "funded" || escrowState === "release_authorized";
     const refundRecovery = isRefundRecoveryState(escrowState);
     const successPathBlocked = escrowFundedNotReleased && locktimePassed;
-    const refundEligible = (escrowFundedNotReleased && locktimePassed) || refundRecovery;
+    // The persisted phase can lag the relay (it is refreshed on interruption),
+    // so this projection may under-report; refund() re-checks authoritatively.
+    const executionDeadlineRefundEligible =
+      escrow !== undefined &&
+      executionDeadlinePassed(escrow, now) &&
+      EXECUTION_DEADLINE_REFUND_PHASES.manual.has(record.phase);
+    const refundEligible =
+      (escrowFundedNotReleased && locktimePassed) || refundRecovery || executionDeadlineRefundEligible;
     const resumable =
       !executing &&
       !reportAvailable &&
@@ -1373,10 +1438,12 @@ export class PactAgentRuntime {
   }
 
   /**
-   * Authoritative timeout refund. Invokes the existing Cashu settlement
-   * coordinator refund semantics through the workflow's refund path. The
-   * caller must verify `availableActions.refund === true` before calling; this
-   * method performs its own eligibility checks and fails closed otherwise.
+   * Authoritative refund. Invokes the existing Cashu settlement coordinator
+   * refund semantics through the workflow's refund path, after locktime or,
+   * for an agreement abandoned in a provider execution state, after its rule
+   * revision 1.1 execution deadline. The caller must verify
+   * `availableActions.refund === true` before calling; this method performs
+   * its own eligibility checks and fails closed otherwise.
    *
    * Idempotency: the underlying coordinator uses fixed idempotency keys and
    * operation deduplication. A second call after a completed refund returns
@@ -1388,6 +1455,18 @@ export class PactAgentRuntime {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
     await this.#ensureRelayConnected();
+    return (await this.#refundTransaction(transactionId, "manual"))!;
+  }
+
+  /**
+   * Applies the one refund eligibility rule shared by manual refund and
+   * automatic reclaim. Returns undefined only for a reclaim the rule does not
+   * permit; a manual refund it does not permit is rejected.
+   */
+  async #refundTransaction(
+    transactionId: string,
+    trigger: RefundTrigger,
+  ): Promise<PactAgentWorkflowReport | undefined> {
     return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
       const record = await this.#loadRecord(transactionId);
       if (!record) {
@@ -1406,77 +1485,114 @@ export class PactAgentRuntime {
         throw new PactAgentRuntimeError("invalid_request", "No funded escrow is available to refund");
       }
       const now = this.#config.dependencies.clock.now();
-      const escrowFundedNotReleased =
-        escrow.operationalState === "funded" || escrow.operationalState === "release_authorized";
-      const refundRecovery = isRefundRecoveryState(escrow.operationalState);
-      const locktimePassed = escrow.locktime !== undefined && now >= escrow.locktime;
-      if (!((escrowFundedNotReleased && locktimePassed) || refundRecovery)) {
-        throw new PactAgentRuntimeError("invalid_request", "Timeout refund is not authorized at this time");
+      if (timeoutRefundEligible(escrow, now) || isRefundRecoveryState(escrow.operationalState)) {
+        return this.#executeRefund(record, escrow);
       }
-      return this.#executeRefund(record, escrow);
+      if (executionDeadlinePassed(escrow, now)) {
+        // The persisted phase may lag the relay, so the agreement phase that
+        // makes a deadline refund eligible is read from the relay history.
+        const agreement = await this.#reconstructAgreementState(
+          record.agreementId,
+          record.privateTerms,
+          record.privateSaltHex,
+        );
+        if (
+          agreement.history.status === "ok" &&
+          EXECUTION_DEADLINE_REFUND_PHASES[trigger].has(agreement.phase)
+        ) {
+          return this.#executeRefund(record, escrow, agreement);
+        }
+      }
+      if (trigger === "reclaim") return undefined;
+      throw new PactAgentRuntimeError("invalid_request", "Timeout refund is not authorized at this time");
     });
   }
 
   /**
-   * Reclaim the exposure held by abandoned, expired funded escrows by driving
-   * each to an authoritative timeout refund through the existing, tested
-   * per-transaction {@link refund} path. Enumerates every persisted
-   * transaction record and, for each whose escrow is funded (or
-   * release-authorized) with a passed locktime, invokes the idempotent refund
-   * — returning the locked value to the requester wallet and releasing its
-   * Cashu exposure reservation. This is the deployed-reconciliation remedy for
-   * the repeatability defect where abandoned funded escrows accumulate and
-   * exhaust the demo exposure cap, blocking all subsequent funding.
+   * Reclaim the exposure held by abandoned funded escrows by driving each to
+   * an authoritative refund through the same eligibility rule as
+   * {@link refund}. Enumerates every persisted transaction record and refunds
+   * each whose escrow is funded (or release-authorized) with a passed
+   * locktime, abandoned after task_delivered past its execution deadline, or
+   * already mid-refund (finishing the same idempotent operation). The refund
+   * returns the locked value to the requester wallet and the Cashu spend
+   * releases its exposure reservation. This is the deployed-reconciliation
+   * remedy for the repeatability defect where abandoned funded escrows
+   * accumulate and exhaust the demo exposure cap, blocking all subsequent
+   * funding.
    *
-   * Each transaction is handled independently; any per-transaction failure is
-   * swallowed so one unresolvable record never blocks reclaiming the rest, and
-   * genuinely unresolved exposure simply remains counted (fail-closed). When
-   * the private store cannot enumerate keys, this is a safe no-op.
+   * Each transaction is handled independently so one unresolvable record never
+   * blocks reclaiming the rest, and genuinely unresolved exposure simply
+   * remains counted (fail-closed). Failures are counted and logged once per
+   * transaction and failure code, as safe codes only. When the private store
+   * cannot enumerate keys, this is a safe no-op.
    */
   async reclaimExpiredFundedEscrows(): Promise<
-    Readonly<{ inspected: number; reclaimed: number }>
+    Readonly<{ inspected: number; reclaimed: number; failed: number }>
   > {
     this.#ensureRunning();
     const store = this.#config.privateStore;
     if (typeof store.list !== "function") {
-      return Object.freeze({ inspected: 0, reclaimed: 0 });
+      return Object.freeze({ inspected: 0, reclaimed: 0, failed: 0 });
     }
     await this.#ensureRelayConnected();
     let transactionIds: readonly string[];
     try {
       transactionIds = await store.list(TRANSACTION_SCOPE);
     } catch {
-      return Object.freeze({ inspected: 0, reclaimed: 0 });
+      return Object.freeze({ inspected: 0, reclaimed: 0, failed: 0 });
     }
     let reclaimed = 0;
+    let failed = 0;
     for (const transactionId of transactionIds) {
       try {
+        if (this.#executions.has(transactionId)) continue;
         const record = await this.#loadRecord(transactionId);
         if (!record || record.phase === "settled" || record.phase === "refunded") continue;
         if (!record.agreementRootEventId) continue;
         const escrow = await this.#readEscrowReferenceAndVersion(record.agreementRootEventId);
         if (!escrow) continue;
         const now = this.#config.dependencies.clock.now();
-        const fundedNotReleased =
-          escrow.operationalState === "funded" ||
-          escrow.operationalState === "release_authorized";
-        const locktimePassed = escrow.locktime !== undefined && now >= escrow.locktime;
-        if (!(fundedNotReleased && locktimePassed)) continue;
-        const report = await this.refund(transactionId);
-        if (report.finalOutcome === "refunded") reclaimed += 1;
-      } catch {
+        if (
+          !timeoutRefundEligible(escrow, now) &&
+          !isRefundRecoveryState(escrow.operationalState) &&
+          !executionDeadlinePassed(escrow, now)
+        ) {
+          continue;
+        }
+        const report = await this.#refundTransaction(transactionId, "reclaim");
+        if (report?.finalOutcome === "refunded") {
+          reclaimed += 1;
+          this.#reclaimFailures.delete(transactionId);
+        }
+      } catch (error) {
         // Fail closed per-transaction: an unresolvable record keeps its
         // exposure counted rather than risking an unsafe release.
+        failed += 1;
+        this.#reportReclaimFailure(transactionId, error);
       }
     }
-    return Object.freeze({ inspected: transactionIds.length, reclaimed });
+    return Object.freeze({ inspected: transactionIds.length, reclaimed, failed });
+  }
+
+  #reportReclaimFailure(transactionId: string, error: unknown): void {
+    const code = safeFailureCode(error);
+    if (this.#reclaimFailures.get(transactionId) === code) return;
+    if (!this.#reclaimFailures.has(transactionId) && this.#reclaimFailures.size >= MAX_TRACKED_RECLAIM_FAILURES) {
+      this.#reclaimFailures.delete(this.#reclaimFailures.keys().next().value!);
+    }
+    this.#reclaimFailures.set(transactionId, code);
+    // Server-side operator log only; transaction ids and failure codes are
+    // safe and never include keys, proofs, private terms, or results.
+    console.error(`escrow reclaim failed [${transactionId}]: ${code}`);
   }
 
   async #executeRefund(
     record: DurableTransactionRecord,
     escrow: { reference: string; revision: number },
+    reconstructed?: ReconstructedAgreementState,
   ): Promise<PactAgentWorkflowReport> {
-    const { root, context, phase, completionDecision } = await this.#reconstructAgreementState(
+    const { root, context, phase, completionDecision } = reconstructed ?? await this.#reconstructAgreementState(
       record.agreementId,
       record.privateTerms,
       record.privateSaltHex,
@@ -1745,6 +1861,14 @@ export class PactAgentRuntime {
       settlementReference = escrowRecord?.settlementReference;
     }
 
+    let refundReference = record.refundReference;
+    if (phase === "refunded" && refundReference === undefined) {
+      const escrowRecord = (await this.#config.dependencies.settlementStore.read(
+        `escrow:${escrowReference}`,
+      )) as { refundReference?: string } | undefined;
+      refundReference = escrowRecord?.refundReference;
+    }
+
     const resumeState: PactAgentWorkflowResumeState = {
       kind: record.kind,
       phase,
@@ -1761,12 +1885,15 @@ export class PactAgentRuntime {
       resultReference,
       completionDecision,
       settlementReference,
-      refundReference: record.refundReference,
+      refundReference,
     };
 
     const workflow = this.#newWorkflow();
-    if (record.kind === "refund") {
-      return workflow.resumeRefundTransaction(resumeState, { reconcileOnly });
+    // The relay history, not the persisted kind, decides the path: a refund
+    // authorized or completed before the record was updated (for example an
+    // execution-deadline refund awaiting reconciliation) resumes as a refund.
+    if (record.kind === "refund" || phase === "refund_authorized" || phase === "refunded") {
+      return workflow.resumeRefundTransaction({ ...resumeState, kind: "refund" }, { reconcileOnly });
     }
     return workflow.resumeSuccessfulTransaction(resumeState, { reconcileOnly });
   }
