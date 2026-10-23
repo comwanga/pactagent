@@ -11,7 +11,9 @@ import { nostrPublicKey, type NostrIdentity, type SignedNostrEvent, type Unsigne
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
 import { createCashuEscrowDescriptor } from "../domain/pontmore-escrow";
 import {
+  DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS,
   DOCUMENT_SUMMARY_PROFILE_ID,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PactPrivateCommitmentSalt,
   createPactAgreementTransition,
   createPactCompletionDecision,
@@ -2135,4 +2137,483 @@ describe("integrated expired-agreement recovery with real Cashu adapter", () => 
     expect(restartedBackend.prepareCalls).toBe(0);
     expect(restartedBackend.submitCalls).toBe(0);
   }, 30_000);
+});
+
+describe("execution-deadline refund (document-summary@1 rule revision 1.1)", () => {
+  // Fixture acceptance is at ROOT_TIME + 2 with maximum_execution_seconds 300.
+  const DEADLINE = ROOT_TIME + 2 + 300 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS;
+
+  function advanceToExecution(
+    data: ReturnType<typeof setup>,
+    through: "task_delivered" | "result_submitted" = "task_delivered",
+  ): void {
+    const start = data.history.at(-1)!.created_at + 1;
+    append(data.context, data.history, "task_delivered", "provider", data.providerKey, start);
+    if (through === "result_submitted") {
+      append(data.context, data.history, "result_submitted", "provider", data.providerKey, start + 1, {
+        resultReference: createPactResultReference(
+          DOCUMENT_SUMMARY_PROFILE_ID,
+          data.context.root.event.id,
+          data.privateResult,
+        ),
+      });
+    }
+  }
+
+  function appendDeadlineRefund(data: ReturnType<typeof setup>, createdAt = DEADLINE): SignedNostrEvent {
+    data.clock.value = createdAt;
+    return append(data.context, data.history, "refund_authorized", "requester", data.requesterKey, createdAt, {
+      reasonCode: PACT_EXECUTION_DEADLINE_REASON_CODE,
+    });
+  }
+
+  function authorize(
+    data: ReturnType<typeof setup>,
+    escrowReference: string,
+    expectedVersion: number,
+    idempotencyKey = "authorize-deadline-1",
+    basis: "timeout" | "rejected" | "execution_deadline" = "execution_deadline",
+    coordinator = data.coordinator,
+  ) {
+    return coordinator.submitRefundAuthorization({
+      idempotencyKey,
+      escrowReference,
+      expectedVersion,
+      context: data.context,
+      history: data.history,
+      basis,
+    });
+  }
+
+  function refund(
+    data: ReturnType<typeof setup>,
+    escrowReference: string,
+    expectedVersion: number,
+    idempotencyKey = "refund-deadline-1",
+    coordinator = data.coordinator,
+  ) {
+    return coordinator.refundEscrow({
+      idempotencyKey,
+      escrowReference,
+      expectedVersion,
+      context: data.context,
+      history: data.history,
+    });
+  }
+
+  it.each(["task_delivered", "result_submitted"] as const)(
+    "refunds an escrow abandoned at %s exactly once with the normal key before locktime",
+    async (through) => {
+      const data = setup();
+      const { funded } = await prepareAndFund(data);
+      await expect(data.store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        executionDeadline: DEADLINE,
+        locktime: data.locktime,
+      });
+      advanceToExecution(data, through);
+      appendDeadlineRefund(data);
+
+      const authorized = await authorize(data, funded.escrow.escrowReference, funded.escrow.version);
+      expect(authorized).toMatchObject({ outcome: "confirmed", escrow: { state: "refund_authorized" } });
+      await expect(data.store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        economicClaim: "none",
+        refundAuthorization: { basis: "execution_deadline", executionDeadline: DEADLINE },
+      });
+      const refunded = await refund(data, funded.escrow.escrowReference, authorized.escrow.version);
+      data.history.push(data.relay.events.at(-1)!);
+
+      expect(refunded).toMatchObject({ outcome: "confirmed", escrow: { state: "refunded" } });
+      expect(refunded.escrow.refundReference).toMatch(/^pactrefund_/);
+      expect(data.cashu.spendSubmissions).toBe(1);
+      expect(data.cashu.spendPublicKeys).toEqual([data.normalSpendKey.publicKey]);
+      expect(reconstructPactAgreementHistory(data.context, data.history)).toMatchObject({
+        status: "ok",
+        currentState: "refunded",
+      });
+      await expect(data.store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+        economicClaim: "refund",
+        state: "refunded",
+      });
+      expect(JSON.stringify(refunded)).not.toContain("cashu_private_");
+    },
+  );
+
+  it("uses the refund key when the execution-deadline refund first executes after locktime", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    appendDeadlineRefund(data, data.locktime + 5);
+    const authorized = await authorize(data, funded.escrow.escrowReference, funded.escrow.version);
+    await expect(refund(data, funded.escrow.escrowReference, authorized.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded" },
+    });
+    expect(data.cashu.spendPublicKeys).toEqual([data.refundSpendKey.publicKey]);
+  });
+
+  it("rejects a premature, mis-based, or tampered execution-deadline authorization before any claim", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+
+    // Trusted coordinator time one second before the deadline; the signed
+    // authorization claims the deadline and is within the 1 s skew allowance.
+    data.clock.value = DEADLINE - 1;
+    await expect(authorize(data, reference, funded.escrow.version)).rejects.toMatchObject({
+      code: "timeout_not_reached",
+    });
+    data.clock.value = DEADLINE;
+    for (const basis of ["timeout", "rejected"] as const) {
+      await expect(
+        authorize(data, reference, funded.escrow.version, `authorize-${basis}-wrong`, basis),
+      ).rejects.toMatchObject({ code: basis === "timeout" ? "timeout_not_reached" : "invalid_state" });
+    }
+    data.clock.value = data.locktime;
+    await expect(
+      authorize(data, reference, funded.escrow.version, "authorize-timeout-late", "timeout"),
+    ).rejects.toMatchObject({ code: "timeout_not_reached" });
+    data.clock.value = DEADLINE;
+    await expect(
+      authorize(data, reference, funded.escrow.version, "authorize-unknown-basis", "bogus" as never),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+
+    // A stored deadline that disagrees with the history fails closed.
+    const key = `escrow:${reference}`;
+    const stored = (await data.store.read(key)) as { revision: number };
+    await data.store.compareAndSet(key, stored.revision, {
+      ...stored,
+      revision: stored.revision + 1,
+      executionDeadline: DEADLINE + 10,
+    });
+    await expect(authorize(data, reference, stored.revision + 1)).rejects.toMatchObject({
+      code: "agreement_mismatch",
+    });
+    expect(data.cashu.spendCalls).toBe(0);
+    await expect(data.store.read(key)).resolves.toMatchObject({ economicClaim: "none", state: "funded" });
+  });
+
+  it("rejects an execution_deadline basis for a refund that does not follow provider execution", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    data.clock.value = data.locktime;
+    append(data.context, data.history, "refund_authorized", "requester", data.requesterKey, data.locktime, {
+      reasonCode: "timeout",
+    });
+    await expect(authorize(data, funded.escrow.escrowReference, funded.escrow.version)).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+    await expect(
+      authorize(data, funded.escrow.escrowReference, funded.escrow.version, "authorize-timeout-ok", "timeout"),
+    ).resolves.toMatchObject({ outcome: "confirmed" });
+  });
+
+  it("keeps authorization idempotent and never creates a second economic claim", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+    const first = await authorize(data, reference, funded.escrow.version);
+    await expect(authorize(data, reference, funded.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refund_authorized", version: first.escrow.version },
+    });
+    await expect(authorize(data, reference, first.escrow.version, "authorize-deadline-2")).rejects.toMatchObject({
+      code: "unauthorized_operation",
+    });
+
+    const refunded = await refund(data, reference, first.escrow.version);
+    await expect(refund(data, reference, first.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded", version: refunded.escrow.version },
+    });
+    await expect(refund(data, reference, refunded.escrow.version, "refund-deadline-2")).rejects.toMatchObject({
+      code: "already_refunded",
+    });
+    expect(data.cashu.spendSubmissions).toBe(1);
+  });
+
+  it("coalesces concurrent execution-deadline refunds into one spend", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+    const authorized = await authorize(data, reference, funded.escrow.version);
+    const attempts = await Promise.allSettled([
+      refund(data, reference, authorized.escrow.version),
+      refund(data, reference, authorized.escrow.version),
+      refund(data, reference, authorized.escrow.version, "refund-deadline-other"),
+    ]);
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(2);
+    expect(attempts[2]).toMatchObject({ status: "rejected" });
+    expect(data.cashu.spendSubmissions).toBe(1);
+    await expect(data.coordinator.inspectEscrowStatus(reference)).resolves.toMatchObject({ state: "refunded" });
+  });
+
+  it("makes a confirmed execution-deadline refund exclude release", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data, "result_submitted");
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+    const authorized = await authorize(data, reference, funded.escrow.version);
+    const refunded = await refund(data, reference, authorized.escrow.version);
+    data.history.push(data.relay.events.at(-1)!);
+    await expect(data.coordinator.releaseEscrow({
+      idempotencyKey: "release-after-deadline-refund",
+      escrowReference: reference,
+      expectedVersion: refunded.escrow.version,
+      context: data.context,
+      history: data.history,
+    })).rejects.toMatchObject({ code: "already_refunded" });
+    await expect(data.coordinator.submitReleaseAuthorization({
+      idempotencyKey: "authorize-release-after-refund",
+      escrowReference: reference,
+      expectedVersion: refunded.escrow.version,
+      context: data.context,
+      history: data.history,
+      resultReference: "sha256:" + "0".repeat(64),
+    })).rejects.toMatchObject({ code: "invalid_state" });
+    expect(data.cashu.spendSubmissions).toBe(1);
+  });
+
+  it("makes a confirmed release exclude an execution-deadline refund", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    const release = advanceReleaseHistory(data);
+    const authorized = await data.coordinator.submitReleaseAuthorization({
+      idempotencyKey: "authorize-release-first",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: funded.escrow.version,
+      context: release.context,
+      history: data.history,
+      resultReference: release.resultReference,
+    });
+    const settled = await data.coordinator.releaseEscrow({
+      idempotencyKey: "release-first-0001",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: authorized.escrow.version,
+      context: release.context,
+      history: data.history,
+    });
+    data.history.push(data.relay.events.at(-1)!);
+    data.clock.value = DEADLINE + 10;
+    await expect(data.coordinator.submitRefundAuthorization({
+      idempotencyKey: "authorize-deadline-after-release",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: settled.escrow.version,
+      context: release.context,
+      history: data.history,
+      basis: "execution_deadline",
+    })).rejects.toMatchObject({ code: "invalid_state" });
+    await expect(data.coordinator.refundEscrow({
+      idempotencyKey: "refund-deadline-after-release",
+      escrowReference: funded.escrow.escrowReference,
+      expectedVersion: settled.escrow.version,
+      context: release.context,
+      history: data.history,
+    })).rejects.toMatchObject({ code: "already_released" });
+    expect(data.cashu.spendSubmissions).toBe(1);
+  });
+
+  it("freezes economic action when a late provider result forks a deadline refund", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    const delivered = [...data.history];
+    appendDeadlineRefund(data);
+    const lateResult = createPactAgreementTransition({
+      context: data.context,
+      history: delivered,
+      predecessorEventId: delivered.at(-1)!.id,
+      nextState: "result_submitted",
+      actor: data.provider.publicKey,
+      actorRole: "provider",
+      resultReference: createPactResultReference(DOCUMENT_SUMMARY_PROFILE_ID, data.context.root.event.id, data.privateResult),
+      createdAt: DEADLINE + 1,
+    });
+    const forkedEvent = sign(lateResult.event, data.providerKey);
+    for (const history of [[...data.history, forkedEvent], [...delivered, forkedEvent, data.history.at(-1)!]]) {
+      await expect(data.coordinator.submitRefundAuthorization({
+        idempotencyKey: "authorize-deadline-fork",
+        escrowReference: funded.escrow.escrowReference,
+        expectedVersion: funded.escrow.version,
+        context: data.context,
+        history,
+        basis: "execution_deadline",
+      })).rejects.toMatchObject({ code: "invalid_state" });
+    }
+    expect(data.cashu.spendCalls).toBe(0);
+    await expect(data.store.read(`escrow:${funded.escrow.escrowReference}`)).resolves.toMatchObject({
+      economicClaim: "none",
+      state: "funded",
+    });
+  });
+
+  it("reconciles an ambiguous execution-deadline refund without a second submission", async () => {
+    const cashu = new FakeCashuPort();
+    cashu.spendModes.push("unknown");
+    const data = setup({ cashu });
+    const { funded } = await prepareAndFund(data);
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+    const authorized = await authorize(data, reference, funded.escrow.version);
+    await expect(refund(data, reference, authorized.escrow.version)).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "refund_reconciliation_required" },
+    });
+    // A different operation cannot start while the first outcome is unknown.
+    const ambiguous = await data.coordinator.inspectEscrowStatus(reference);
+    await expect(refund(data, reference, ambiguous.version, "refund-deadline-other")).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+    await expect(refund(data, reference, authorized.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded" },
+    });
+    expect(cashu.spendCalls).toBe(2);
+    expect(cashu.spendSubmissions).toBe(1);
+  });
+
+  it("reconciles an ambiguous pre-locktime refund after locktime as the same Cashu operation", async () => {
+    const data = setup();
+    const backend = new FakeCashuBackend();
+    const privateStore = createInMemoryCashuPrivateStore();
+    const adapter = createCashuTestMintAdapterWithBackend({
+      configuration: { testMintUrl: MINT_URL, unit: "sat", maximumExposureSats: sats(1_000n) },
+      backend,
+      privateStore,
+    });
+    const coordinator = createPactCashuEscrowSettlementCoordinator({
+      mintUrl: MINT_URL,
+      cashu: adapter,
+      privateDelivery: data.privateDelivery,
+      store: data.store,
+      escrowAuthoritySigner: data.escrowAuthoritySigner,
+      normalSpendKey: data.normalSpendKey,
+      refundSpendKey: data.refundSpendKey,
+      relay: data.relay,
+      clock: data.clock,
+    });
+    const activeExposure = async (): Promise<bigint> => {
+      const ledger = (await privateStore.read(MINT_URL, "exposure-ledger")) as {
+        reservations?: Record<string, { amountSats: string; status: string }>;
+      } | undefined;
+      return Object.values(ledger?.reservations ?? {})
+        .filter((reservation) => reservation.status !== "released")
+        .reduce((total, reservation) => total + BigInt(reservation.amountSats), 0n);
+    };
+    const prepared = await coordinator.prepareEscrow({
+      idempotencyKey: "deadline-int-prepare",
+      context: data.context,
+      history: data.history,
+    });
+    const funded = await coordinator.fundEscrow({
+      idempotencyKey: "deadline-int-fund",
+      escrowReference: prepared.escrow.escrowReference,
+      expectedVersion: prepared.escrow.version,
+      context: data.context,
+      history: data.history,
+      funding: createPrivateCashuFunding({
+        mintUrl: MINT_URL,
+        unit: "sat",
+        proofs: deserializeProofs([{ id: "00aabbccddeeff", amount: "400", secret: "deadline-proof", C: CURVE_POINT, witness: "deadline-witness" }]),
+      }),
+    });
+    expect(funded.outcome).toBe("confirmed");
+    data.history.push(data.relay.events.at(-1)!);
+    expect(await activeExposure()).toBeGreaterThan(0n);
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const reference = funded.escrow.escrowReference;
+    const authorized = await authorize(data, reference, funded.escrow.version, undefined, undefined, coordinator);
+
+    backend.submitFailures.push(new CashuPrivateBackendError("timeout", "submitted_unknown"));
+    await expect(refund(data, reference, authorized.escrow.version, undefined, coordinator)).resolves.toMatchObject({
+      outcome: "reconciliation_required",
+      escrow: { state: "refund_reconciliation_required" },
+    });
+    expect(backend.submitCalls).toBe(2);
+    expect(await activeExposure()).toBeGreaterThan(0n);
+
+    // The original normal-key spend landed; reconciliation happens after the
+    // locktime, when a time-based key choice would have picked the refund key.
+    data.clock.value = data.locktime + 1;
+    backend.states = [{ state: "spent" }];
+    backend.restoreSucceeds = true;
+    await expect(refund(data, reference, authorized.escrow.version, undefined, coordinator)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded" },
+    });
+    expect(backend.submitCalls).toBe(2);
+    expect(backend.inspectCalls).toBe(1);
+    expect(backend.restoreCalls).toBe(1);
+    expect(await activeExposure()).toBe(0n);
+    await expect(data.store.read(`escrow:${reference}`)).resolves.toMatchObject({
+      operations: { "refund-deadline-1": { spendingKey: "normal", status: "succeeded" } },
+    });
+  }, 30_000);
+
+  it("refunds even when the provider future-dated task_delivered", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    append(data.context, data.history, "task_delivered", "provider", data.providerKey, DEADLINE + 10 * 365 * 86_400);
+    appendDeadlineRefund(data);
+    const authorized = await authorize(data, funded.escrow.escrowReference, funded.escrow.version);
+    await expect(refund(data, funded.escrow.escrowReference, authorized.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded" },
+    });
+    data.history.push(data.relay.events.at(-1)!);
+    expect(reconstructPactAgreementHistory(data.context, data.history)).toMatchObject({
+      status: "ok",
+      currentState: "refunded",
+    });
+  });
+
+  it("rejects preparation when the execution deadline would not precede the locktime", async () => {
+    const minimumTimeout = 300 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS;
+    for (const timeout of [minimumTimeout - 1, minimumTimeout]) {
+      const data = setup({ fixture: fixture({ timeout }) });
+      await expect(data.coordinator.prepareEscrow({
+        idempotencyKey: `deadline-prepare-${timeout}`,
+        context: data.context,
+        history: data.history,
+      })).rejects.toMatchObject({ code: "invalid_request" });
+      expect(data.cashu.prepareCalls).toBe(0);
+    }
+    const data = setup({ fixture: fixture({ timeout: minimumTimeout + 1 }) });
+    const prepared = await data.coordinator.prepareEscrow({
+      idempotencyKey: "deadline-prepare-ok",
+      context: data.context,
+      history: data.history,
+    });
+    await expect(data.store.read(`escrow:${prepared.escrow.escrowReference}`)).resolves.toMatchObject({
+      executionDeadline: DEADLINE,
+      locktime: DEADLINE + 1,
+    });
+  });
+
+  it("refunds a legacy escrow prepared without a stored execution deadline", async () => {
+    const data = setup();
+    const { funded } = await prepareAndFund(data);
+    const key = `escrow:${funded.escrow.escrowReference}`;
+    const { executionDeadline: _removed, ...legacy } = (await data.store.read(key)) as {
+      revision: number;
+      executionDeadline?: number;
+    };
+    expect(_removed).toBe(DEADLINE);
+    await data.store.compareAndSet(key, legacy.revision, { ...legacy, revision: legacy.revision + 1 });
+    advanceToExecution(data);
+    appendDeadlineRefund(data);
+    const authorized = await authorize(data, funded.escrow.escrowReference, legacy.revision + 1);
+    await expect(refund(data, funded.escrow.escrowReference, authorized.escrow.version)).resolves.toMatchObject({
+      outcome: "confirmed",
+      escrow: { state: "refunded" },
+    });
+  });
 });

@@ -39,7 +39,13 @@ import {
 import { createPactAgentRuntime, type PactAgentRuntimeConfig } from "./pactagent-runtime";
 import { DeterministicPactAgentClock } from "./pactagent-workflow";
 
-type Checkpoint = "none" | "after_root" | "after_funding_success" | "after_ambiguous";
+type Checkpoint =
+  | "none"
+  | "after_root"
+  | "after_funding_success"
+  | "after_ambiguous"
+  | "after_task_delivered"
+  | "after_refund_spend_success";
 type InspectionMode = "unspent" | "spent" | "pending" | "mixed";
 type SubmitMode = "success" | "ambiguous_lock" | "ambiguous_spend";
 
@@ -71,6 +77,9 @@ const stateDirectory = requiredEnvironment("PACT_PROCESS_STATE_DIRECTORY");
 const action = requiredEnvironment("PACT_PROCESS_ACTION");
 const checkpoint = (process.env.PACT_PROCESS_CHECKPOINT ?? "none") as Checkpoint;
 const idempotencyKey = process.env.PACT_PROCESS_IDEMPOTENCY_KEY ?? "process-idempotency-0001";
+// Each process starts its deterministic clock here, so a restart can resume
+// after an agreement deadline has passed.
+const clockOffsetSeconds = Number(process.env.PACT_PROCESS_CLOCK_OFFSET_SECONDS ?? "0");
 const relayPath = join(stateDirectory, "relay.json");
 const backendPath = join(stateDirectory, "backend.json");
 const lifecyclePath = join(stateDirectory, "lifecycle.json");
@@ -152,6 +161,12 @@ class DurableRelay implements NostrRelayAdapter {
     ) {
       await pauseAt("after_root");
     }
+    if (
+      checkpoint === "after_task_delivered" &&
+      event.tags.some((tag) => tag[0] === "t" && tag[1] === "task_delivered")
+    ) {
+      await pauseAt("after_task_delivered");
+    }
   }
 
   async queryEvents(filter: NostrFilter): Promise<SignedNostrEvent[]> {
@@ -188,6 +203,7 @@ class DurableCashuBackend implements CashuMintPrivateBackend {
     const state = readJson<BackendState>(backendPath, initialBackendState());
     const requestedMode = process.env.PACT_PROCESS_INSPECTION_MODE as InspectionMode | undefined;
     if (requestedMode) state.inspectionMode = requestedMode;
+    if (process.env.PACT_PROCESS_SUBMIT_MODE === "ambiguous_spend") state.submitMode = "ambiguous_spend";
     return state;
   }
 
@@ -342,9 +358,17 @@ async function buildRuntimeConfig(): Promise<{
       }
       return result;
     },
-    spendLockedValue: (input: SpendLockedValueInput) => adapter.spendLockedValue(input),
+    async spendLockedValue(input: SpendLockedValueInput) {
+      const result = await adapter.spendLockedValue(input);
+      if (checkpoint === "after_refund_spend_success" && result.status === "succeeded") {
+        // The mint adapter has durably recorded the spend; the coordinator has
+        // not yet recorded refund_confirmed.
+        await pauseAt("after_refund_spend_success");
+      }
+      return result;
+    },
   };
-  const clock = new DeterministicPactAgentClock(ROOT_TIME);
+  const clock = new DeterministicPactAgentClock(ROOT_TIME + clockOffsetSeconds);
   return {
     config: {
       identities: fixture.identities,
@@ -447,6 +471,14 @@ async function run(): Promise<void> {
     } else if (action === "status") {
       const transactionId = requiredEnvironment("PACT_PROCESS_TRANSACTION_ID");
       emit("result", { transactionId, status: await runtime.status(transactionId) });
+    } else if (action === "reclaim") {
+      const transactionId = requiredEnvironment("PACT_PROCESS_TRANSACTION_ID");
+      const reclaim = await runtime.reclaimExpiredFundedEscrows();
+      emit("result", { transactionId, reclaim, status: await runtime.status(transactionId) });
+    } else if (action === "reconcile") {
+      const transactionId = requiredEnvironment("PACT_PROCESS_TRANSACTION_ID");
+      const report = await runtime.reconcile(transactionId);
+      emit("result", { transactionId, report });
     } else {
       throw new Error(`Unknown process action: ${action}`);
     }

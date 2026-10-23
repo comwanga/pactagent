@@ -38,6 +38,14 @@ export const DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES = ["text/plain", "application/pd
 /** Longest acyclic document-summary@1 path from proposed to a terminal state. */
 export const PACT_AGREEMENT_MAX_TRANSITIONS = 8;
 export const PACT_AGREEMENT_CLOCK_SKEW_SECONDS = 60;
+/**
+ * document-summary@1 rule revision 1.1: time the provider keeps after its
+ * agreed execution window before the requester may refund an abandoned
+ * agreement. It absorbs participant clock skew plus funding and publication
+ * latency.
+ */
+export const DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS = 2 * 60;
+export const PACT_EXECUTION_DEADLINE_REASON_CODE = "execution_deadline_elapsed";
 
 export type PactCapabilityProfileId = typeof DOCUMENT_SUMMARY_PROFILE_ID;
 export type PactTermsCommitmentScheme = typeof PACT_TERMS_COMMITMENT_SCHEME;
@@ -201,6 +209,8 @@ export interface DocumentSummaryPrivateResult {
 
 export interface PactCapabilityProfile<TPrivateTerms, TPrivateResult> {
   readonly id: PactCapabilityProfileId;
+  /** Seconds added to maximum_execution_seconds to form the execution deadline. */
+  readonly executionGraceSeconds: number;
   validatePrivateTerms(value: unknown): TPrivateTerms;
   validatePrivateResult(value: unknown): TPrivateResult;
   validateAgreement(content: PactServiceAgreementContent): void;
@@ -221,8 +231,10 @@ const DOCUMENT_SUMMARY_TRANSITIONS: Readonly<
   proposed: ["accepted", "expired"],
   accepted: ["escrow_funded", "expired", "refund_authorized"],
   escrow_funded: ["task_delivered", "refund_authorized"],
-  task_delivered: ["result_submitted"],
-  result_submitted: ["result_verified", "rejected"],
+  // Rule revision 1.1: the refund edges from provider execution states are
+  // valid only after the execution deadline (see executionDeadlineFor).
+  task_delivered: ["result_submitted", "refund_authorized"],
+  result_submitted: ["result_verified", "rejected", "refund_authorized"],
   result_verified: ["release_authorized"],
   release_authorized: ["settled", "refund_authorized"],
   rejected: ["refund_authorized"],
@@ -247,11 +259,28 @@ const RECOVERY_STATES_REQUIRING_REASON = new Set<PactAgreementState>([
   "disputed",
 ]);
 
+const EXECUTION_DEADLINE_REFUND_PREDECESSORS = new Set<PactAgreementState>([
+  "task_delivered",
+  "result_submitted",
+]);
+
+function isExecutionDeadlineRefund(previous: PactAgreementState, next: PactAgreementState): boolean {
+  return next === "refund_authorized" && EXECUTION_DEADLINE_REFUND_PREDECESSORS.has(previous);
+}
+
+/** True for a rule revision 1.1 refund out of a provider execution state. */
+export function isPactExecutionDeadlineRefund(
+  content: Pick<PactAgreementTransitionContent, "state" | "prev_state">,
+): boolean {
+  return isExecutionDeadlineRefund(content.prev_state, content.state);
+}
+
 const DOCUMENT_SUMMARY_PROFILE: PactCapabilityProfile<
   DocumentSummaryPrivateTerms,
   DocumentSummaryPrivateResult
 > = {
   id: DOCUMENT_SUMMARY_PROFILE_ID,
+  executionGraceSeconds: DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS,
   validatePrivateTerms(value) {
     if (!isRecord(value)) {
       agreementError("privacy_boundary_violation", "Private document-summary terms are invalid");
@@ -1019,6 +1048,12 @@ function parseTransitionContent(
   ) {
     agreementError("invalid_transition", "PactAgent transition reason code is invalid");
   }
+  if (
+    isExecutionDeadlineRefund(value.prev_state, value.state) &&
+    value.reason_code !== PACT_EXECUTION_DEADLINE_REASON_CODE
+  ) {
+    agreementError("invalid_transition", "Execution-deadline refund requires its reason code");
+  }
   if (value.state === "result_submitted" || value.state === "result_verified") {
     profile.validatePublicResultReference(value.result_reference);
   } else if (value.result_reference !== undefined) {
@@ -1199,6 +1234,62 @@ function validatedContext(context: PactAgreementContext): PactAgreementContext {
   return { ...context, root };
 }
 
+/**
+ * Rule revision 1.1 execution deadline:
+ * accepted.created_at + maximum_execution_seconds + profile grace.
+ *
+ * The anchor is the same accepted event the Cashu locktime uses
+ * (accepted.created_at + descriptor timeout), so the deadline precedes the
+ * locktime exactly when execution + grace < timeout. Agreements that cannot
+ * satisfy that have no execution-deadline refund.
+ */
+function executionDeadlineFor(
+  context: PactAgreementContext,
+  orderedTransitions: readonly PactAgreementTransition[],
+): number {
+  const accepted = orderedTransitions.find((transition) => transition.content.state === "accepted");
+  if (!accepted) {
+    agreementError("invalid_transition", "Execution deadline requires an accepted agreement");
+  }
+  let timeoutSeconds: number;
+  try {
+    timeoutSeconds = parseCashuEscrowDescriptorEvent(context.references.escrowDescriptor).content
+      .dispute_rules.timeout.duration_seconds;
+  } catch {
+    agreementError("invalid_reference", "PactAgent agreement has an invalid Pontmore reference");
+  }
+  const profile = getPactCapabilityProfile(context.root.content.capability_profile);
+  const acceptedAt = accepted.event.created_at;
+  const deadline = acceptedAt + context.root.content.maximum_execution_seconds + profile.executionGraceSeconds;
+  const locktime = acceptedAt + timeoutSeconds;
+  if (
+    !Number.isSafeInteger(acceptedAt) ||
+    !Number.isSafeInteger(deadline) ||
+    !Number.isSafeInteger(locktime) ||
+    deadline >= locktime
+  ) {
+    agreementError("invalid_transition", "Agreement execution deadline is not before the escrow locktime");
+  }
+  return deadline;
+}
+
+function validateExecutionDeadlineRefundTime(
+  createdAt: number,
+  deadline: number,
+  validationTime: number | undefined,
+): void {
+  if (!Number.isSafeInteger(validationTime) || (validationTime as number) < 0) {
+    agreementError("malformed_event", "Current agreement transition validation requires trusted time");
+  }
+  const now = validationTime as number;
+  if (Math.abs(createdAt - now) > PACT_AGREEMENT_CLOCK_SKEW_SECONDS) {
+    agreementError("invalid_transition", "PactAgent transition timestamp exceeds permitted clock skew");
+  }
+  if (createdAt < deadline || now < deadline) {
+    agreementError("invalid_transition", "Execution-deadline refund cannot precede the execution deadline");
+  }
+}
+
 function validatedSignedTransitions(
   events: readonly SignedNostrEvent[],
   context: PactAgreementContext,
@@ -1327,7 +1418,14 @@ export function reconstructPactAgreementHistory(
       predecessorKey === rootKey
         ? context.root.event.created_at
         : byId.get(predecessorKey)!.event.created_at;
-    if (selected.event.created_at < predecessorCreatedAt) {
+    // A deadline refund is ordered by its predecessor link and the deadline,
+    // not by the provider-signed predecessor timestamp, so a provider cannot
+    // postpone it by future-dating task_delivered or result_submitted.
+    if (isExecutionDeadlineRefund(selected.content.prev_state, selected.content.state)) {
+      if (selected.event.created_at < executionDeadlineFor(context, ordered)) {
+        agreementError("invalid_transition", "Execution-deadline refund predates the execution deadline");
+      }
+    } else if (selected.event.created_at < predecessorCreatedAt) {
       agreementError("stale_predecessor", "PactAgent transition predates its predecessor");
     }
     ordered.push(selected);
@@ -1346,6 +1444,23 @@ export function reconstructPactAgreementHistory(
     transitions: ordered,
     duplicateEventIds,
   };
+}
+
+/**
+ * The rule revision 1.1 execution deadline of one agreement, derived only from
+ * its validated, unforked history. Domain validation, the settlement
+ * coordinator, and workflow recovery all use this one rule.
+ */
+export function pactAgreementExecutionDeadline(
+  contextValue: PactAgreementContext,
+  events: readonly SignedNostrEvent[],
+): number {
+  const context = validatedContext(contextValue);
+  const history = reconstructPactAgreementHistory(context, events);
+  if (history.status === "forked") {
+    agreementError("forked_history", "Forked history has no execution deadline");
+  }
+  return executionDeadlineFor(context, history.transitions);
 }
 
 /**
@@ -1478,7 +1593,10 @@ export function createPactAgreementTransition(
   }
   const predecessorCreatedAt =
     history.transitions.at(-1)?.event.created_at ?? context.root.event.created_at;
-  if (input.createdAt < predecessorCreatedAt) {
+  if (
+    input.createdAt < predecessorCreatedAt &&
+    !isExecutionDeadlineRefund(history.currentState, input.nextState)
+  ) {
     agreementError("stale_predecessor", "PactAgent transition predates its predecessor");
   }
   const actor = nostrPublicKey(input.actor);
@@ -1534,6 +1652,13 @@ export function createPactAgreementTransition(
     context.root.content.expires_at,
     input.validationTime,
   );
+  if (isExecutionDeadlineRefund(transition.content.prev_state, transition.content.state)) {
+    validateExecutionDeadlineRefundTime(
+      transition.event.created_at,
+      executionDeadlineFor(context, history.transitions),
+      input.validationTime,
+    );
+  }
   return transition;
 }
 

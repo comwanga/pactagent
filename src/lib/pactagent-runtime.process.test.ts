@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createPactEscrowAuthoritySource,
+  DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PACT_SERVICE_AGREEMENT_ROOT_TYPE,
   validatePactServiceAgreementRoot,
 } from "../domain/pact-service-agreement";
@@ -20,7 +22,19 @@ interface ProcessMessage {
   type: "checkpoint" | "ready" | "result" | "error" | "fatal";
   name?: string;
   transactionId?: string;
-  report?: { agreementId: string; agreementRootEventId: string; finalOutcome: string };
+  report?: {
+    agreementId: string;
+    agreementRootEventId: string;
+    finalOutcome: string;
+    lifecycle?: Array<{ state: string }>;
+  };
+  reclaim?: { inspected: number; reclaimed: number; failed: number };
+  status?: {
+    phase: string;
+    operationalState: string;
+    availableActions: { resume: boolean; reconcile: boolean; refund: boolean };
+    reconciliationState?: string;
+  };
   message?: string;
   port?: number;
 }
@@ -69,11 +83,17 @@ async function stateDirectory(): Promise<string> {
 function spawnRuntime(
   directory: string,
   options: {
-    action: "start" | "resume" | "status" | "signal" | "http";
-    checkpoint?: "after_root" | "after_funding_success" | "after_ambiguous";
+    action: "start" | "resume" | "status" | "signal" | "http" | "reclaim" | "reconcile";
+    checkpoint?:
+      | "after_root"
+      | "after_funding_success"
+      | "after_ambiguous"
+      | "after_task_delivered"
+      | "after_refund_spend_success";
     transactionId?: string;
     submitMode?: "ambiguous" | "ambiguous_spend";
     inspectionMode?: "unspent" | "spent" | "pending" | "mixed";
+    clockOffsetSeconds?: number;
   },
 ): RunningChild {
   const child = spawn(process.execPath, [VITE_NODE, "--config", VITE_CONFIG, CHILD_ENTRY], {
@@ -93,6 +113,9 @@ function spawnRuntime(
       ...(options.inspectionMode === undefined
         ? {}
         : { PACT_PROCESS_INSPECTION_MODE: options.inspectionMode }),
+      ...(options.clockOffsetSeconds === undefined
+        ? {}
+        : { PACT_PROCESS_CLOCK_OFFSET_SECONDS: String(options.clockOffsetSeconds) }),
     },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
@@ -771,6 +794,201 @@ describe("PactAgent separate-process restart acceptance", () => {
       for (const marker of privateMarkers) expect(output).not.toContain(marker);
     }
   }, 90_000);
+
+  describe("execution-deadline refund after the provider abandons task_delivered (#58)", () => {
+    // The fixture accepts at ROOT_TIME with maximum_execution_seconds 120.
+    const DEADLINE_OFFSET = 120 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS;
+    const TRANSACTION = transactionId(IDEMPOTENCY_KEY);
+
+    function refundAuthorizations(directory: string): SignedNostrEvent[] {
+      return relayState(directory).events.filter((event) =>
+        event.tags.some((tag) => tag[0] === "t" && tag[1] === "refund_authorized"),
+      );
+    }
+
+    function stateCount(directory: string, state: string): number {
+      return publicStates(directory).filter((candidate) => candidate === state).length;
+    }
+
+    async function abandonAfterTaskDelivered(directory: string): Promise<string> {
+      await hardKillAt(
+        directory,
+        { action: "start", checkpoint: "after_task_delivered" },
+        "after_task_delivered",
+      );
+      expect(publicStates(directory)).toContain("task_delivered");
+      expect(publicStates(directory)).not.toContain("result_submitted");
+      expect(settlementState(directory)).toBe("funded");
+      const locked = cashuRecoveryState(directory).activeExposureSats;
+      expect(locked).not.toBe("0");
+      return locked;
+    }
+
+    it("reclaims after a restart past the deadline, releases exposure, and stays idempotent", async () => {
+      const directory = await stateDirectory();
+      const locked = await abandonAfterTaskDelivered(directory);
+
+      const early = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET - 1,
+      });
+      // The kill landed before the progress checkpoint, so the durable phase
+      // is stale; eligibility is decided from the relay history instead.
+      expect(early.message).toMatchObject({
+        type: "result",
+        reclaim: { reclaimed: 0, failed: 0 },
+        status: { phase: "escrow_funded", availableActions: { refund: false } },
+      });
+      expect(refundAuthorizations(directory)).toHaveLength(0);
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe(locked);
+
+      const reclaimed = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET,
+      });
+      expect(reclaimed.message).toMatchObject({
+        type: "result",
+        reclaim: { inspected: 1, reclaimed: 1, failed: 0 },
+        status: { phase: "refunded", operationalState: "refunded" },
+      });
+      const [authorization] = refundAuthorizations(directory);
+      expect(refundAuthorizations(directory)).toHaveLength(1);
+      expect(authorization.pubkey).toBe(buildFixture().identities.requesterSigner.publicKey);
+      const accepted = relayState(directory).events.find((event) =>
+        event.tags.some((tag) => tag[0] === "t" && tag[1] === "accepted"),
+      )!;
+      // Authorized exactly at the deadline by the restarted process's clock.
+      expect(authorization.created_at).toBe(accepted.created_at + DEADLINE_OFFSET);
+      expect(JSON.parse(authorization.content)).toMatchObject({
+        state: "refund_authorized",
+        prev_state: "task_delivered",
+        actor_role: "requester",
+        reason_code: PACT_EXECUTION_DEADLINE_REASON_CODE,
+      });
+      expect(settlementState(directory)).toBe("refunded");
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe("0");
+      const afterRefund = backendState(directory);
+      expect(afterRefund).toMatchObject({ submitLockCalls: 1, submitSpendCalls: 1, prepareSpendCalls: 1 });
+      expect(stateCount(directory, "refunded")).toBe(1);
+
+      const again = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET + 600,
+      });
+      expect(again.message).toMatchObject({
+        type: "result",
+        reclaim: { reclaimed: 0, failed: 0 },
+        status: { operationalState: "refunded" },
+      });
+      expect(backendState(directory)).toMatchObject({
+        submitLockCalls: afterRefund.submitLockCalls,
+        submitSpendCalls: afterRefund.submitSpendCalls,
+        prepareSpendCalls: afterRefund.prepareSpendCalls,
+      });
+      expect(refundAuthorizations(directory)).toHaveLength(1);
+      expect(stateCount(directory, "refunded")).toBe(1);
+      expect(agreementRoots(directory)).toHaveLength(1);
+    }, 120_000);
+
+    it("finishes a refund killed after the Cashu spend without a second spend", async () => {
+      const directory = await stateDirectory();
+      await abandonAfterTaskDelivered(directory);
+      await hardKillAt(
+        directory,
+        {
+          action: "reclaim",
+          transactionId: TRANSACTION,
+          clockOffsetSeconds: DEADLINE_OFFSET,
+          checkpoint: "after_refund_spend_success",
+        },
+        "after_refund_spend_success",
+      );
+      expect(settlementState(directory)).toBe("refund_pending");
+      expect(publicStates(directory)).toContain("refund_authorized");
+      expect(publicStates(directory)).not.toContain("refunded");
+      const interrupted = backendState(directory);
+      expect(interrupted.submitSpendCalls).toBe(1);
+
+      const resumed = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET + 30,
+      });
+      expect(resumed.message).toMatchObject({
+        type: "result",
+        reclaim: { reclaimed: 1, failed: 0 },
+        status: { phase: "refunded" },
+      });
+      expect(backendState(directory)).toMatchObject({
+        submitSpendCalls: interrupted.submitSpendCalls,
+        prepareSpendCalls: interrupted.prepareSpendCalls,
+      });
+      expect(settlementState(directory)).toBe("refunded");
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe("0");
+      expect(refundAuthorizations(directory)).toHaveLength(1);
+      expect(stateCount(directory, "refunded")).toBe(1);
+
+      const again = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET + 90,
+      });
+      expect(again.message).toMatchObject({ type: "result", reclaim: { reclaimed: 0, failed: 0 } });
+      expect(backendState(directory).submitSpendCalls).toBe(interrupted.submitSpendCalls);
+    }, 120_000);
+
+    it("keeps an ambiguous refund reserved across restarts and reconciles it by NUT-07/NUT-09", async () => {
+      const directory = await stateDirectory();
+      const locked = await abandonAfterTaskDelivered(directory);
+
+      const ambiguous = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET,
+        submitMode: "ambiguous_spend",
+      });
+      expect(ambiguous.message).toMatchObject({
+        type: "result",
+        reclaim: { reclaimed: 0, failed: 1 },
+        status: {
+          operationalState: "reconciliation_required",
+          reconciliationState: "refund_reconciliation_required",
+          availableActions: { resume: false, reconcile: true, refund: false },
+        },
+      });
+      expect(settlementState(directory)).toBe("refund_reconciliation_required");
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe(locked);
+      const before = backendState(directory);
+      expect(before.submitSpendCalls).toBe(1);
+
+      const retried = await runToExit(directory, {
+        action: "reclaim",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET + 60,
+      });
+      expect(retried.message).toMatchObject({ type: "result", reclaim: { reclaimed: 0, failed: 0 } });
+      expect(backendState(directory).submitSpendCalls).toBe(before.submitSpendCalls);
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe(locked);
+
+      const reconciled = await runToExit(directory, {
+        action: "reconcile",
+        transactionId: TRANSACTION,
+        clockOffsetSeconds: DEADLINE_OFFSET + 120,
+        inspectionMode: "spent",
+      });
+      expect(reconciled.message).toMatchObject({ type: "result", report: { finalOutcome: "refunded" } });
+      const after = backendState(directory);
+      expect(after.submitSpendCalls).toBe(before.submitSpendCalls);
+      expect(after.inspectCalls).toBe(before.inspectCalls + 1);
+      expect(after.restoreCalls).toBe(before.restoreCalls + 1);
+      expect(settlementState(directory)).toBe("refunded");
+      expect(cashuRecoveryState(directory).activeExposureSats).toBe("0");
+      expect(refundAuthorizations(directory)).toHaveLength(1);
+    }, 120_000);
+  });
 
   it("handles a real SIGTERM once, disconnects and closes durable stores, and exits bounded", async () => {
     const directory = await stateDirectory();

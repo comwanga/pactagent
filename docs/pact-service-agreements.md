@@ -126,6 +126,7 @@ proposed -> accepted -> escrow_funded -> task_delivered -> result_submitted
 proposed/accepted -> expired
 accepted/escrow_funded -> refund_authorized -> refunded
 result_submitted -> rejected -> refund_authorized
+task_delivered/result_submitted -> refund_authorized   # rule revision 1.1, after the execution deadline
 ```
 
 The provider alone signs `accepted`, `task_delivered`, and `result_submitted`.
@@ -148,6 +149,64 @@ by issue #10.
 particular, signing the PIP-01 descriptor does not automatically make its author
 the settlement authority; the descriptor owner only signs the separate record
 that explicitly designates that authority.
+
+## Execution-deadline refund (`document-summary@1` rule revision 1.1)
+
+Without this rule a provider that publishes `task_delivered` and then never
+returns, or publishes `result_submitted` while withholding the private result,
+leaves the requester's escrow with no software recovery path. Rule revision 1.1
+adds one recovery edge from each provider execution state:
+
+```text
+task_delivered   -> refund_authorized
+result_submitted -> refund_authorized
+```
+
+- **Signer.** Only the requester named in the root, with `actor_role:
+  "requester"`. Provider, escrow-authority, and unrelated signatures are rejected.
+- **Reason.** `reason_code` must be exactly `execution_deadline_elapsed`.
+- **Deadline.** `accepted.created_at + maximum_execution_seconds +
+  DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS` (120 s of grace for clock skew and
+  funding/publication latency). It is computed by one domain function,
+  `pactAgreementExecutionDeadline`, from the validated history; domain
+  validation, the settlement coordinator, and workflow recovery all use it.
+- **Timing.** In any history the authorization's `created_at` must be at or after
+  the deadline. When a new authorization is created, trusted validator time is
+  required: it must be at or after the deadline and within the 60 s clock-skew
+  allowance of `created_at`. The coordinator re-checks the deadline against its
+  own clock, so a requester cannot refund early by dating its event forward.
+- **Relationship to the Cashu locktime.** The deadline uses the same `accepted`
+  anchor as the locktime (`accepted.created_at + descriptor timeout`), so it
+  precedes the locktime exactly when execution plus grace is shorter than the
+  descriptor timeout. The rule is invalid otherwise, and the coordinator refuses
+  to prepare an escrow for such an agreement, so no value is locked without a
+  deadline path. Before locktime the refund spends with the normal NUT-11 key;
+  after locktime it spends with the refund key.
+
+The accepted timestamp is signed by the provider and bounded by the root
+(`root.created_at <= accepted < expires_at`), and the coordinator refuses to
+prepare an escrow over a future-dated acceptance. A provider can therefore only
+shorten its own window. Funding latency beyond the grace also shortens the
+provider's effective window, so a provider should not publish `task_delivered`
+for an agreement whose deadline is too close.
+
+A late provider `result_submitted` and a deadline refund are both children of
+`task_delivered`, which reconstructs as a `forked` history. Economic action is
+then frozen: the coordinator refuses forked histories. If the refund's Cashu
+spend completed before the fork appeared, that spend stands and cannot be rolled
+back. Release is impossible because the escrow's economic claim is already
+`refund`. The agreement report then fails closed with a fork until an operator
+resolves it.
+
+**Compatibility.** Rule revision 1.1 is a strict superset of the previous
+`document-summary@1` rules. Every previously valid kind-3921 history remains
+valid with its original meaning, no persisted record is reinterpreted, and the
+maximum history length of 8 transitions is unchanged. Escrows prepared before
+the revision do not store a deadline. Runtime status and reclaim therefore treat
+them conservatively and wait for locktime, while the coordinator still derives
+the deadline from their history. Validators that predate the revision reject the
+new edges; no independent `document-summary@1` validators exist. The PIP-02 v2
+representation of this rule is tracked separately (#74).
 
 ## Reconstruction
 

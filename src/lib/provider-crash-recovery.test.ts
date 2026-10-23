@@ -20,11 +20,21 @@ import {
   PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID,
 } from "../domain/pact-service-offer";
 import {
+  DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS,
   DOCUMENT_SUMMARY_PROFILE_ID,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PACT_SERVICE_AGREEMENT_ROOT_TYPE,
   PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
   PACT_TERMS_COMMITMENT_SCHEME,
+  createPactAgreementTransition,
+  createPactEscrowAuthorityBinding,
+  createPactEscrowAuthoritySource,
+  createPactResultReference,
+  reconstructPactAgreementHistory,
+  validatePactServiceAgreementRoot,
+  type PactAgreementContext,
   type PactAgreementReferences,
+  type PactAgreementState,
 } from "../domain/pact-service-agreement";
 import { createLocalNostrSigner } from "./nostr-signer";
 import { createLocalNostrEncrypter, sealPrivateTask } from "./private-task-transport";
@@ -602,6 +612,102 @@ describe("F38-03/F38-04 provider crash recovery (service-level)", () => {
     expect(wrapCountAfter).toBe(wrapCountBefore);
 
     store.close();
+  }, 30_000);
+
+  it("Issue #58: a recovering provider does not fork a requester's execution-deadline refund", async () => {
+    const { store, path } = createStore();
+    // Root inside its proposal window, with the execution deadline
+    // (accepted + 120 s + grace) already in the past.
+    const now = Math.floor(Date.now() / 1000);
+    const rootTime = now - 400;
+    const rootEvent = createAgreementRoot(fixture, rootTime);
+    const root = validatePactServiceAgreementRoot(rootEvent, fixture.references);
+    const source = await fixture.providerSigner.sign(createPactEscrowAuthoritySource({
+      root,
+      references: fixture.references,
+      authority: fixture.escrowAuthorityPublicKey,
+      createdAt: rootTime + 1,
+    }).event);
+    const context: PactAgreementContext = {
+      root,
+      references: fixture.references,
+      escrowAuthority: createPactEscrowAuthorityBinding({
+        root,
+        references: fixture.references,
+        authority: fixture.escrowAuthorityPublicKey,
+        source,
+      }),
+    };
+    const escrowSigner = createLocalNostrSigner(hex(key(43)));
+    const history: SignedNostrEvent[] = [];
+    const append = async (
+      nextState: PactAgreementState,
+      signer: NostrSigner,
+      actorRole: "requester" | "provider" | "escrow",
+      createdAt: number,
+      reasonCode?: string,
+    ) => {
+      const draft = createPactAgreementTransition({
+        context,
+        history,
+        predecessorEventId: history.at(-1)?.id ?? null,
+        nextState,
+        actor: signer.publicKey,
+        actorRole,
+        reasonCode,
+        createdAt,
+        validationTime: createdAt,
+      });
+      history.push(await signer.sign(draft.event));
+    };
+    await append("accepted", fixture.providerSigner, "provider", rootTime + 1);
+    await append("escrow_funded", escrowSigner, "escrow", rootTime + 2);
+    await append("task_delivered", fixture.providerSigner, "provider", rootTime + 3);
+    await append(
+      "refund_authorized",
+      fixture.requesterSigner,
+      "requester",
+      rootTime + 1 + 120 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS + 10,
+      PACT_EXECUTION_DEADLINE_REASON_CODE,
+    );
+
+    // The provider finished and privately published its result just as the
+    // requester refunded; it restarts before publishing result_submitted.
+    await store.write({
+      agreementRootEventId: rootEvent.id,
+      agreementId: root.content.agreement_id,
+      requesterPublicKey: fixture.requesterPublicKey,
+      state: "result_published",
+      resultReference: createPactResultReference(DOCUMENT_SUMMARY_PROFILE_ID, rootEvent.id, { summary: "late" }),
+      resultSummary: "late",
+      acceptedTransitionEventId: undefined,
+      taskDeliveredTransitionEventId: undefined,
+      resultSubmittedTransitionEventId: undefined,
+      createdAt: rootTime,
+      updatedAt: rootTime,
+      failureCode: undefined,
+    });
+    const relay = new InMemoryRelay();
+    relay.addEvent(fixture.references.requesterDefinition);
+    relay.addEvent(fixture.references.providerDefinition);
+    relay.addEvent(fixture.references.escrowDescriptor);
+    relay.addEvent(rootEvent);
+    relay.addEvent(source);
+    history.forEach((event) => relay.addEvent(event));
+
+    const service = createService(fixture, store, relay);
+    await service.start();
+    await new Promise((r) => setTimeout(r, 3_000));
+    await service.stop();
+
+    expect(relay.events.some((event) => event.tags.some((tag) => tag[0] === "t" && tag[1] === "result_submitted")))
+      .toBe(false);
+    expect(reconstructPactAgreementHistory(context, relay.events.filter((event) =>
+      event.tags.some((tag) => tag[0] === "t" && tag[1] === "pactagent/service-agreement-transition@1"),
+    ))).toMatchObject({ status: "ok", currentState: "refund_authorized" });
+    const store2 = reopenStore(path);
+    expect((await store2.read(rootEvent.id))?.state).toBe("result_published");
+    store2.close();
   }, 30_000);
 
   it("Issue #39: inclusive-since relay polls do not re-process the newest agreement root forever", async () => {

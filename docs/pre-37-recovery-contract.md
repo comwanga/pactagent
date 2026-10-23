@@ -6,8 +6,11 @@ locktime or infer economic recovery from the displayed lifecycle phase.
 ## Recovery actions
 
 - `resume` continues only the successful workflow or an existing release.
-- `refund` starts or continues the timeout-refund family:
-  `refund_authorized`, `refund_pending`, and `refund_confirmed`.
+- `refund` starts or continues the refund family:
+  `refund_authorized`, `refund_pending`, and `refund_confirmed`. It is offered
+  after locktime or, for an agreement abandoned at `task_delivered` or
+  `result_submitted`, after its execution deadline
+  (`document-summary@1` rule revision 1.1).
 - `reconcile` is reserved for an explicitly projected
   `reconciliation_required` state.
 - `refunded` and `settled` expose no recovery actions.

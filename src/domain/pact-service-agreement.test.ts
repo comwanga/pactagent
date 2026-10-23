@@ -10,12 +10,16 @@ import {
 import { createPontmoreAgentDefinition } from "./pontmore-agent";
 import { createCashuEscrowDescriptor } from "./pontmore-escrow";
 import {
+  DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS,
   DOCUMENT_SUMMARY_PROFILE_ID,
   DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES,
   PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PACT_TERMS_COMMITMENT_SCHEME,
   PactPrivateCommitmentSalt,
   createPactAgreementTransition,
+  isPactExecutionDeadlineRefund,
+  pactAgreementExecutionDeadline,
   createPactCompletionDecision,
   createPactEscrowAuthorityBinding,
   createPactEscrowAuthoritySource,
@@ -59,7 +63,7 @@ function sign(event: UnsignedNostrEvent, secretKey: Uint8Array): SignedNostrEven
   ) as unknown as SignedNostrEvent;
 }
 
-function createFixture() {
+function createFixture(options: { timeoutSeconds?: number } = {}) {
   const requesterKey = key(1);
   const providerKey = key(2);
   const escrowKey = key(3);
@@ -71,6 +75,7 @@ function createFixture() {
     identifier: "document-summary-cashu",
     updatedAt: ROOT_TIME - 10,
     referenceFormat: "opaque_service_reference",
+    ...(options.timeoutSeconds === undefined ? {} : { timeoutSeconds: options.timeoutSeconds }),
   });
   const requesterDefinition = createPontmoreAgentDefinition({
     identity: requesterIdentity,
@@ -1111,3 +1116,384 @@ describe("PactAgent service agreement kernel", () => {
     expect(String(thrown)).not.toContain("cashuA-DO-NOT-LOG");
   });
 });
+
+describe("document-summary@1 rule revision 1.1 execution-deadline refund", () => {
+  const ACCEPTED_AT = ROOT_TIME + 1;
+  // accepted.created_at + maximum_execution_seconds (300) + profile grace.
+  const DEADLINE = ACCEPTED_AT + 300 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS;
+
+  function deliveredHistory(
+    fixture: ReturnType<typeof createFixture>,
+    through: "task_delivered" | "result_submitted" = "task_delivered",
+  ): SignedNostrEvent[] {
+    const history: SignedNostrEvent[] = [];
+    appendTransition(fixture, history, "accepted", "provider", fixture.providerKey, { createdAt: ACCEPTED_AT });
+    appendTransition(fixture, history, "escrow_funded", "escrow", fixture.escrowKey, { createdAt: ACCEPTED_AT + 1 });
+    appendTransition(fixture, history, "task_delivered", "provider", fixture.providerKey, { createdAt: ACCEPTED_AT + 2 });
+    if (through === "result_submitted") {
+      appendTransition(fixture, history, "result_submitted", "provider", fixture.providerKey, {
+        createdAt: ACCEPTED_AT + 3,
+        resultReference: fixture.resultReference,
+      });
+    }
+    return history;
+  }
+
+  function refundDraft(
+    fixture: ReturnType<typeof createFixture>,
+    history: readonly SignedNostrEvent[],
+    overrides: {
+      createdAt?: number;
+      validationTime?: number;
+      actor?: string;
+      actorRole?: "requester" | "provider" | "escrow";
+      reasonCode?: string | null;
+    } = {},
+  ) {
+    const createdAt = overrides.createdAt ?? DEADLINE;
+    return createPactAgreementTransition({
+      context: fixture.context,
+      history,
+      predecessorEventId: history.at(-1)?.id ?? null,
+      nextState: "refund_authorized",
+      actor: overrides.actor ?? fixture.requesterIdentity.publicKey,
+      actorRole: overrides.actorRole ?? "requester",
+      ...(overrides.reasonCode === null
+        ? {}
+        : { reasonCode: overrides.reasonCode ?? PACT_EXECUTION_DEADLINE_REASON_CODE }),
+      createdAt,
+      validationTime: overrides.validationTime ?? createdAt,
+    });
+  }
+
+  function resign(event: UnsignedNostrEvent, createdAt: number, secretKey: Uint8Array): SignedNostrEvent {
+    return sign({ ...event, created_at: createdAt }, secretKey);
+  }
+
+  it.each(["task_delivered", "result_submitted"] as const)(
+    "rejects a %s refund one second before the deadline and accepts it at and after the deadline",
+    (through) => {
+      const fixture = createFixture();
+      const history = deliveredHistory(fixture, through);
+      expect(pactAgreementExecutionDeadline(fixture.context, history)).toBe(DEADLINE);
+
+      expect(() => refundDraft(fixture, history, { createdAt: DEADLINE - 1 })).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+      // A deadline-dated event is still rejected while trusted time is earlier.
+      expect(() => refundDraft(fixture, history, { createdAt: DEADLINE, validationTime: DEADLINE - 1 })).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+      // A signed event backdated past the creation checks fails reconstruction.
+      const backdated = resign(refundDraft(fixture, history).event, DEADLINE - 1, fixture.requesterKey);
+      expect(() => reconstructPactAgreementHistory(fixture.context, [...history, backdated])).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+
+      for (const createdAt of [DEADLINE, DEADLINE + 1]) {
+        const draft = refundDraft(fixture, history, { createdAt });
+        expect(draft.content).toMatchObject({
+          state: "refund_authorized",
+          prev_state: through,
+          actor_role: "requester",
+          reason_code: PACT_EXECUTION_DEADLINE_REASON_CODE,
+        });
+        expect(isPactExecutionDeadlineRefund(draft.content)).toBe(true);
+        const signed = sign(draft.event, fixture.requesterKey);
+        expect(reconstructPactAgreementHistory(fixture.context, [...history, signed])).toMatchObject({
+          status: "ok",
+          currentState: "refund_authorized",
+        });
+      }
+
+      const refund = sign(refundDraft(fixture, history).event, fixture.requesterKey);
+      const refunded = [...history, refund];
+      appendTransition(fixture, refunded, "refunded", "escrow", fixture.escrowKey, { createdAt: DEADLINE + 1 });
+      expect(reconstructPactAgreementHistory(fixture.context, refunded)).toMatchObject({
+        status: "ok",
+        currentState: "refunded",
+      });
+    },
+  );
+
+  it("rejects a provider, unrelated, or mis-signed refund authorization", () => {
+    const fixture = createFixture();
+    const history = deliveredHistory(fixture);
+    const unrelatedKey = key(4);
+    const unrelated = identity(unrelatedKey).publicKey;
+
+    expect(() =>
+      refundDraft(fixture, history, { actor: fixture.providerIdentity.publicKey, actorRole: "provider" }),
+    ).toThrowError(expect.objectContaining({ code: "signer_not_authorized" }));
+    expect(() => refundDraft(fixture, history, { actor: unrelated })).toThrowError(
+      expect.objectContaining({ code: "signer_not_authorized" }),
+    );
+    // A requester-authored draft signed by the provider or an unrelated key.
+    for (const secret of [fixture.providerKey, unrelatedKey]) {
+      const forged = sign(refundDraft(fixture, history).event, secret);
+      expect(() => reconstructPactAgreementHistory(fixture.context, [...history, forged])).toThrowError(
+        expect.objectContaining({ code: "signer_not_authorized" }),
+      );
+    }
+  });
+
+  it("rejects a wrong actor role on an execution-deadline refund", () => {
+    const fixture = createFixture();
+    const history = deliveredHistory(fixture);
+    for (const actorRole of ["provider", "escrow"] as const) {
+      expect(() => refundDraft(fixture, history, { actorRole })).toThrowError(
+        expect.objectContaining({ code: "signer_not_authorized" }),
+      );
+    }
+    expect(() =>
+      refundDraft(fixture, history, { actor: fixture.escrowIdentity.publicKey, actorRole: "escrow" }),
+    ).toThrowError(expect.objectContaining({ code: "signer_not_authorized" }));
+  });
+
+  it.each(["task_delivered", "result_submitted"] as const)(
+    "rejects a %s refund with a missing or incorrect reason code",
+    (through) => {
+      const fixture = createFixture();
+      const history = deliveredHistory(fixture, through);
+      for (const reasonCode of [null, "timeout", "result_rejected", "execution_deadline"]) {
+        expect(() => refundDraft(fixture, history, { reasonCode })).toThrowError(
+          expect.objectContaining({ code: "invalid_transition" }),
+        );
+      }
+    },
+  );
+
+  it("rejects an execution deadline that cannot be computed safely", () => {
+    const fixture = createFixture({ timeoutSeconds: Number.MAX_SAFE_INTEGER });
+    const history = deliveredHistory(fixture);
+    expect(() => pactAgreementExecutionDeadline(fixture.context, history)).toThrowError(
+      expect.objectContaining({ code: "invalid_transition" }),
+    );
+    expect(() => refundDraft(fixture, history)).toThrowError(
+      expect.objectContaining({ code: "invalid_transition" }),
+    );
+    // The deadline is anchored on acceptance; it does not exist before it.
+    const proposed = createFixture();
+    expect(() => pactAgreementExecutionDeadline(proposed.context, [])).toThrowError(
+      expect.objectContaining({ code: "invalid_transition" }),
+    );
+  });
+
+  it("rejects agreements whose execution deadline is at or beyond the escrow locktime", () => {
+    const minimumTimeout = 300 + DOCUMENT_SUMMARY_EXECUTION_GRACE_SECONDS;
+    for (const timeoutSeconds of [minimumTimeout - 1, minimumTimeout]) {
+      const fixture = createFixture({ timeoutSeconds });
+      const history = deliveredHistory(fixture);
+      expect(() => pactAgreementExecutionDeadline(fixture.context, history)).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+      expect(() => refundDraft(fixture, history, { createdAt: ACCEPTED_AT + timeoutSeconds })).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+      // A hand-built, correctly signed authorization fails reconstruction too.
+      const signed = sign(manualRefundEvent(fixture, history, ACCEPTED_AT + timeoutSeconds), fixture.requesterKey);
+      expect(() => reconstructPactAgreementHistory(fixture.context, [...history, signed])).toThrowError(
+        expect.objectContaining({ code: "invalid_transition" }),
+      );
+    }
+    const fixture = createFixture({ timeoutSeconds: minimumTimeout + 1 });
+    const history = deliveredHistory(fixture);
+    expect(pactAgreementExecutionDeadline(fixture.context, history)).toBe(DEADLINE);
+    expect(() => refundDraft(fixture, history)).not.toThrow();
+  });
+
+  it.each(["task_delivered", "result_submitted"] as const)(
+    "does not let a provider postpone the refund by future-dating %s",
+    (through) => {
+      const fixture = createFixture();
+      const history: SignedNostrEvent[] = [];
+      const farFuture = DEADLINE + 365 * 24 * 60 * 60;
+      appendTransition(fixture, history, "accepted", "provider", fixture.providerKey, { createdAt: ACCEPTED_AT });
+      appendTransition(fixture, history, "escrow_funded", "escrow", fixture.escrowKey, { createdAt: ACCEPTED_AT + 1 });
+      appendTransition(fixture, history, "task_delivered", "provider", fixture.providerKey, {
+        createdAt: through === "task_delivered" ? farFuture : ACCEPTED_AT + 2,
+      });
+      if (through === "result_submitted") {
+        appendTransition(fixture, history, "result_submitted", "provider", fixture.providerKey, {
+          createdAt: farFuture,
+          resultReference: fixture.resultReference,
+        });
+      }
+      const refund = sign(refundDraft(fixture, history).event, fixture.requesterKey);
+      expect(refund.created_at).toBe(DEADLINE);
+      expect(reconstructPactAgreementHistory(fixture.context, [...history, refund])).toMatchObject({
+        status: "ok",
+        currentState: "refund_authorized",
+      });
+      // Only the deadline refund is exempt; other successors still keep order.
+      expect(() =>
+        appendTransition(fixture, [...history], through === "task_delivered" ? "result_submitted" : "rejected",
+          through === "task_delivered" ? "provider" : "requester",
+          through === "task_delivered" ? fixture.providerKey : fixture.requesterKey,
+          {
+            createdAt: DEADLINE,
+            ...(through === "task_delivered"
+              ? { resultReference: fixture.resultReference }
+              : { reasonCode: "result_rejected" }),
+          }),
+      ).toThrowError(expect.objectContaining({ code: "stale_predecessor" }));
+    },
+  );
+
+  it("rejects an authorization that exceeds the permitted clock skew", () => {
+    const fixture = createFixture();
+    const history = deliveredHistory(fixture);
+    expect(() =>
+      refundDraft(fixture, history, { createdAt: DEADLINE + 61, validationTime: DEADLINE }),
+    ).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+    expect(() =>
+      createPactAgreementTransition({
+        context: fixture.context,
+        history,
+        predecessorEventId: history.at(-1)!.id,
+        nextState: "refund_authorized",
+        actor: fixture.requesterIdentity.publicKey,
+        actorRole: "requester",
+        reasonCode: PACT_EXECUTION_DEADLINE_REASON_CODE,
+        createdAt: DEADLINE,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "malformed_event" }));
+  });
+
+  it("detects a deadline refund and a late provider result as a fork in either order", () => {
+    const fixture = createFixture();
+    const history = deliveredHistory(fixture);
+    const refund = sign(refundDraft(fixture, history).event, fixture.requesterKey);
+    const lateResult = sign(
+      createPactAgreementTransition({
+        context: fixture.context,
+        history,
+        predecessorEventId: history.at(-1)!.id,
+        nextState: "result_submitted",
+        actor: fixture.providerIdentity.publicKey,
+        actorRole: "provider",
+        resultReference: fixture.resultReference,
+        createdAt: DEADLINE + 5,
+      }).event,
+      fixture.providerKey,
+    );
+    for (const events of [
+      [...history, refund, lateResult],
+      [...history, lateResult, refund],
+      [lateResult, ...[...history].reverse(), refund],
+    ]) {
+      const reconstructed = reconstructPactAgreementHistory(fixture.context, events);
+      expect(reconstructed).toMatchObject({
+        status: "forked",
+        currentState: "task_delivered",
+        conflict: {
+          predecessorEventId: history.at(-1)!.id,
+          competingEventIds: [refund.id, lateResult.id].sort(),
+        },
+      });
+      expect(() => pactAgreementExecutionDeadline(fixture.context, events)).toThrowError(
+        expect.objectContaining({ code: "forked_history" }),
+      );
+      expect(() =>
+        appendTransition(fixture, [...events], "refunded", "escrow", fixture.escrowKey, { createdAt: DEADLINE + 6 }),
+      ).toThrowError(expect.objectContaining({ code: "forked_history" }));
+    }
+    // A provider result cannot follow a published refund authorization.
+    const refunded = [...history, refund];
+    expect(() =>
+      appendTransition(fixture, refunded, "result_submitted", "provider", fixture.providerKey, {
+        createdAt: DEADLINE + 5,
+        resultReference: fixture.resultReference,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+  });
+
+  it("keeps previously valid refund and settlement histories valid and time-independent", () => {
+    const fixture = createFixture();
+    // Timeout refund straight from escrow_funded, well before the deadline.
+    const timeout: SignedNostrEvent[] = [];
+    appendTransition(fixture, timeout, "accepted", "provider", fixture.providerKey, { createdAt: ACCEPTED_AT });
+    appendTransition(fixture, timeout, "escrow_funded", "escrow", fixture.escrowKey, { createdAt: ACCEPTED_AT + 1 });
+    appendTransition(fixture, timeout, "refund_authorized", "requester", fixture.requesterKey, {
+      createdAt: ACCEPTED_AT + 2,
+      reasonCode: "timeout",
+    });
+    appendTransition(fixture, timeout, "refunded", "escrow", fixture.escrowKey, { createdAt: ACCEPTED_AT + 3 });
+    expect(reconstructPactAgreementHistory(fixture.context, timeout)).toMatchObject({
+      status: "ok",
+      currentState: "refunded",
+    });
+    expect(isPactExecutionDeadlineRefund(
+      reconstructPactAgreementHistory(fixture.context, timeout).transitions[2].content,
+    )).toBe(false);
+
+    // Rejected-result refund before the deadline still uses its own rule.
+    const rejected = deliveredHistory(fixture, "result_submitted");
+    appendTransition(fixture, rejected, "rejected", "requester", fixture.requesterKey, {
+      createdAt: ACCEPTED_AT + 4,
+      reasonCode: "result_rejected",
+    });
+    appendTransition(fixture, rejected, "refund_authorized", "requester", fixture.requesterKey, {
+      createdAt: ACCEPTED_AT + 5,
+      reasonCode: "result_rejected",
+    });
+    expect(reconstructPactAgreementHistory(fixture.context, rejected)).toMatchObject({
+      status: "ok",
+      currentState: "refund_authorized",
+    });
+
+    // Full settlement path is unchanged; the history bound is unchanged.
+    const settled = advanceToSubmitted(fixture);
+    const decision = createPactCompletionDecision({
+      context: fixture.context,
+      history: settled,
+      privateTerms: fixture.privateTerms,
+      privateSalt: fixture.privateSalt,
+      privateResult: fixture.privateResult,
+    });
+    const verifiedFixture = { ...fixture, context: { ...fixture.context, completionDecisions: [decision] } };
+    appendTransition(verifiedFixture, settled, "result_verified", "requester", fixture.requesterKey, {
+      resultReference: fixture.resultReference,
+    });
+    appendTransition(verifiedFixture, settled, "release_authorized", "requester", fixture.requesterKey);
+    appendTransition(verifiedFixture, settled, "settled", "escrow", fixture.escrowKey);
+    expect(reconstructPactAgreementHistory(verifiedFixture.context, settled)).toMatchObject({
+      status: "ok",
+      currentState: "settled",
+    });
+  });
+});
+
+/** Builds a requester refund event without the creation-time checks. */
+function manualRefundEvent(
+  fixture: ReturnType<typeof createFixture>,
+  history: readonly SignedNostrEvent[],
+  createdAt: number,
+): UnsignedNostrEvent {
+  const predecessor = history.at(-1)!;
+  const content = {
+    version: 1,
+    agreement_id: AGREEMENT_ID,
+    agreement_root: fixture.root.event.id,
+    predecessor: predecessor.id,
+    state: "refund_authorized",
+    prev_state: JSON.parse(predecessor.content).state,
+    actor: fixture.requesterIdentity.publicKey,
+    actor_role: "requester",
+    reason_code: PACT_EXECUTION_DEADLINE_REASON_CODE,
+  };
+  return {
+    pubkey: fixture.requesterIdentity.publicKey,
+    created_at: createdAt,
+    kind: PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND,
+    tags: [
+      ["d", AGREEMENT_ID],
+      ["t", "pactagent/service-agreement-transition@1"],
+      ["t", "refund_authorized"],
+      ["e", fixture.root.event.id],
+      ["e", predecessor.id],
+      ["p", fixture.requesterIdentity.publicKey],
+    ],
+    content: JSON.stringify(content),
+  };
+}

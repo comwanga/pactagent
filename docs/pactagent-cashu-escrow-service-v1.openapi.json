@@ -135,7 +135,7 @@
                     "required": ["refund_authorization_event_id", "basis"],
                     "properties": {
                       "refund_authorization_event_id": { "$ref": "#/components/schemas/EventId" },
-                      "basis": { "type": "string", "enum": ["timeout", "rejected"] }
+                      "basis": { "type": "string", "enum": ["timeout", "rejected", "execution_deadline"] }
                     }
                   }
                 ]

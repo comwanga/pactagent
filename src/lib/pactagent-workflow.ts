@@ -5,6 +5,7 @@ import type { NostrPublicKey, SignedNostrEvent } from "../domain/nostr";
 import type { Sats } from "../domain/money";
 import {
   DOCUMENT_SUMMARY_PROFILE_ID,
+  PACT_EXECUTION_DEADLINE_REASON_CODE,
   PactPrivateCommitmentSalt,
   createPactAgreementId,
   createPactAgreementTransition,
@@ -13,6 +14,9 @@ import {
   createPactEscrowAuthoritySource,
   createPactResultReference,
   createPactTermsCommitment,
+  isPactExecutionDeadlineRefund,
+  pactAgreementExecutionDeadline,
+  parsePactAgreementTransitionEvent,
   verifyPactTermsCommitment,
   type DocumentSummaryPrivateResult,
   type DocumentSummaryPrivateTerms,
@@ -1436,7 +1440,19 @@ export class PactAgentWorkflow {
     history: PactAgreementHistory,
     refundReference: string,
   ): PactAgentWorkflowReport {
-    this.#assertTerminalHistory(history, ["accepted", "escrow_funded", "refund_authorized", "refunded"]);
+    const states = history.transitions.map((t) => t.content.state);
+    const executionStates: readonly PactAgreementState[] = states.includes("result_submitted")
+      ? ["task_delivered", "result_submitted"]
+      : states.includes("task_delivered")
+        ? ["task_delivered"]
+        : [];
+    this.#assertTerminalHistory(history, [
+      "accepted",
+      "escrow_funded",
+      ...executionStates,
+      "refund_authorized",
+      "refunded",
+    ]);
     return this.#buildReport(context, history, undefined, refundReference);
   }
 
@@ -1454,7 +1470,27 @@ export class PactAgentWorkflow {
   }
 
   async #publishRefundAuthorization(context: PactAgreementContext): Promise<SignedNostrEvent[]> {
-    const historyBeforeRefundAuthorization = await this.#collectHistoryEvents(context);
+    const history = await this.#reconstructHistory(context);
+    if (history.status !== "ok") {
+      workflowError("reconstruction_failed", "Agreement history is forked");
+    }
+    const historyBeforeRefundAuthorization = history.transitions.map((t) => t.event);
+    // Rule revision 1.1: a refund out of a provider execution state is an
+    // execution-deadline refund and is checked against trusted time.
+    const executionDeadlineRefund =
+      history.currentState === "task_delivered" || history.currentState === "result_submitted";
+    const now = this.#now();
+    if (executionDeadlineRefund) {
+      let deadline: number;
+      try {
+        deadline = pactAgreementExecutionDeadline(context, historyBeforeRefundAuthorization);
+      } catch {
+        workflowError("settlement_failed", "Agreement has no valid execution deadline");
+      }
+      if (now < deadline) {
+        workflowError("unexpected_state", "Agreement execution deadline has not elapsed");
+      }
+    }
     await signAndPublishPactAgreementTransition({
       context,
       history: historyBeforeRefundAuthorization,
@@ -1465,11 +1501,13 @@ export class PactAgentWorkflow {
         nextState: "refund_authorized",
         actor: this.requesterPublicKey,
         actorRole: "requester",
-        reasonCode: "timeout",
-        createdAt: this.#now(),
+        reasonCode: executionDeadlineRefund ? PACT_EXECUTION_DEADLINE_REASON_CODE : "timeout",
+        createdAt: now,
+        validationTime: now,
       }),
       signer: this.#identities.requesterSigner,
       relay: this.#dependencies.relay,
+      validationTime: now,
     });
     return this.#collectHistoryEvents(context);
   }
@@ -1493,13 +1531,19 @@ export class PactAgentWorkflow {
 
     let authorized, refunded;
     try {
+      // The basis follows the published authorization; the coordinator
+      // independently re-validates it against the history and its clock.
+      const authorization = parsePactAgreementTransitionEvent(
+        refundAuthorizedHistory.at(-1)!,
+        context.root.content.capability_profile,
+      );
       authorized = await coordinator.submitRefundAuthorization({
         idempotencyKey: "wf-authorize-refund-1",
         escrowReference: this.#state.escrowReference!,
         expectedVersion: this.#state.escrowVersion!,
         context,
         history: refundAuthorizedHistory,
-        basis: "timeout",
+        basis: isPactExecutionDeadlineRefund(authorization.content) ? "execution_deadline" : "timeout",
       });
       refunded = await coordinator.refundEscrow({
         idempotencyKey: "wf-refund-escrow-1",
@@ -1670,8 +1714,10 @@ export class PactAgentWorkflow {
   /**
    * Continues a previously interrupted refund transaction from a persisted
    * resume state. The requester publishes refund_authorized only after the
-   * timeout rule permits it, and the Cashu refund reuses the existing
-   * coordinator idempotency so a confirmed refund is never repeated.
+   * timeout rule (escrow_funded) or the rule revision 1.1 execution deadline
+   * (task_delivered, result_submitted) permits it. An authorization already on
+   * the relay is reused, never replaced, and the Cashu refund reuses the
+   * existing coordinator idempotency so a confirmed refund is never repeated.
    */
   async resumeRefundTransaction(
     state: PactAgentWorkflowResumeState,
@@ -1685,7 +1731,19 @@ export class PactAgentWorkflow {
       this.#seedResumeState(state);
       const context = this.#state.context!;
 
-      const currentState = (await this.#reconstructHistory(context)).currentState;
+      const history = await this.#reconstructHistory(context);
+      if (history.status !== "ok") {
+        workflowError("reconstruction_failed", "Agreement history is forked");
+      }
+      const currentState = history.currentState;
+
+      if (currentState === "task_delivered" || currentState === "result_submitted") {
+        if (options.reconcileOnly === true) {
+          workflowError("unexpected_state", "Reconciliation cannot authorize a new refund");
+        }
+        const refundAuthorizedHistory = await this.#publishRefundAuthorization(context);
+        return this.#completeRefund(context, refundAuthorizedHistory);
+      }
 
       if (currentState === "escrow_funded") {
         const refundAuthorizedHistory = await this.#publishRefundAuthorization(context);

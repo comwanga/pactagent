@@ -24,6 +24,7 @@ import {
   validatePactServiceAgreementRoot,
   createPactResultReference,
   type PactAgreementContext,
+  type PactAgreementHistory,
   type PactAgreementReferences,
   type PactServiceAgreementRoot,
 } from "../domain/pact-service-agreement";
@@ -97,6 +98,21 @@ export type ProviderServiceErrorCode =
   | "not_started"
   | "already_started"
   | "relay_disconnected";
+
+/**
+ * True when publishing result_submitted could only fork the agreement: the
+ * relay history is already forked, or the requester has authorized a refund
+ * (rule revision 1.1 lets it refund from task_delivered after the execution
+ * deadline). The result-submission paths filter the history down to provider
+ * states, so without this check they would extend task_delivered a second time.
+ */
+function resultSubmissionSuperseded(history: PactAgreementHistory): boolean {
+  return (
+    history.status === "forked" ||
+    history.currentState === "refund_authorized" ||
+    history.currentState === "refunded"
+  );
+}
 
 export class ProviderServiceError extends Error {
   readonly code: ProviderServiceErrorCode;
@@ -1003,7 +1019,12 @@ export class PactAgentProviderService {
     const updatedHistory = await this.#collectHistory(context);
     const updatedState = updatedHistory.currentState;
 
-    if (updatedState !== "result_submitted" && updatedState !== "release_authorized" && updatedState !== "settled" && updatedState !== "refunded") {
+    if (resultSubmissionSuperseded(updatedHistory)) {
+      safeLog("warn", "provider_result_submission_superseded", {
+        event_id: rootEvent.id,
+        relay_state: updatedState,
+      });
+    } else if (updatedState !== "result_submitted" && updatedState !== "release_authorized" && updatedState !== "settled" && updatedState !== "refunded") {
       if (record.resultReference) {
         try {
           const resultSubmittedHistory = updatedHistory.transitions
@@ -1230,7 +1251,12 @@ export class PactAgentProviderService {
     }
 
     const updatedHistory = await this.#collectHistory(context);
-    if (updatedHistory.currentState !== "result_submitted" && updatedHistory.currentState !== "release_authorized" && updatedHistory.currentState !== "settled") {
+    if (resultSubmissionSuperseded(updatedHistory)) {
+      safeLog("warn", "provider_result_submission_superseded", {
+        event_id: rootEvent.id,
+        relay_state: updatedHistory.currentState,
+      });
+    } else if (updatedHistory.currentState !== "result_submitted" && updatedHistory.currentState !== "release_authorized" && updatedHistory.currentState !== "settled") {
       const resultSubmittedHistory = updatedHistory.transitions
         .filter((t) => {
           const state = t.content.state;
