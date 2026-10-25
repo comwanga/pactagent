@@ -51,7 +51,7 @@ import {
   type NostrEncrypter,
 } from "./private-task-transport";
 import type { PrivateTaskProvenance } from "../domain/private-task-transport";
-import { isTimeoutError, operationOptions } from "./pontmore-publication-helpers";
+import { externalErrorCode, isTimeoutError, operationOptions } from "./pontmore-publication-helpers";
 import {
   createSqliteProviderIdempotencyStore,
   type ProviderIdempotencyStore,
@@ -81,6 +81,13 @@ import {
  * Idempotency: processed agreement root event IDs are tracked in-memory and
  * optionally durably. Replaying a valid relay event does not produce duplicate
  * acceptance, execution, or result publication.
+ *
+ * Polling (Issue #59): the root query is restricted to roots addressed to this
+ * provider (`#p`) and to timestamps no later than trusted time plus the
+ * protocol clock skew. The durable poll cursor only moves after a scan has
+ * covered its whole window, never past trusted time, and never past a root
+ * whose processing must be retried. After a restart, incomplete durable
+ * records are recovered by root id, independent of the cursor.
  *
  * Reconnect: if the relay connection drops, the service reconnects and resumes
  * polling. In-flight agreements that were already accepted are not re-accepted
@@ -213,6 +220,48 @@ interface ProcessedAgreementRecord {
 const DEFAULT_POLL_INTERVAL_MS = 3_000;
 const DEFAULT_TRANSITION_WAIT_TIMEOUT_MS = 120_000;
 const DEFAULT_RELAY_QUERY_TIMEOUT_MS = 15_000;
+const AGREEMENT_POLL_PAGE_LIMIT = 100;
+/** Pages fetched per poll; a longer scan resumes on the next poll. */
+const AGREEMENT_POLL_MAX_PAGES = 10;
+/**
+ * Issue #59: how far behind the poll cursor each scan starts. One clock skew
+ * covers a requester whose clock trails this provider's by the permitted skew;
+ * the second covers relay publication latency and poll duration.
+ */
+export const AGREEMENT_POLL_OVERLAP_SECONDS = 2 * PACT_AGREEMENT_CLOCK_SKEW_SECONDS;
+
+/**
+ * Attempts for a root whose handling failed for a relay or unexpected reason
+ * before its outcome was decided. A root author can provoke such failures
+ * (for example a requester definition reference the relay cannot answer), so
+ * the attempts are bounded and the root then stops holding the cursor.
+ */
+const AGREEMENT_ROOT_RETRY_ATTEMPTS = 3;
+
+/**
+ * Outcome of handling one agreement root. "retry" and "store_unavailable"
+ * hold the poll cursor; only "retry" counts against the retry attempts,
+ * because a local store failure is not caused by the root.
+ */
+type AgreementRootOutcome = "handled" | "retry" | "store_unavailable";
+
+/**
+ * One pass over the poll window [since, startedAt + skew], fetched newest
+ * first in pages. `until` is the inclusive upper bound of the next page.
+ */
+interface AgreementPollScan {
+  readonly since: number;
+  readonly startedAt: number;
+  until: number;
+  newestAddressedCreatedAt: number | undefined;
+  oldestRetryCreatedAt: number | undefined;
+}
+
+/** Relay failures while fetching the requester definition are transient. */
+function isTransientRetrievalError(error: unknown): boolean {
+  const code = externalErrorCode(error);
+  return code === "timeout" || code === "retrieval_failure";
+}
 
 function safeLog(level: "info" | "warn" | "error", message: string, fields?: Record<string, unknown>): void {
   const safeFields: Record<string, unknown> = {};
@@ -236,16 +285,25 @@ export class PactAgentProviderService {
   #agreementsProcessed = 0;
   #reconnectAttempts = 0;
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
-  #lastPollTimestamp = 0;
+  // Issue #59: poll cursor (Unix seconds) and the value last written to the
+  // durable store. Undefined until loaded on the first poll.
+  #pollCursor: number | undefined;
+  #storedPollCursor: number | undefined;
+  #pollScan: AgreementPollScan | undefined;
+  #incompleteAgreementsRecovered = false;
   // F38-06C: Track poll failures so protocolReady reflects real state.
   #pollFailing = false;
   // Issue #39: Strfry's `since` filter is INCLUSIVE, so the newest agreement
   // root is re-returned on every poll. Track processed root event ids so the
   // same root is not re-recovered (and re-logged) forever. The durable
   // idempotency store remains the authoritative dedup across restarts; this
-  // set only bounds the poll loop. Capped to stay bounded in memory.
+  // set only bounds the poll loop. Capped to stay bounded in memory; the cap
+  // exceeds what an overlapping poll window holds under normal load, so a
+  // re-scanned root is not handled again.
   #processedRootEventIds = new Set<string>();
-  static readonly #PROCESSED_ROOT_ID_CAP = 500;
+  static readonly #PROCESSED_ROOT_ID_CAP = 10_000;
+  // Issue #59: failed attempts per root still being retried.
+  #rootRetryAttempts = new Map<string, number>();
 
   constructor(config: PactAgentProviderServiceConfig) {
     if (config.offerAmountSats <= 0n) {
@@ -269,6 +327,10 @@ export class PactAgentProviderService {
     if (this.#started) throw new ProviderServiceError("already_started", "Provider service is already started");
     this.#started = true;
     this.#stopping = false;
+    this.#pollCursor = undefined;
+    this.#storedPollCursor = undefined;
+    this.#pollScan = undefined;
+    this.#incompleteAgreementsRecovered = false;
     await this.#connectAndPublish();
     this.#schedulePoll();
     safeLog("info", "provider_service_started", {
@@ -475,56 +537,302 @@ export class PactAgentProviderService {
     }
     if (!connected) return;
 
-    const since = this.#lastPollTimestamp > 0 ? this.#lastPollTimestamp : undefined;
-    const filter: NostrFilter = {
-      kinds: [PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND],
-      tags: { t: [PACT_SERVICE_AGREEMENT_ROOT_TYPE] },
-      ...(since === undefined ? {} : { since }),
-      limit: 100,
-    };
+    if (!(await this.#loadPollCursor())) return;
+    await this.#recoverIncompleteAgreements();
 
-    let events: SignedNostrEvent[];
-    try {
-      events = await this.#config.relay.queryEvents(
-        filter,
-        operationOptions(DEFAULT_RELAY_QUERY_TIMEOUT_MS),
-      );
-    } catch (error) {
-      this.#pollFailing = true;
-      if (isTimeoutError(error)) {
-        safeLog("warn", "provider_poll_timeout");
+    const scan = this.#pollScan ?? this.#beginPollScan();
+    this.#pollScan = scan;
+    let complete = false;
+    for (let page = 0; page < AGREEMENT_POLL_MAX_PAGES && !this.#stopping; page += 1) {
+      const filter: NostrFilter = {
+        kinds: [PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND],
+        tags: { t: [PACT_SERVICE_AGREEMENT_ROOT_TYPE], p: [this.providerPublicKey] },
+        since: scan.since,
+        until: scan.until,
+        limit: AGREEMENT_POLL_PAGE_LIMIT,
+      };
+
+      let events: SignedNostrEvent[];
+      try {
+        events = await this.#config.relay.queryEvents(
+          filter,
+          operationOptions(DEFAULT_RELAY_QUERY_TIMEOUT_MS),
+        );
+      } catch (error) {
+        // The scan is kept: the next poll retries this page and the cursor
+        // does not move.
+        this.#pollFailing = true;
+        if (isTimeoutError(error)) {
+          safeLog("warn", "provider_poll_timeout");
+          return;
+        }
+        safeLog("warn", "provider_poll_query_failed");
         return;
       }
-      safeLog("warn", "provider_poll_query_failed");
-      return;
+
+      // F38-06C: Poll succeeded — clear the poll-failing flag.
+      this.#pollFailing = false;
+
+      const pageOldest = await this.#processPolledPage(events, scan);
+      if (this.#stopping) return;
+      if (events.length < AGREEMENT_POLL_PAGE_LIMIT) {
+        complete = true;
+        break;
+      }
+      // A full page may hide older roots: page down with an inclusive until.
+      if (pageOldest === undefined) {
+        // No usable event to page from; relay output cannot be trusted.
+        this.#pollScan = undefined;
+        this.#pollFailing = true;
+        safeLog("warn", "provider_poll_page_unusable");
+        return;
+      }
+      if (pageOldest < scan.until) {
+        scan.until = pageOldest;
+      } else {
+        // Every event in the page shares one second. NIP-01 filters cannot
+        // page within a second, so step past it and say so.
+        safeLog("warn", "provider_poll_page_saturated", { created_at: pageOldest });
+        scan.until = pageOldest - 1;
+      }
+      if (scan.until < scan.since) {
+        complete = true;
+        break;
+      }
     }
+    if (!complete) return;
 
-    // F38-06C: Poll succeeded — clear the poll-failing flag.
-    this.#pollFailing = false;
+    this.#pollScan = undefined;
+    await this.#advancePollCursor(scan);
+  }
 
-    let latestTimestamp = this.#lastPollTimestamp;
+  /**
+   * Issue #59: loads the durable poll cursor once per start. A store without
+   * a cursor starts at trusted time (the first scan re-reads the overlap
+   * window), and that starting point is persisted at once so a restart
+   * before the first complete scan does not move it forward. A cursor ahead
+   * of the clock is pulled back to it. A corrupt or unreadable cursor fails
+   * the poll closed and is retried every poll.
+   */
+  async #loadPollCursor(): Promise<boolean> {
+    if (this.#pollCursor !== undefined) return true;
+    let stored: number | undefined;
+    try {
+      stored = await this.#config.idempotencyStore.readPollCursor();
+    } catch {
+      this.#pollFailing = true;
+      safeLog("error", "provider_poll_cursor_unavailable");
+      return false;
+    }
+    const now = this.#config.clock();
+    if (stored === undefined) {
+      try {
+        await this.#config.idempotencyStore.writePollCursor(now);
+      } catch {
+        this.#pollFailing = true;
+        safeLog("error", "provider_poll_cursor_persist_failed");
+        return false;
+      }
+      stored = now;
+    } else if (stored > now) {
+      safeLog("warn", "provider_poll_cursor_ahead_of_clock");
+    }
+    this.#storedPollCursor = stored;
+    this.#pollCursor = Math.min(stored, now);
+    return true;
+  }
+
+  #beginPollScan(): AgreementPollScan {
+    const now = this.#config.clock();
+    // The cursor never exceeds trusted time when it is set, but the clock
+    // may have moved backward since.
+    const cursor = Math.min(this.#pollCursor ?? now, now);
+    return {
+      since: Math.max(0, cursor - AGREEMENT_POLL_OVERLAP_SECONDS),
+      startedAt: now,
+      until: now + PACT_AGREEMENT_CLOCK_SKEW_SECONDS,
+      newestAddressedCreatedAt: undefined,
+      oldestRetryCreatedAt: undefined,
+    };
+  }
+
+  /**
+   * Handles one page of poll results without trusting the relay's filtering.
+   * Returns the oldest verified in-window timestamp, used to page down.
+   */
+  async #processPolledPage(
+    events: readonly SignedNostrEvent[],
+    scan: AgreementPollScan,
+  ): Promise<number | undefined> {
+    let pageOldest: number | undefined;
+    let rejected = 0;
     for (const event of events) {
       if (this.#stopping) break;
-      // Issue #39: skip roots already processed in this process lifetime.
-      // Strfry re-returns the newest root when the inclusive `since` filter
-      // matches; without this skip the provider would re-run recovery for
-      // that root on every poll indefinitely.
-      if (this.#processedRootEventIds.has(event.id)) continue;
+      let parsed: SignedNostrEvent;
       try {
-        const parsed = parseSignedNostrEvent(event);
+        parsed = parseSignedNostrEvent(event);
         verifySignedNostrEvent(parsed);
-        if (parsed.created_at > latestTimestamp) latestTimestamp = parsed.created_at;
-        await this.#processAgreementRoot(parsed);
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
         safeLog("warn", "provider_agreement_parse_error", {
-          event_id: event.id,
+          event_id: typeof event?.id === "string" ? event.id.slice(0, 64) : "unknown",
           error: errMsg.slice(0, 200),
         });
+        continue;
       }
+      // Re-check the window against the clock now: it may have moved
+      // backward since the scan began.
+      const latestPermitted = Math.min(scan.until, this.#config.clock() + PACT_AGREEMENT_CLOCK_SKEW_SECONDS);
+      if (parsed.created_at < scan.since || parsed.created_at > latestPermitted) {
+        rejected += 1;
+        continue;
+      }
+      pageOldest = pageOldest === undefined ? parsed.created_at : Math.min(pageOldest, parsed.created_at);
+      if (!this.#isAddressedAgreementRoot(parsed)) {
+        rejected += 1;
+        continue;
+      }
+      const outcome = await this.#handlePolledRoot(parsed);
+      if (outcome !== "handled") {
+        scan.oldestRetryCreatedAt = Math.min(scan.oldestRetryCreatedAt ?? parsed.created_at, parsed.created_at);
+      } else {
+        scan.newestAddressedCreatedAt = Math.max(
+          scan.newestAddressedCreatedAt ?? parsed.created_at,
+          parsed.created_at,
+        );
+      }
+    }
+    if (rejected > 0) safeLog("warn", "provider_poll_events_rejected", { count: rejected });
+    return pageOldest;
+  }
+
+  /**
+   * True only for a well-formed agreement root whose signed content and tags
+   * name this provider. The relay's `#p` filter is a discovery optimization,
+   * not proof of addressing.
+   */
+  #isAddressedAgreementRoot(event: SignedNostrEvent): boolean {
+    if (!event.tags.some((tag) => tag[0] === "t" && tag[1] === PACT_SERVICE_AGREEMENT_ROOT_TYPE)) return false;
+    try {
+      return parsePactServiceAgreementRootEvent(event).content.provider === this.providerPublicKey;
+    } catch {
+      return false;
+    }
+  }
+
+  async #handlePolledRoot(event: SignedNostrEvent): Promise<AgreementRootOutcome> {
+    // Issue #39: skip roots already processed in this process lifetime.
+    // Strfry re-returns the newest root when the inclusive `since` filter
+    // matches; without this skip the provider would re-run recovery for
+    // that root on every poll indefinitely.
+    if (this.#processedRootEventIds.has(event.id)) return "handled";
+    let outcome: AgreementRootOutcome;
+    try {
+      outcome = await this.#processAgreementRoot(event);
+    } catch (error) {
+      // An unexpected failure must not let the cursor pass this root
+      // without another attempt.
+      const errMsg = error instanceof Error ? error.message : String(error);
+      safeLog("warn", "provider_agreement_processing_error", {
+        event_id: event.id,
+        error: errMsg.slice(0, 200),
+      });
+      outcome = "retry";
+    }
+    if (outcome === "retry") {
+      const attempts = (this.#rootRetryAttempts.get(event.id) ?? 0) + 1;
+      if (attempts >= AGREEMENT_ROOT_RETRY_ATTEMPTS) {
+        // Any durable record it gained is still recovered after a restart.
+        safeLog("warn", "provider_agreement_retry_exhausted", { event_id: event.id, attempts });
+        outcome = "handled";
+      } else {
+        if (this.#rootRetryAttempts.size >= PactAgentProviderService.#PROCESSED_ROOT_ID_CAP) {
+          const oldest = this.#rootRetryAttempts.keys().next();
+          if (!oldest.done) this.#rootRetryAttempts.delete(oldest.value);
+        }
+        this.#rootRetryAttempts.set(event.id, attempts);
+      }
+    }
+    if (outcome === "handled") {
+      this.#rootRetryAttempts.delete(event.id);
       this.#rememberProcessedRoot(event.id);
     }
-    this.#lastPollTimestamp = latestTimestamp;
+    return outcome;
+  }
+
+  /**
+   * Issue #59: moves the cursor after a complete scan. It never passes trusted
+   * time, the scan start, or a root that must be retried, and a cursor that
+   * could not be written durably is not adopted.
+   */
+  async #advancePollCursor(scan: AgreementPollScan): Promise<void> {
+    const previous = this.#pollCursor ?? scan.startedAt;
+    let target = Math.min(scan.startedAt, scan.newestAddressedCreatedAt ?? previous);
+    if (scan.oldestRetryCreatedAt !== undefined) target = Math.min(target, scan.oldestRetryCreatedAt);
+    const next = Math.max(0, Math.min(Math.max(previous, target), this.#config.clock()));
+    if (next === this.#storedPollCursor) {
+      this.#pollCursor = next;
+      return;
+    }
+    try {
+      await this.#config.idempotencyStore.writePollCursor(next);
+    } catch {
+      this.#pollFailing = true;
+      safeLog("error", "provider_poll_cursor_persist_failed");
+      return;
+    }
+    this.#storedPollCursor = next;
+    this.#pollCursor = next;
+  }
+
+  /**
+   * Issue #59: after a restart, in-flight agreements are recovered from their
+   * durable records by root id, because their roots may be older than the
+   * persisted poll window. Runs until it completes once per start.
+   */
+  async #recoverIncompleteAgreements(): Promise<void> {
+    if (this.#incompleteAgreementsRecovered) return;
+    let rootIds: string[];
+    try {
+      rootIds = await this.#config.idempotencyStore.listIncompleteAgreementRootEventIds();
+    } catch {
+      safeLog("warn", "provider_incomplete_recovery_store_failed");
+      return;
+    }
+    let retries = 0;
+    let found = 0;
+    for (let offset = 0; offset < rootIds.length; offset += AGREEMENT_POLL_PAGE_LIMIT) {
+      if (this.#stopping) return;
+      const chunk = rootIds.slice(offset, offset + AGREEMENT_POLL_PAGE_LIMIT);
+      let events: SignedNostrEvent[];
+      try {
+        events = await this.#config.relay.queryEvents(
+          { ids: chunk, kinds: [PACTAGENT_SERVICE_AGREEMENT_EVENT_KIND], limit: chunk.length },
+          operationOptions(DEFAULT_RELAY_QUERY_TIMEOUT_MS),
+        );
+      } catch {
+        safeLog("warn", "provider_incomplete_recovery_query_failed");
+        return;
+      }
+      for (const event of events) {
+        if (this.#stopping) return;
+        let parsed: SignedNostrEvent;
+        try {
+          parsed = parseSignedNostrEvent(event);
+          verifySignedNostrEvent(parsed);
+        } catch {
+          continue;
+        }
+        if (!chunk.includes(parsed.id) || !this.#isAddressedAgreementRoot(parsed)) continue;
+        found += 1;
+        if ((await this.#handlePolledRoot(parsed)) !== "handled") retries += 1;
+      }
+    }
+    if (retries > 0) return;
+    this.#incompleteAgreementsRecovered = true;
+    if (rootIds.length > 0) {
+      safeLog("info", "provider_incomplete_recovery_complete", { records: rootIds.length, found });
+    }
   }
 
   #rememberProcessedRoot(eventId: string): void {
@@ -535,33 +843,39 @@ export class PactAgentProviderService {
     this.#processedRootEventIds.add(eventId);
   }
 
-  async #processAgreementRoot(rootEvent: SignedNostrEvent): Promise<void> {
+  async #processAgreementRoot(rootEvent: SignedNostrEvent): Promise<AgreementRootOutcome> {
     let root: PactServiceAgreementRoot<SignedNostrEvent>;
     try {
       root = parsePactServiceAgreementRootEvent(rootEvent);
     } catch {
       safeLog("warn", "provider_agreement_root_invalid", { event_id: rootEvent.id });
-      return;
+      return "handled";
     }
 
     if (root.content.provider !== this.providerPublicKey) {
-      return;
+      return "handled";
     }
 
     const now = this.#config.clock();
     if (now > root.content.expires_at) {
       safeLog("warn", "provider_agreement_expired", { event_id: rootEvent.id });
-      return;
+      return "handled";
     }
 
     /*
      * Durable idempotency check: if we already have a record for this
      * agreement root, recover from the stored state instead of re-processing.
      */
-    const existing = await this.#config.idempotencyStore.read(rootEvent.id);
+    let existing: ProviderOperationRecord | undefined;
+    try {
+      existing = await this.#config.idempotencyStore.read(rootEvent.id);
+    } catch {
+      safeLog("error", "provider_agreement_store_unavailable", { event_id: rootEvent.id });
+      return "store_unavailable";
+    }
     if (existing) {
       await this.#recoverFromState(existing, root, rootEvent);
-      return;
+      return "handled";
     }
 
     /*
@@ -577,9 +891,15 @@ export class PactAgentProviderService {
         this.#config.relay,
       );
       requesterDefinitionEvent = requesterDef.event;
-    } catch {
+    } catch (error) {
+      // Issue #59: nothing durable exists yet, so a relay failure here is
+      // retried; a definition that is absent or invalid is final.
+      if (isTransientRetrievalError(error)) {
+        safeLog("warn", "provider_requester_definition_retrieval_failed", { event_id: rootEvent.id });
+        return "retry";
+      }
       safeLog("warn", "provider_requester_definition_not_found", { event_id: rootEvent.id });
-      return;
+      return "handled";
     }
 
     const references: PactAgreementReferences = {
@@ -592,7 +912,7 @@ export class PactAgentProviderService {
       validatePactServiceAgreementRoot(root.event, references);
     } catch {
       safeLog("warn", "provider_agreement_validation_failed", { event_id: rootEvent.id });
-      return;
+      return "handled";
     }
 
     /*
@@ -614,7 +934,12 @@ export class PactAgentProviderService {
       updatedAt: now,
       failureCode: undefined,
     });
-    await this.#config.idempotencyStore.write(record);
+    try {
+      await this.#config.idempotencyStore.write(record);
+    } catch {
+      safeLog("error", "provider_agreement_store_unavailable", { event_id: rootEvent.id });
+      return "store_unavailable";
+    }
 
     /*
      * Publish the signed escrow authority source to the relay.
@@ -635,7 +960,7 @@ export class PactAgentProviderService {
       await this.#config.idempotencyStore.transitionState(rootEvent.id, "complete", {
         failureCode: "authority_source_failed",
       });
-      return;
+      return "handled";
     }
 
     const escrowAuthority = createPactEscrowAuthorityBinding({
@@ -676,7 +1001,7 @@ export class PactAgentProviderService {
           state: history.currentState,
         });
       }
-      return;
+      return "handled";
     }
 
     try {
@@ -696,14 +1021,14 @@ export class PactAgentProviderService {
       await this.#config.idempotencyStore.transitionState(rootEvent.id, "complete", {
         failureCode: "accept_failed",
       });
-      return;
+      return "handled";
     }
 
     try {
       await this.#waitForTransition(context, "escrow_funded");
     } catch {
       safeLog("warn", "provider_escrow_funded_timeout", { event_id: rootEvent.id });
-      return;
+      return "handled";
     }
 
     // F38-03: Transition to "processing" before execution.
@@ -727,6 +1052,7 @@ export class PactAgentProviderService {
         });
       }
     }
+    return "handled";
   }
 
   async #recoverFromState(

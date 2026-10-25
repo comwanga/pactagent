@@ -51,6 +51,18 @@ class FailingStore implements ProviderIdempotencyStore {
     if (this.#failReads) throw new Error("simulated store failure");
     return this.#inner.countByState(state);
   }
+  async listIncompleteAgreementRootEventIds() {
+    if (this.#failReads) throw new Error("simulated store failure");
+    return this.#inner.listIncompleteAgreementRootEventIds();
+  }
+  async readPollCursor() {
+    if (this.#failReads) throw new Error("simulated store failure");
+    return this.#inner.readPollCursor();
+  }
+  async writePollCursor(createdAt: number) {
+    if (this.#failReads) throw new Error("simulated store failure");
+    return this.#inner.writePollCursor(createdAt);
+  }
   close() {
     this.#inner.close();
   }

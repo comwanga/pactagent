@@ -52,6 +52,10 @@ import { nostrPublicKey, type NostrPublicKey } from "../domain/nostr";
  *   complete:               fully terminal — relay shows settled or refunded.
  *                           Never re-execute.
  *
+ * Issue #59: the store also holds the agreement poll cursor in a separate
+ * metadata table, never as an operation record. The cursor is a Unix
+ * timestamp only; it carries no key, task, or result material.
+ *
  * The store uses WAL mode with synchronous=FULL for crash safety.
  * File permissions are 0600 (private application state).
  */
@@ -255,7 +259,27 @@ export interface ProviderIdempotencyStore {
    * Used by provider readiness to report recoveryRequiredCount.
    */
   countByState(state: ProviderOperationState): Promise<number>;
+  /**
+   * Issue #59: agreement root event ids whose operation is not complete.
+   * Used after a restart to recover in-flight agreements whose roots are
+   * older than the persisted poll window.
+   */
+  listIncompleteAgreementRootEventIds(): Promise<string[]>;
+  /**
+   * Issue #59: the durable agreement poll cursor, or undefined when none has
+   * been written yet. Throws `invalid_record` when the persisted value is
+   * corrupt so the caller can fail closed.
+   */
+  readPollCursor(): Promise<number | undefined>;
+  /** Issue #59: durably replaces the agreement poll cursor. */
+  writePollCursor(createdAt: number): Promise<void>;
   close(): void;
+}
+
+const POLL_CURSOR_KEY = "agreement_poll_cursor";
+
+function isPollCursorValue(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function storeError(message: string): never {
@@ -282,6 +306,11 @@ export function createSqliteProviderIdempotencyStore(
         value_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pact_provider_metadata (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
     chmodSync(resolvedPath, 0o600);
   } catch {
@@ -295,6 +324,16 @@ export function createSqliteProviderIdempotencyStore(
     INSERT INTO pact_provider_operations (agreement_root_event_id, value_json, updated_at)
     VALUES (?, ?, ?)
     ON CONFLICT(agreement_root_event_id) DO UPDATE SET
+      value_json = excluded.value_json,
+      updated_at = excluded.updated_at
+  `);
+  const readMetadataStatement = database.prepare(
+    "SELECT value_json FROM pact_provider_metadata WHERE key = ?",
+  );
+  const upsertMetadataStatement = database.prepare(`
+    INSERT INTO pact_provider_metadata (key, value_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
       value_json = excluded.value_json,
       updated_at = excluded.updated_at
   `);
@@ -365,6 +404,55 @@ export function createSqliteProviderIdempotencyStore(
         "SELECT COUNT(*) as cnt FROM pact_provider_operations WHERE value_json LIKE ?",
       ).get(`%"state":"${state}"%`) as { cnt: number };
       return result.cnt;
+    },
+
+    async listIncompleteAgreementRootEventIds(): Promise<string[]> {
+      ensureOpen();
+      // A row whose JSON cannot be read is still listed: recovery then reads
+      // it through read(), which fails closed for that one agreement.
+      const rows = database.prepare(`
+        SELECT agreement_root_event_id FROM pact_provider_operations
+        WHERE NOT json_valid(value_json)
+          OR json_extract(value_json, '$.state') IS NOT 'complete'
+        ORDER BY updated_at, agreement_root_event_id
+      `).all() as { agreement_root_event_id: string }[];
+      return rows.map((row) => row.agreement_root_event_id);
+    },
+
+    async readPollCursor(): Promise<number | undefined> {
+      ensureOpen();
+      const result = readMetadataStatement.get(POLL_CURSOR_KEY) as
+        | { value_json: string }
+        | undefined;
+      if (result === undefined) return undefined;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(result.value_json);
+      } catch {
+        throw new ProviderIdempotencyError("invalid_record", "Persisted poll cursor is corrupt");
+      }
+      const candidate = parsed as Record<string, unknown> | null;
+      if (
+        typeof candidate !== "object" ||
+        candidate === null ||
+        candidate.version !== 1 ||
+        !isPollCursorValue(candidate.created_at)
+      ) {
+        throw new ProviderIdempotencyError("invalid_record", "Persisted poll cursor is malformed");
+      }
+      return candidate.created_at;
+    },
+
+    async writePollCursor(createdAt: number): Promise<void> {
+      ensureOpen();
+      if (!isPollCursorValue(createdAt)) {
+        throw new ProviderIdempotencyError("invalid_record", "Poll cursor must be a non-negative Unix timestamp");
+      }
+      upsertMetadataStatement.run(
+        POLL_CURSOR_KEY,
+        JSON.stringify({ version: 1, created_at: createdAt }),
+        Math.floor(Date.now() / 1000),
+      );
     },
 
     close(): void {
