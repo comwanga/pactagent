@@ -1,6 +1,7 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { nostrPublicKey, type NostrPublicKey } from "../domain/nostr";
@@ -291,5 +292,164 @@ describe("Provider crash-state recovery (A-G)", () => {
     const same = await store2.transitionState("a".repeat(64), "complete");
     expect(same.state).toBe("complete");
     store2.close();
+  });
+});
+
+describe("Issue #59 agreement poll cursor storage", () => {
+  function testPath(): string {
+    return join(mkdtempSync(join(tmpdir(), "pactagent-poll-cursor-store-")), "provider-ops.sqlite");
+  }
+
+  function writeRawCursor(path: string, valueJson: string): void {
+    const database = new DatabaseSync(path);
+    database
+      .prepare(
+        "INSERT INTO pact_provider_metadata (key, value_json, updated_at) VALUES ('agreement_poll_cursor', ?, 0) " +
+          "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+      )
+      .run(valueJson);
+    database.close();
+  }
+
+  it("returns undefined before any cursor is written", async () => {
+    const store = createTestStore();
+    await expect(store.readPollCursor()).resolves.toBeUndefined();
+    store.close();
+  });
+
+  it("persists the cursor across close and reopen", async () => {
+    const path = testPath();
+    const first = createSqliteProviderIdempotencyStore(path);
+    await first.writePollCursor(1_800_000_000);
+    await first.writePollCursor(1_800_000_060);
+    first.close();
+    const second = createSqliteProviderIdempotencyStore(path);
+    await expect(second.readPollCursor()).resolves.toBe(1_800_000_060);
+    second.close();
+  });
+
+  it("keeps the cursor out of the operation records", async () => {
+    const path = testPath();
+    const store = createSqliteProviderIdempotencyStore(path);
+    await store.writePollCursor(1_800_000_000);
+    await expect(store.listIncompleteAgreementRootEventIds()).resolves.toEqual([]);
+    await expect(store.countByState("received")).resolves.toBe(0);
+    store.close();
+    const database = new DatabaseSync(path);
+    const rows = database.prepare("SELECT COUNT(*) AS cnt FROM pact_provider_operations").get() as { cnt: number };
+    database.close();
+    expect(rows.cnt).toBe(0);
+  });
+
+  it("rejects cursor values that are not non-negative safe Unix timestamps", async () => {
+    const store = createTestStore();
+    for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 2]) {
+      await expect(store.writePollCursor(value)).rejects.toMatchObject({ code: "invalid_record" });
+    }
+    await expect(store.readPollCursor()).resolves.toBeUndefined();
+    await store.writePollCursor(0);
+    await expect(store.readPollCursor()).resolves.toBe(0);
+    store.close();
+  });
+
+  it("fails closed on a corrupt or malformed persisted cursor", async () => {
+    for (const valueJson of [
+      "{not json",
+      "null",
+      JSON.stringify({ version: 2, created_at: 1_800_000_000 }),
+      JSON.stringify({ version: 1, created_at: -5 }),
+      JSON.stringify({ version: 1, created_at: 1.5 }),
+      JSON.stringify({ version: 1, created_at: "1800000000" }),
+      JSON.stringify({ version: 1 }),
+    ]) {
+      const path = testPath();
+      createSqliteProviderIdempotencyStore(path).close();
+      writeRawCursor(path, valueJson);
+      const store = createSqliteProviderIdempotencyStore(path);
+      await expect(store.readPollCursor()).rejects.toBeInstanceOf(ProviderIdempotencyError);
+      await expect(store.readPollCursor()).rejects.toMatchObject({ code: "invalid_record" });
+      store.close();
+    }
+  });
+
+  it("reports a write to a closed store as a failure", async () => {
+    const store = createTestStore();
+    store.close();
+    await expect(store.writePollCursor(1_800_000_000)).rejects.toMatchObject({ code: "store_unavailable" });
+    await expect(store.readPollCursor()).rejects.toMatchObject({ code: "store_unavailable" });
+  });
+
+  it("opens a pre-#59 database without a metadata table and keeps its records", async () => {
+    const path = testPath();
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE pact_provider_operations (
+        agreement_root_event_id TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    const record = createRecord({ state: "waiting_for_funding" });
+    legacy
+      .prepare("INSERT INTO pact_provider_operations (agreement_root_event_id, value_json, updated_at) VALUES (?, ?, ?)")
+      .run(
+        record.agreementRootEventId,
+        JSON.stringify({
+          version: 1,
+          agreement_root_event_id: record.agreementRootEventId,
+          agreement_id: record.agreementId,
+          requester_public_key: record.requesterPublicKey,
+          state: record.state,
+          result_reference: null,
+          result_summary: null,
+          accepted_transition_event_id: null,
+          task_delivered_transition_event_id: null,
+          result_submitted_transition_event_id: null,
+          created_at: record.createdAt,
+          updated_at: record.updatedAt,
+          failure_code: null,
+          prepared_event_json: null,
+        }),
+        record.updatedAt,
+      );
+    legacy.close();
+
+    const store = createSqliteProviderIdempotencyStore(path);
+    await expect(store.read(record.agreementRootEventId)).resolves.toMatchObject({ state: "waiting_for_funding" });
+    await expect(store.readPollCursor()).resolves.toBeUndefined();
+    await store.writePollCursor(1_800_000_000);
+    await expect(store.listIncompleteAgreementRootEventIds()).resolves.toEqual([record.agreementRootEventId]);
+    store.close();
+    if (process.platform !== "win32") {
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  it("lists incomplete operations, including unreadable rows, and excludes complete ones", async () => {
+    const path = testPath();
+    const store = createSqliteProviderIdempotencyStore(path);
+    await store.write(createRecord({ agreementRootEventId: "1".repeat(64), state: "waiting_for_funding", updatedAt: 1 }));
+    await store.write(createRecord({ agreementRootEventId: "2".repeat(64), state: "complete", updatedAt: 2 }));
+    await store.write(createRecord({ agreementRootEventId: "3".repeat(64), state: "recovery_required", updatedAt: 3 }));
+    await store.write(createRecord({
+      agreementRootEventId: "4".repeat(64),
+      state: "complete",
+      resultSummary: 'a summary quoting "state":"received"',
+      updatedAt: 4,
+    }));
+    store.close();
+    const database = new DatabaseSync(path);
+    database
+      .prepare("INSERT INTO pact_provider_operations (agreement_root_event_id, value_json, updated_at) VALUES (?, ?, ?)")
+      .run("5".repeat(64), "{corrupt", 5);
+    database.close();
+
+    const reopened = createSqliteProviderIdempotencyStore(path);
+    await expect(reopened.listIncompleteAgreementRootEventIds()).resolves.toEqual([
+      "1".repeat(64),
+      "3".repeat(64),
+      "5".repeat(64),
+    ]);
+    reopened.close();
   });
 });
