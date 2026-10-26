@@ -23,6 +23,9 @@ if [ ! -x /app/strfry ]; then
 fi
 
 cd /app
+# Configuration and persistent accounting must be usable before opening the
+# listener. Runtime policy failures also reject in Strfry's plugin protocol.
+/app/strfry-write-policy.py --initialize
 echo "strfry entrypoint starting (pid $$)"
 
 child_pid=""
