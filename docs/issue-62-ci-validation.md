@@ -117,12 +117,13 @@ Existing expensive unit/integration/process/browser/build lanes were not
 unnecessarily repeated for this infrastructure-only change. No relay policy,
 economic implementation or Docker image configuration changed in this task.
 
-Docker-backed validation passed on Linux/Node 22 at `8bed7c5` in
-[job 121632139829](https://github.com/comwanga/pactagent/actions/runs/40340080651/job/121632139829):
+Docker-backed validation passed on Linux/Node 22 at `c3272ad` in
+[job 121638567136](https://github.com/comwanga/pactagent/actions/runs/40341913339/job/121638567136):
 34 policy cases, four baseline publications, 5 provider cases, 3 size-boundary
-cases, 9 real policy cases, 3 hosted settlement cases, restart probes and cleanup.
-Final-head storage-boundary additions and remaining PR checks still require a
-fresh successful run. Local Docker was not started.
+cases, 11 real policy cases, 3 hosted settlement cases, restart probes and cleanup.
+The full Linux suite (1,133 cases), 16 process cases, 8 browser cases, build,
+invariants, dependency review and CodeQL also passed at that revision. Local
+Docker was not started. The subsequent report update changes documentation only.
 
 The first baseline run reproduced a startup failure: pinned Strfry requests
 1,000,000 descriptors but the runner's Docker hard limit was 65,536. Both

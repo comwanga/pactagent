@@ -61,12 +61,49 @@ prompt produces a 3,495,793-byte signed encrypted wrap and passes policy.
 Exact per-kind size/first-byte-overflow, malformed protocol, rate windows,
 multi-author spam, bounded state, storage isolation and restart tests pass.
 
-The before/after signed **real relay** suites passed on Linux/Node 22 at
-`8bed7c50f932bdca27dc91ce1bfcf6ba401f5e91` in
-[job 121632139829](https://github.com/comwanga/pactagent/actions/runs/40340080651/job/121632139829).
+The final before/after signed **real relay** suites passed on Linux/Node 22 at
+`c3272ad4658c51e7163198bf4c6994ae96c570ba` in
+[job 121638567136](https://github.com/comwanga/pactagent/actions/runs/40341913339/job/121638567136).
 The run accepted a maximum 4,194,304-byte gift event, rejected the first byte of
 overflow, verified native expiration and quota persistence across an actual
 plugin SIGKILL, and completed real hosted test-economic settlement.
+
+Observed author matrix (`P` provider, `R` independently generated requester,
+`A` escrow authority; all keys generated for the disposable run):
+
+| Kind | Observed accepted author | Observed rejected publication |
+| --- | --- | --- |
+| 0 | P | Foreign author |
+| 10002 | P | Foreign author |
+| 30360 | P, R | Foreign author |
+| 30361 | P | Foreign author |
+| 30400 | P | Foreign author and enrolled requester |
+| 3921 | P, R, A; actual requester root in hosted transaction | Foreign author |
+| 7300 | R | Foreign author |
+| 7301 | P | Foreign author |
+| 1059 | One-time outer keys to enrolled recipients; encrypted task/result | Missing recipient/expiration, size/rate/storage overflow |
+| 1 | None under the policy | Valid signed foreign event |
+
+Recipient quota: 12 small gifts accepted, the 13th rejected, and publication
+accepted after a 61-second wait. Aggregate quota: 120 gifts accepted across
+ten recipients, then a fresh eleventh recipient rejected. A maximum source and
+prompt produced a 3,495,793-byte encrypted gift. The exact 4,194,304-byte event
+was accepted; 4,194,305 bytes and frame overflow were rejected. Future events
+outside the 60-second window were rejected.
+
+Native expiration verified initial presence followed by removal of a gift
+whose signed 30-day retention was about to end; agreement evidence remained.
+Normal delivery/settlement completed before expiry. A deliberate plugin SIGKILL
+caused an actual authorized write to reject, then automatic restart restored
+authorized writes while still rejecting kind 1 and the exhausted recipient.
+
+Storage saturation used an explicit disposable-accounting seed at the 256 MiB
+gift reserve: a small signed gift rejected with the storage-budget reason while
+an authorized 3921 still accepted. Restoring only the seed restored gift writes.
+Post-flood inspection verified SQLite integrity, <=514 rate rows, <=723 storage
+rows, <=512 pages, each reserve <=256 MiB and LMDB file size <=1 GiB. This is
+seeded admission saturation and an observed bound check, not physical disk-fill
+stress testing. Both relay restart/persistence probes and scoped cleanup passed.
 
 ## E. Independent security review
 
@@ -111,18 +148,20 @@ scope, fresh-event rejection assertions and persisted-recipient quota check.
 | `npm run audit:client-bundle` | Passed; configured secret-value scans unavailable in clean worktree, known sentinel/identifier scans passed |
 | Existing Chromium acceptance | 8 passed, 1.8 min (`node scripts/run-requester-e2e.mjs --project=chromium`, using the verified webpack build) |
 | Stock exposure reproduction | Passed on GitHub Ubuntu runner: four signed baseline publications accepted |
-| Packaged hosted policy acceptance | 9 real WSS tests passed in 149.19 s at `8bed7c5`, including plugin SIGKILL/restart |
+| Packaged hosted policy acceptance | 11 real WSS tests passed at `c3272ad`, including plugin SIGKILL/restart and storage isolation |
 | Strfry size-boundary acceptance | 3 passed; exact 4 MiB event accepted and first-byte/frame overflow rejected |
 | Provider service acceptance | 5 passed against packaged relay |
 | Full hosted settlement acceptance | 3 passed, phase `settled`, balance 1000 → 648 Demo sats, `accountingPending=false` |
 | Cleanup and persistence | Both relay restart probes and scoped project/volume cleanup passed |
-| Linux/Node 22 CI | Docker policy/hosted job passed at `8bed7c5`; final-head storage-boundary additions and remaining PR checks still require completion |
+| Linux/Node 22 full suite | 1,133 passed / 56 files; lint, typecheck and production dependency audit passed |
+| Linux/Node 22 process/browser | 16 process tests passed (305.69 s); 8 Chromium tests passed (1.4 min) |
+| Linux/Node 22 CI | All PR checks passed at `c3272ad`, including production build, invariants, dependency review and CodeQL; branch protection unchanged |
 
 Observed environment: Ubuntu 24.04 runner image `20261012.334.1`, Docker
 client/server 28.0.4 (API 1.48), Compose 2.38.2, Node 22.23.3 and Python 3.12.15.
 Relay base is the unchanged Strfry 1.1.3 image digest documented in the policy;
 Caddy and Nutshell 0.21.0 digests remain pinned in Compose. The complete job
-finished in 4 minutes 59 seconds and removed its disposable resources.
+finished in 4 minutes 57 seconds and removed its disposable resources.
 
 ## G. Remaining limitations
 
@@ -135,13 +174,21 @@ gifts are not scanned/deleted. Capacity changes and policy-state restoration
 require operator review and matching backups. Windows/Node 24 results cannot
 replace Linux/Node 22 CI and actual pinned-image acceptance.
 
+The legacy exact-ID relay case and existing prepared-result recovery tests
+provide compositional recovery evidence; a single combined legacy prepared-result
+recovery transaction through the packaged relay was not separately executed.
+No unresolved security finding was confirmed by independent review. Passing
+these cases is evidence for the specified contract, not a guarantee of zero bugs.
+
 ## H. Publication readiness
 
-**NOT READY — VERIFICATION INCOMPLETE**
+**READY TO COMMIT**
 
-Required real-relay reproduction/acceptance, native expiration, full hosted
-settlement have passed at the linked revision. Final-head coverage additions
-and remaining PR checks must pass before readiness can change.
+Verification is complete for implementation revision `c3272ad`: all Linux PR
+checks passed, including real-relay security/retention/storage and complete
+hosted settlement. The implementation has already been committed/pushed under
+subsequent user authorization; PR #106 remains a draft as requested. No merge
+or production deployment is included in this readiness assessment.
 
 The completed [CI validation infrastructure and workflow security review](issue-62-ci-validation.md)
 describe the exact PR commands, resource isolation, cleanup and outstanding
