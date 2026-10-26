@@ -27,6 +27,18 @@ function gift(recipient: string, content = "ciphertext", createdAt = now()) {
     [["p", recipient], ["expiration", String(createdAt + PRIVATE_GIFT_WRAP_RETENTION_SECONDS)]], createdAt);
 }
 
+function disposablePolicyCommand(code: string): string {
+  const project = process.env.PACTAGENT_RELAY_TEST_COMPOSE_PROJECT ?? "";
+  if (process.env.PACTAGENT_HOSTED_ACCEPTANCE !== "true" || new URL(url).hostname !== "localhost" ||
+    !/^pactagent-(?:62-ci-\d+-\d+-)?hosted-[a-z0-9]+-[0-9a-f]{8}$/.test(project)) {
+    throw new Error("Policy fault injection requires the disposable loopback acceptance project");
+  }
+  return execFileSync("docker", ["compose", "-f", resolve("compose.hosted.yml"),
+    "-f", resolve("local/compose.hosted-acceptance.yml"), "-p", project,
+    "exec", "-T", "strfry", "python3", "-c", code],
+  { env: process.env, timeout: 10000, encoding: "utf8", stdio: "pipe" });
+}
+
 describe("packaged hosted Strfry write policy (signed events through public WSS)", () => {
   it("rejects a valid kind-1 event and unauthorized coordination", async () => {
     await connected(async relay => {
@@ -125,11 +137,6 @@ describe("packaged hosted Strfry write policy (signed events through public WSS)
   });
 
   it("fails closed on a killed plugin and preserves recipient quota after automatic restart", async () => {
-    const project = process.env.PACTAGENT_RELAY_TEST_COMPOSE_PROJECT ?? "";
-    if (process.env.PACTAGENT_HOSTED_ACCEPTANCE !== "true" || new URL(url).hostname !== "localhost" ||
-      !/^pactagent-(?:62-ci-\d+-\d+-)?hosted-[a-z0-9]+-[0-9a-f]{8}$/.test(project)) {
-      throw new Error("Plugin fault injection requires the disposable loopback acceptance project");
-    }
     const recipients = JSON.parse(process.env.PACTAGENT_RELAY_RATE_TEST_RECIPIENTS!) as string[];
     const recipient = recipients[10];
     await connected(async relay => {
@@ -137,9 +144,7 @@ describe("packaged hosted Strfry write policy (signed events through public WSS)
     });
     // Only the plugin process in THIS disposable container can match argv[1].
     // Kill between acknowledged writes, after its SQLite transaction committed.
-    execFileSync("docker", ["compose", "-f", resolve("compose.hosted.yml"),
-      "-f", resolve("local/compose.hosted-acceptance.yml"), "-p", project,
-      "exec", "-T", "strfry", "python3", "-c", `
+    disposablePolicyCommand(`
 import os,signal
 matches=[]
 for name in os.listdir('/proc'):
@@ -150,7 +155,7 @@ for name in os.listdir('/proc'):
     except (FileNotFoundError,PermissionError): pass
 assert len(matches)==1, 'Expected exactly one disposable policy process'
 os.kill(matches[0],signal.SIGKILL)
-`], { env: process.env, timeout: 10000, stdio: "pipe" });
+`);
     await connected(async relay => {
       await expect(relay.publish(event(0))).rejects.toMatchObject({ code: "publish_rejected" });
     });
@@ -159,6 +164,44 @@ os.kill(matches[0],signal.SIGKILL)
       await expect(relay.publish(event(1, generateSecretKey()))).rejects.toMatchObject({ code: "publish_rejected" });
       await expect(relay.publish(gift(recipient))).rejects.toMatchObject({ code: "publish_rejected" });
     });
+  });
+
+  it("rejects a small wrap when storage reserve is exhausted while preserving economic writes", async () => {
+    // Seed only the disposable relay's accounting at its boundary. Publication
+    // still goes through the actual signed WSS/Strfry/plugin path, not a mock.
+    const recipient = (JSON.parse(process.env.PACTAGENT_RELAY_RATE_TEST_RECIPIENTS!) as string[])[9];
+    const added = Number(disposablePolicyCommand(`
+import sqlite3
+db=sqlite3.connect('/app/strfry-db/pactagent-policy.sqlite')
+try:
+    db.execute('BEGIN IMMEDIATE')
+    used=db.execute('SELECT coalesce(sum(bytes),0) FROM gift_storage').fetchone()[0]
+    added=256*1024*1024-used
+    assert added>0
+    db.execute('INSERT INTO gift_storage VALUES (?,?) ON CONFLICT(release) DO UPDATE SET bytes=bytes+excluded.bytes',(9007199254740991,added))
+    db.commit()
+    print(added)
+finally: db.close()
+`).trim());
+    expect(Number.isSafeInteger(added) && added > 0).toBe(true);
+    try {
+      await connected(async relay => {
+        await expect(relay.publish(gift(recipient))).rejects.toMatchObject({ code: "publish_rejected",
+          message: expect.stringContaining("gift storage budget exhausted") });
+        await relay.publish(event(3921));
+      });
+    } finally {
+      disposablePolicyCommand(`
+import sqlite3
+db=sqlite3.connect('/app/strfry-db/pactagent-policy.sqlite')
+try:
+    db.execute('UPDATE gift_storage SET bytes=bytes-? WHERE release=?',(${added},9007199254740991))
+    db.execute('DELETE FROM gift_storage WHERE bytes=0')
+    db.commit()
+finally: db.close()
+`);
+    }
+    await connected(async relay => { await relay.publish(gift(recipient)); });
   });
 
   it("enforces the global gift quota across enrolled recipients and fresh outer signing keys", async () => {
@@ -170,5 +213,29 @@ os.kill(matches[0],signal.SIGKILL)
       }
       await expect(relay.publish(gift(recipients[10]))).rejects.toMatchObject({ code: "publish_rejected" });
     });
+  });
+
+  it("keeps actual relay accounting and database files within configured bounds after the flood tests", () => {
+    const accounting = JSON.parse(disposablePolicyCommand(`
+import json,os,sqlite3
+db=sqlite3.connect('/app/strfry-db/pactagent-policy.sqlite')
+try:
+    print(json.dumps({'rateRows':db.execute('SELECT count(*) FROM buckets').fetchone()[0],
+      'storageRows':db.execute('SELECT count(*) FROM gift_storage').fetchone()[0],
+      'pages':db.execute('PRAGMA page_count').fetchone()[0],
+      'integrity':db.execute('PRAGMA quick_check').fetchone()[0],
+      'giftBytes':db.execute('SELECT coalesce(sum(bytes),0) FROM gift_storage').fetchone()[0],
+      'coordinationBytes':db.execute('SELECT charged FROM metadata').fetchone()[0],
+      'relayBytes':os.path.getsize('/app/strfry-db/data.mdb')}))
+finally: db.close()
+`)) as { rateRows: number; storageRows: number; pages: number; integrity: string;
+      giftBytes: number; coordinationBytes: number; relayBytes: number };
+    expect(accounting.integrity).toBe("ok");
+    expect(accounting.rateRows).toBeLessThanOrEqual(514);
+    expect(accounting.storageRows).toBeLessThanOrEqual(723);
+    expect(accounting.pages).toBeLessThanOrEqual(512);
+    expect(accounting.giftBytes).toBeLessThanOrEqual(256 * 1024 * 1024);
+    expect(accounting.coordinationBytes).toBeLessThanOrEqual(256 * 1024 * 1024);
+    expect(accounting.relayBytes).toBeLessThanOrEqual(1024 * 1024 * 1024);
   });
 });

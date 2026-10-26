@@ -7,10 +7,10 @@ for every `pull_request` targeting `main`, including the Issue #62 branch.
 There is no head-branch or path filter. Existing quality, production-build,
 process and browser checks and branch-protection settings are unchanged.
 
-The code must first be committed/pushed and included in a PR by an authorized
-operator. This task does neither. Fork/first-time-contributor approval may still
-be required by repository Actions policy. No deployment or local Docker startup
-is needed to execute the PR job.
+The code was committed/pushed and published as
+[draft PR #106](https://github.com/comwanga/pactagent/pull/106) after explicit
+user authorization. Fork/first-time-contributor approval may still be required
+by repository Actions policy. No deployment or local Docker startup is needed.
 
 ## Exact commands
 
@@ -50,7 +50,12 @@ acceptance are reused. No relay responses are mocked by the security lane.
   rejection; recipient and aggregate rate boundaries with fresh outer authors.
 - Native removal of an initially present expiring gift; agreement evidence
   remains; exact enrolled pre-upgrade wrap recovery; retained event survives
-  relay restart and controlled shutdown.
+  relay restart and controlled shutdown. An actual plugin SIGKILL requires the
+  next write to reject; automatic restart preserves kind filtering and quota.
+- A small signed gift rejects at the storage-reservation boundary while an
+  authorized economic event remains writable. Only the disposable policy's
+  accounting is seeded/restored; responses are actual Strfry WSS responses.
+  Accounting row/page/reservation and LMDB file bounds are checked after floods.
 - Full requester HTTP -> independent provider process -> discovery, agreement,
   funding, private task, execution, private result, verification and settlement
   against a newly created **Nutshell FakeWallet test mint**.
@@ -112,9 +117,17 @@ Existing expensive unit/integration/process/browser/build lanes were not
 unnecessarily repeated for this infrastructure-only change. No relay policy,
 economic implementation or Docker image configuration changed in this task.
 
-No Docker-backed result has been observed yet. Success requires the PR's actual
-Linux/Node 22 job to pass; YAML validation and local unit tests cannot establish
-native relay enforcement or hosted settlement success.
+Docker-backed validation passed on Linux/Node 22 at `8bed7c5` in
+[job 121632139829](https://github.com/comwanga/pactagent/actions/runs/40340080651/job/121632139829):
+34 policy cases, four baseline publications, 5 provider cases, 3 size-boundary
+cases, 9 real policy cases, 3 hosted settlement cases, restart probes and cleanup.
+Final-head storage-boundary additions and remaining PR checks still require a
+fresh successful run. Local Docker was not started.
+
+The first baseline run reproduced a startup failure: pinned Strfry requests
+1,000,000 descriptors but the runner's Docker hard limit was 65,536. Both
+disposable relay fixtures now supply soft/hard `nofile=1000000`; no filter,
+security assertion or production resource was weakened to pass the test.
 
 The runner remains an untrusted-code execution environment with Internet access
 for public images/packages; this is not a sandbox against a malicious PR that

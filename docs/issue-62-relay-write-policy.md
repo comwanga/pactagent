@@ -199,6 +199,14 @@ procedure. Never infer a settlement/refund decision from absence of a wrap.
    `PACTAGENT_HOSTED_WSS_PORT` select binding. Acceptance uses loopback and an
    ephemeral port. Railway Caddy exposure is unchanged. Public reads need no AUTH.
 
+The pinned Strfry binary requests a soft/hard file-descriptor limit of at least
+1,000,000. Ensure the deployment platform supplies that limit. On Docker hosts
+with a lower default, configure the Strfry service's `ulimits.nofile.soft` and
+`hard` to `1000000` (as the disposable acceptance override does), or configure an
+equivalent daemon default. An insufficient hard limit causes startup to fail;
+it never disables the write policy. This pinned-runtime prerequisite was
+reproduced on the GitHub Ubuntu runner and the acceptance rerun passed.
+
 On startup/configuration failure, fix the author lists or restore the matching
 policy snapshot; do not remove the plugin. On clock rollback, repair the clock
 and wait for the last admitted time. A missing/corrupt state DB refuses writes;
