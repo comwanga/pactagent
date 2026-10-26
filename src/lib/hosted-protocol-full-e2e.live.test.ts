@@ -27,6 +27,10 @@ function isRuntimeAvailable(): Promise<boolean> {
 const relayAvailable = await isRelayAvailable();
 const runtimeAvailable = await isRuntimeAvailable();
 const configuredProvider = Boolean(process.env.PACTAGENT_LIVE_PROVIDER_PUBLIC_KEY);
+if (process.env.PACTAGENT_HOSTED_ACCEPTANCE === "true" &&
+  (!relayAvailable || !runtimeAvailable || !configuredProvider)) {
+  throw new Error("Required hosted acceptance services are unavailable");
+}
 const liveIt = relayAvailable && runtimeAvailable && configuredProvider ? it : it.skip;
 
 /*

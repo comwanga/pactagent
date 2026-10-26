@@ -161,6 +161,20 @@ Server secrets:
 ### pactagent-strfry
 
 - `PORT`
+- `PACTAGENT_RELAY_PROVIDER_AUTHORS` (mandatory comma-separated provider public keys)
+- `PACTAGENT_RELAY_REQUESTER_AUTHORS` (mandatory requester public keys, including independent clients)
+- `PACTAGENT_RELAY_AUTHORITY_AUTHORS` (mandatory escrow authority public keys)
+- `PACTAGENT_RELAY_LEGACY_GIFT_IDS` (optional, at most 32 exact pre-upgrade prepared wrap IDs)
+
+These lists authorize **writes**, not reads: the public Caddy WSS endpoint
+remains readable by anyone. The custom pinned Strfry image verifies its included
+Python 3/SQLite runtime and installs the JSON-lines write-policy plugin; startup fails closed on
+invalid configuration or unusable persistent accounting. NIP-42 is explicitly
+disabled; an arbitrary authenticated key would not establish approval.
+Before enabling the policy on an existing deployment, follow the
+[Issue #62 migration and recovery procedure](issue-62-relay-write-policy.md).
+In particular, enroll all existing requester/authority keys and recover or
+explicitly enroll any prepared pre-upgrade gift wraps before rollout.
 
 ### pactagent-relay
 

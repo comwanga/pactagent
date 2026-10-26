@@ -76,12 +76,14 @@ export const PRIVATE_TASK_GIFT_WRAP_MAX_PAGES = 20;
  * - relay.maxWebsocketPayloadSize applies to the complete WebSocket message.
  *
  * A maximum accepted source is represented as bounded base64 inside the
- * encrypted task message. The measured maximum task wrap is 3,495,765 bytes;
- * the 4 MiB event ceiling leaves 698,539 bytes for bounded protocol evolution.
+ * encrypted task message. The measured maximum task wrap is 3,495,793 bytes
+ * including expiration; the 4 MiB ceiling leaves 698,511 bytes of headroom.
  * The relay reserves another 256 bytes for the `["EVENT", event]` envelope.
  * PactAgent measures both representations before funding.
  */
 export const MAX_NOSTR_NORMALIZED_EVENT_BYTES = 4 * 1024 * 1024;
+// Native NIP-40 cleanup on the hosted relay; public economic records never expire.
+export const PRIVATE_GIFT_WRAP_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 export const MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES = MAX_NOSTR_NORMALIZED_EVENT_BYTES + 256;
 
 export interface NostrEventTransportSize {
@@ -268,7 +270,7 @@ async function buildGiftWrap(
     pubkey: oneTimePk,
     created_at: createdAt,
     kind: NIP59_GIFT_WRAP_KIND,
-    tags: [["p", provenance.recipient]],
+    tags: [["p", provenance.recipient], ["expiration", String(createdAt + PRIVATE_GIFT_WRAP_RETENTION_SECONDS)]],
     content: wrapContent,
   };
 

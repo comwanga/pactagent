@@ -1,0 +1,4 @@
+# These files execute directly in the pinned Linux relay image, including
+# when the Docker build context comes from a Windows checkout.
+deploy/strfry-entrypoint.sh text eol=lf
+deploy/strfry-write-policy.py text eol=lf
