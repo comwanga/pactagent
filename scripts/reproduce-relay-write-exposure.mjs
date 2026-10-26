@@ -25,6 +25,7 @@ writeFileSync(file, JSON.stringify({ services: { strfry: {
   image: "dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d",
   command: ["/app/strfry.sh"], ports: [`127.0.0.1:${port}:7777`],
   mem_limit: "256m",
+  ulimits: { nofile: { soft: 1000000, hard: 1000000 } },
   volumes: ["baseline:/app/strfry-db", `${resolve(root, "local/strfry.conf").replaceAll("\\", "/")}:/etc/strfry.conf:ro`],
   healthcheck: { test: ["CMD", "curl", "-fSs", "http://localhost:7777/"], interval: "2s", timeout: "2s", retries: 20 },
 } }, volumes: { baseline: {} } }));

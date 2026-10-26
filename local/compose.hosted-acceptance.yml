@@ -1,5 +1,12 @@
 # Only for the uniquely named disposable hosted acceptance project.
 services:
+  strfry:
+    # The pinned relay requests 1,000,000 descriptors. Hosted runners otherwise
+    # give containers a 65,536 hard limit, causing Strfry to fail before listen.
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
   demo-mint:
     image: cashubtc/nutshell:0.21.0@sha256:beed25e291357368e35e1698bf2e4645d97ed435232a8f8ff6501c77d67c0b90
     command: ["poetry", "run", "mint"]

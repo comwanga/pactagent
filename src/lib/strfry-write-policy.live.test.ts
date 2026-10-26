@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 import type { SignedNostrEvent } from "../domain/nostr";
@@ -119,6 +121,43 @@ describe("packaged hosted Strfry write policy (signed events through public WSS)
     await connected(async relay => { await relay.publish(legacy); });
     await connected(async reader => {
       expect((await reader.queryEvents({ ids: [legacy.id] }))[0]).toEqual(legacy);
+    });
+  });
+
+  it("fails closed on a killed plugin and preserves recipient quota after automatic restart", async () => {
+    const project = process.env.PACTAGENT_RELAY_TEST_COMPOSE_PROJECT ?? "";
+    if (process.env.PACTAGENT_HOSTED_ACCEPTANCE !== "true" || new URL(url).hostname !== "localhost" ||
+      !/^pactagent-(?:62-ci-\d+-\d+-)?hosted-[a-z0-9]+-[0-9a-f]{8}$/.test(project)) {
+      throw new Error("Plugin fault injection requires the disposable loopback acceptance project");
+    }
+    const recipients = JSON.parse(process.env.PACTAGENT_RELAY_RATE_TEST_RECIPIENTS!) as string[];
+    const recipient = recipients[10];
+    await connected(async relay => {
+      for (let i = 0; i < 12; i++) await relay.publish(gift(recipient));
+    });
+    // Only the plugin process in THIS disposable container can match argv[1].
+    // Kill between acknowledged writes, after its SQLite transaction committed.
+    execFileSync("docker", ["compose", "-f", resolve("compose.hosted.yml"),
+      "-f", resolve("local/compose.hosted-acceptance.yml"), "-p", project,
+      "exec", "-T", "strfry", "python3", "-c", `
+import os,signal
+matches=[]
+for name in os.listdir('/proc'):
+    if not name.isdigit(): continue
+    try:
+        with open('/proc/'+name+'/cmdline','rb') as handle: args=handle.read().split(b'\\0')
+        if len(args)>1 and args[1]==b'/app/strfry-write-policy.py': matches.append(int(name))
+    except (FileNotFoundError,PermissionError): pass
+assert len(matches)==1, 'Expected exactly one disposable policy process'
+os.kill(matches[0],signal.SIGKILL)
+`], { env: process.env, timeout: 10000, stdio: "pipe" });
+    await connected(async relay => {
+      await expect(relay.publish(event(0))).rejects.toMatchObject({ code: "publish_rejected" });
+    });
+    await connected(async relay => {
+      await relay.publish(event(0)); // Strfry restarts the policy, without opening writes.
+      await expect(relay.publish(event(1, generateSecretKey()))).rejects.toMatchObject({ code: "publish_rejected" });
+      await expect(relay.publish(gift(recipient))).rejects.toMatchObject({ code: "publish_rejected" });
     });
   });
 

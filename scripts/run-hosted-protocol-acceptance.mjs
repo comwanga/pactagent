@@ -474,6 +474,7 @@ async function main() {
   const acceptanceEnvironment = {
     ...sharedEnvironment,
     PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY: providerPrivateKey,
+    PACTAGENT_RELAY_TEST_COMPOSE_PROJECT: composeEnv.COMPOSE_PROJECT_NAME,
   };
 
   let providerChild, nextChild;
