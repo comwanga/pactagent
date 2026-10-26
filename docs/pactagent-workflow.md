@@ -32,9 +32,11 @@ framework. Every capability is consumed from its existing boundary.
 ```text
 human intent + private document
   ↓
-#9 validated discovery → deterministic provider selection
+#9 validated discovery → deterministic provider selection (allowlisted providers only, #60)
   ↓
 #15 bounded requester recommendation → deterministic requester policy
+  ↓
+#60 selected provider must be the configured provider, checked before signing
   ↓
 #10 requester-signed proposal (proposed)
   ↓

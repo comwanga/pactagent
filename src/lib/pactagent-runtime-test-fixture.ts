@@ -285,6 +285,7 @@ export function buildFixture(): RuntimeFixture {
       maxBudgetSats: sats(500n), allowedCapabilities: ["document-summary"],
       maximumEscrowDurationSeconds: 15 * 60, maximumProviderPriceSats: sats(450n),
       allowedSettlementNetworks: ["cashu"], autoRelease: "deterministic_checks_only",
+      allowedProviders: [createLocalNostrSigner(hex(providerKey)).publicKey],
     },
     decisionBounds: { maximumInstructionCharacters: 1000, maximumRationaleCharacters: 500, modelTimeoutMilliseconds: 5000 },
     decisionModel: new ApprovingDecisionModel(recommendation),

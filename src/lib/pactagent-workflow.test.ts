@@ -60,7 +60,7 @@ import {
   type PactAgentWorkflowResumeState,
 } from "./pactagent-workflow";
 import { publishSignedPactAgreementTransition } from "./pact-service-agreement-publication";
-import type { RequesterDecisionModel } from "./requester-decision";
+import type { RequesterDecisionModel, SafeRequesterDecisionInput } from "./requester-decision";
 import type { RequesterPolicy } from "../domain/pact-agents";
 
 const ROOT_TIME = 1_900_000_000;
@@ -430,6 +430,7 @@ function buildWorkflow(options: { timeout?: number; relay?: MemoryRelay; store?:
     maxBudgetSats: sats(500n), allowedCapabilities: ["document-summary"],
     maximumEscrowDurationSeconds: 15 * 60, maximumProviderPriceSats: sats(450n),
     allowedSettlementNetworks: ["cashu"], autoRelease: "deterministic_checks_only",
+    allowedProviders: [nostrPublicKey(providerPubkey)],
   };
   const decisionBounds = { maximumInstructionCharacters: 1000, maximumRationaleCharacters: 500, modelTimeoutMilliseconds: 5000 };
 
@@ -1490,4 +1491,153 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(new Set(cashuA.spendOperationIds).size).toBe(1);
     }, 30_000);
   });
+});
+
+/*
+ * Issue #60: the workflow executes against its configured provider signer, so
+ * a proposal naming any other provider can never complete. These fixtures add
+ * a second, validly signed provider that is cheaper and faster than the
+ * configured one.
+ */
+const FOREIGN_PROVIDER_SEED = 34;
+
+function publishForeignProvider(relay: MemoryRelay, seed = FOREIGN_PROVIDER_SEED): NostrPublicKey {
+  const foreignKey = key(seed);
+  const foreign = ident(foreignKey);
+  const descriptor = createCashuEscrowDescriptor({
+    identity: foreign, identifier: "wf-foreign-cashu", updatedAt: ROOT_TIME - 10,
+    referenceFormat: "opaque_service_reference", timeoutSeconds: 900,
+  });
+  const offer = createPactServiceOffer({
+    identity: foreign, identifier: "wf-foreign-offer",
+    capabilityProfile: { id: PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID, version: 1 },
+    amountSats: sats(300n), settlementNetwork: "cashu",
+    escrowDescriptorReference: descriptor.address, maximumExecutionSeconds: 60,
+    validFrom: ROOT_TIME - 10, expiresAt: ROOT_TIME + 3600, updatedAt: ROOT_TIME - 10,
+  });
+  const definition = createPontmoreAgentDefinition({
+    identity: foreign, identifier: "wf-foreign-provider", name: "Foreign Provider", about: "Provides summaries.",
+    capabilities: { names: ["document-summary"], settlement_networks: ["cashu"] },
+    pricingPolicyReference: offer.address, escrowDescriptorReference: descriptor.address, updatedAt: ROOT_TIME - 9,
+  });
+  relay.events.push(signEvent(descriptor.event, foreignKey));
+  relay.events.push(signEvent(offer.event, foreignKey));
+  relay.events.push(signEvent(definition.event, foreignKey));
+  return foreign.publicKey as NostrPublicKey;
+}
+
+/** Approves whatever discovery selected (the first, authoritative candidate). */
+class EchoSelectedDecisionModel implements RequesterDecisionModel {
+  async recommend(input: SafeRequesterDecisionInput): Promise<unknown> {
+    const selected = input.candidates[0];
+    return {
+      action: "recommend",
+      providerPublicKey: selected.providerPublicKey,
+      providerDefinitionReference: selected.providerDefinitionReference,
+      offerReference: selected.offerReference,
+      escrowDescriptorReference: selected.escrowDescriptorReference,
+      proposedAmountSats: selected.amountSats,
+    };
+  }
+}
+
+function runInput(s: ReturnType<typeof buildWorkflow>) {
+  return {
+    requesterDefinition: s.requesterDefinition,
+    privateDocument: "PRIVATE-DOCUMENT A short document about Bitcoin scripting and layer-two scaling for the summary test.",
+    mediaType: "text/plain" as const,
+    privatePrompt: "PRIVATE-PROMPT Summarize concisely.",
+    maximumBudgetSats: sats(500n),
+    funding: privateFunding(),
+  };
+}
+
+describe("Issue #60 workflow provider identity", () => {
+  it("does not propose to a cheaper, faster provider that is not the configured provider", async () => {
+    const s = buildWorkflow();
+    publishForeignProvider(s.relay);
+    const workflow = createPactAgentWorkflow({
+      identities: s.identities,
+      dependencies: { ...s.dependencies, decisionModel: new EchoSelectedDecisionModel() },
+    });
+    const report = await workflow.runSuccessfulTransaction(runInput(s));
+    expect(report.finalOutcome).toBe("settled");
+    const root = findAgreementRoot(s.relay, findRootEvent(s.relay)!.id);
+    expect(root.content.provider).toBe(s.identities.providerSigner.publicKey);
+  }, 30_000);
+  /** Wraps the requester signer to count every signature it produces. */
+  function countingRequesterSigner(s: ReturnType<typeof buildWorkflow>) {
+    const inner = s.identities.requesterSigner;
+    const signed: SignedNostrEvent[] = [];
+    return {
+      signed,
+      signer: {
+        publicKey: inner.publicKey,
+        async sign(event: UnsignedNostrEvent) {
+          const result = await inner.sign(event);
+          signed.push(result);
+          return result;
+        },
+      },
+    };
+  }
+
+  async function expectRejectedBeforeAnySideEffect(
+    s: ReturnType<typeof buildWorkflow>,
+    allowedProviders: readonly NostrPublicKey[],
+    message: string,
+  ) {
+    const store = createTrackingStore();
+    const requester = countingRequesterSigner(s);
+    const eventsBefore = s.relay.events.map((event) => event.id);
+    const workflow = createPactAgentWorkflow({
+      identities: { ...s.identities, requesterSigner: requester.signer },
+      dependencies: {
+        ...s.dependencies,
+        settlementStore: store,
+        decisionModel: new EchoSelectedDecisionModel(),
+        requesterPolicy: { ...s.requesterPolicy, allowedProviders },
+      },
+    });
+    const error = await workflow.runSuccessfulTransaction(runInput(s)).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PactAgentWorkflowError);
+    expect(error).toMatchObject({ code: "discovery_failed", message });
+    // Redacted: the error names no provider key.
+    const serialized = JSON.stringify(error);
+    for (const providerKey of allowedProviders) expect(serialized).not.toContain(providerKey);
+    expect(serialized).not.toContain(s.identities.providerSigner.publicKey);
+    // Nothing was signed, published or funded, and the signed references on
+    // the relay are exactly the ones that were there before.
+    expect(requester.signed).toHaveLength(0);
+    expect(findRootEvent(s.relay)).toBeUndefined();
+    expect(s.relay.events.map((event) => event.id)).toEqual(eventsBefore);
+    expect(s.cashu.prepareCalls).toBe(0);
+    expect(s.cashu.spendCalls).toBe(0);
+    expect(store.insertedKeys).toHaveLength(0);
+  }
+
+  it("refuses a provider the policy allows but that is not the configured execution identity", async () => {
+    const s = buildWorkflow();
+    const foreign = publishForeignProvider(s.relay);
+    const configured = nostrPublicKey(s.identities.providerSigner.publicKey);
+    // Both are allowed and the foreign offer is cheaper, so discovery selects it.
+    await expectRejectedBeforeAnySideEffect(
+      s,
+      [configured, foreign],
+      "Selected provider is not the configured provider",
+    );
+  }, 30_000);
+
+  it("fails closed when the configured provider is not on the allowlist", async () => {
+    const s = buildWorkflow();
+    const foreign = publishForeignProvider(s.relay);
+    await expectRejectedBeforeAnySideEffect(s, [foreign], "Selected provider is not the configured provider");
+  }, 30_000);
+
+  it("finds no provider, and does not fall back, when the allowlist names nobody on the relay", async () => {
+    const s = buildWorkflow();
+    publishForeignProvider(s.relay);
+    const absent = nostrPublicKey(getPublicKey(key(77)));
+    await expectRejectedBeforeAnySideEffect(s, [absent], "No compatible provider was discovered");
+  }, 30_000);
 });

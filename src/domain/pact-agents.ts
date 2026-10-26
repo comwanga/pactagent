@@ -1,5 +1,5 @@
 import { InvalidDomainInputError } from "./errors";
-import type { NostrIdentity } from "./nostr";
+import { nostrPublicKey, type NostrIdentity, type NostrPublicKey } from "./nostr";
 import type { Sats } from "./money";
 import { sats } from "./money";
 import type { PontmoreAgentDefinition } from "./pontmore-agent";
@@ -18,6 +18,13 @@ export interface RequesterPolicy {
   readonly maximumProviderPriceSats: Sats;
   readonly allowedSettlementNetworks: readonly ["cashu"];
   readonly autoRelease: "deterministic_checks_only";
+  /**
+   * Issue #60: the only providers this requester may select. It comes from
+   * trusted configuration, never from discovery, and must not be empty: an
+   * empty list never means "any provider". Until multi-provider execution
+   * (#84), the runtime sets it to its one configured provider identity.
+   */
+  readonly allowedProviders: readonly NostrPublicKey[];
 }
 
 export interface ProviderPolicy {
@@ -66,7 +73,36 @@ export interface RequesterOfferPolicyInput {
   readonly estimatedExecutionSeconds: number;
 }
 
+/**
+ * Issue #60: validates a requester provider allowlist and returns it as a
+ * set. Fails closed on a missing, empty, or malformed list. Duplicate keys
+ * collapse, so they never change which providers are allowed.
+ */
+export function allowedProviderSet(allowedProviders: unknown): ReadonlySet<NostrPublicKey> {
+  if (!Array.isArray(allowedProviders) || allowedProviders.length === 0) {
+    throw new InvalidDomainInputError("P001 allowed providers must be a non-empty list");
+  }
+  const allowed = new Set<NostrPublicKey>();
+  for (const value of allowedProviders) {
+    if (typeof value !== "string") {
+      throw new InvalidDomainInputError("P001 allowed providers must be Nostr public keys");
+    }
+    try {
+      allowed.add(nostrPublicKey(value));
+    } catch {
+      throw new InvalidDomainInputError("P001 allowed providers must be Nostr public keys");
+    }
+  }
+  return allowed;
+}
+
+/** Issue #60: true only when the policy's validated allowlist names this provider. */
+export function isAllowedProvider(policy: RequesterPolicy, providerPublicKey: string): boolean {
+  return allowedProviderSet(policy.allowedProviders).has(providerPublicKey as NostrPublicKey);
+}
+
 export function validateRequesterPolicy(policy: RequesterPolicy): void {
+  allowedProviderSet(policy.allowedProviders);
   sats(policy.maxBudgetSats);
   sats(policy.maximumProviderPriceSats);
   if (policy.maximumProviderPriceSats > policy.maxBudgetSats) {

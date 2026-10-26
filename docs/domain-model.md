@@ -62,8 +62,9 @@ advancement.
 `discoverProviders` runs the relay-backed pipeline:
 
 ```text
-query kind 30360 profiles
+query kind 30360 profiles from allowed authors
   -> verify NIP-01 events
+  -> drop providers outside the requester allowlist
   -> select current PIP-00 definitions by address
   -> validate PactAgent capability profile
   -> resolve and verify current PactAgent offer
@@ -78,11 +79,39 @@ Discovery keeps three decisions distinct: (1) is this a valid signed Pontmore ag
 
 Successful discovery returns stable `SelectedProviderReferences` (provider definition, escrow descriptor, and offer addresses) suitable for the PactAgent service-agreement event integration (#10). Discovery does not create a service agreement, imply bilateral consent, advance lifecycle state, authorize settlement, or let AI output perform an economic action. PactAgent `document-summary@1` agreement/profile fields are not misrepresented as PIP-00/PIP-01 protocol fields.
 
+### Provider allowlist (#60)
+
+The requester workflow executes against one configured provider identity, so a
+proposal naming any other provider can never complete. `RequesterPolicy`
+therefore carries `allowedProviders`, and discovery only ranks providers on it.
+This is an interim restriction, not multi-provider support (#84).
+
+- The allowlist comes from trusted configuration, never from the relay.
+  `createRuntimeRequesterPolicy` builds the one runtime policy, used for hosted
+  bootstrap discovery, every transaction's discovery, and the live workflow. It
+  allows exactly the configured provider: `PACTAGENT_LIVE_PROVIDER_PUBLIC_KEY`
+  in hosted mode, or the configured provider signer's key in local mode.
+- A missing, empty, or malformed allowlist fails closed. It never means "any
+  provider". Duplicate entries do not change which providers are allowed.
+- Discovery asks the relay for allowed authors only, and re-checks each
+  authentic profile locally. A provider that is not allowed is rejected with
+  `provider_not_allowed` before it uses any profile or resolution budget,
+  however low its price or execution time. With no allowed candidate,
+  discovery selects nothing; there is no fallback.
+- Price and execution-time ranking is unchanged among allowed providers.
+- The workflow checks the selection again before the agreement root is built,
+  signed, or published: the selected provider, the authors of its signed
+  definition, offer and escrow descriptor, the allowlist, and the configured
+  provider signer must all name the same key. A mismatch fails with
+  `discovery_failed` ("Selected provider is not the configured provider") before
+  any root is signed or published and before any escrow is funded.
+
 ## Bounded requester decision (#15)
 
 `runRequesterDecision` consumes an already validated Issue #9 `DiscoveryResult`; it
 does not query relays, reimplement discovery, or change the selected-provider
-ordering. A narrow injected `RequesterDecisionModel` receives the private bounded
+ordering. It rejects a supplied result whose selection is not on the requester
+allowlist with `provider_not_allowed`, before the model is consulted (#60). A narrow injected `RequesterDecisionModel` receives the private bounded
 human instruction plus a frozen safe projection containing only public identity,
 stable definition/offer/escrow references, amount, Cashu network, and execution
 duration. Raw Nostr events and private document, result, key, Cashu, commitment,

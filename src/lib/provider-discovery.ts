@@ -4,7 +4,7 @@ import {
   type SignedNostrEvent,
 } from "../domain/nostr";
 import { parseSignedNostrEvent, verifySignedNostrEvent } from "../domain/nostr";
-import type { ServiceCapability, RequesterPolicy } from "../domain/pact-agents";
+import { allowedProviderSet, type ServiceCapability, type RequesterPolicy } from "../domain/pact-agents";
 import type { Sats } from "../domain/money";
 import {
   parsePontmoreAgentDefinitionEvent,
@@ -48,6 +48,11 @@ import {
  *   2. Does it describe a provider compatible with the requested capability?
  *   3. Does the requester's deterministic economic policy authorize the
  *      provider's current signed offer?
+ *
+ * Issue #60: only providers on the requester policy's allowlist are
+ * considered. The relay is asked for those authors only, and every authentic
+ * profile is re-checked locally before it can use any resolution budget, so a
+ * cheaper or faster provider outside the allowlist is never ranked.
  */
 
 export const PIP00_PROFILE_DISCOVERY_TIMEOUT_MS = 10_000;
@@ -93,6 +98,7 @@ export type DiscoveryRejectionCategory =
   | "below_provider_minimum"
   | "provider_execution_limit_exceeded"
   | "duration_rejected"
+  | "provider_not_allowed"
   | "discovery_truncated";
 
 export interface DiscoveryRejection {
@@ -160,9 +166,14 @@ function rejection(
   return { providerPublicKey, category, reason };
 }
 
-function profileDiscoveryFilter(maxProfiles: number, until?: number): NostrFilter {
+function profileDiscoveryFilter(
+  maxProfiles: number,
+  allowedProviders: readonly string[],
+  until?: number,
+): NostrFilter {
   return {
     kinds: [30360],
+    authors: allowedProviders,
     tags: { t: ["agent"] },
     limit: maxProfiles,
     ...(until === undefined ? {} : { until }),
@@ -500,6 +511,13 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
   if (!Number.isInteger(maxResolutions) || maxResolutions < 0) {
     throw new DiscoveryError("invalid_input", "Discovery bounds maxResolutions must be a non-negative integer");
   }
+  let allowedProviders: ReadonlySet<string>;
+  try {
+    allowedProviders = allowedProviderSet(input.requesterPolicy.allowedProviders);
+  } catch {
+    throw new DiscoveryError("invalid_input", "Discovery requires a valid provider allowlist");
+  }
+  const allowedAuthors = [...allowedProviders];
   if (!input.requesterPolicy.allowedCapabilities.includes(input.capability)) {
     return { candidates: [], selected: undefined, rejections: [] };
   }
@@ -520,7 +538,7 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
     try {
       page = await withinDiscoveryDeadline(
         input.relay.queryEvents(
-          profileDiscoveryFilter(DEFAULT_DISCOVERY_PROFILE_PAGE_SIZE, until),
+          profileDiscoveryFilter(DEFAULT_DISCOVERY_PROFILE_PAGE_SIZE, allowedAuthors, until),
           operationOptions(remaining, input.options),
         ),
         deadline,
@@ -586,6 +604,18 @@ export async function discoverProviders(input: DiscoverProvidersInput): Promise<
       break;
     }
     if (!currentAuthentic) continue;
+
+    // Issue #60: the relay's author filter is not trusted. A provider outside
+    // the allowlist is rejected before it can use any profile or resolution
+    // budget, however attractive its offer.
+    if (!allowedProviders.has(currentAuthentic.pubkey)) {
+      rejections.push(rejection(
+        currentAuthentic.pubkey,
+        "provider_not_allowed",
+        "Provider is not on the requester's provider allowlist",
+      ));
+      continue;
+    }
 
     /*
      * Replacement ordering is authoritative only among authentic NIP-01

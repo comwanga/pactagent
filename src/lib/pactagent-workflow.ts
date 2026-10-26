@@ -29,7 +29,7 @@ import {
   type PactTermsCommitment,
 } from "../domain/pact-service-agreement";
 import { summarizeDocument } from "../domain/document-summary-service";
-import type { RequesterPolicy } from "../domain/pact-agents";
+import { isAllowedProvider, type RequesterPolicy } from "../domain/pact-agents";
 import type { NostrRelayAdapter } from "./nostr-relay";
 import type { NostrSigner } from "../domain/nostr";
 import {
@@ -486,8 +486,41 @@ export class PactAgentWorkflow {
     if (!discovery.selected) {
       workflowError("discovery_failed", "No compatible provider was discovered");
     }
+    this.#assertSelectedProviderIsConfigured(discovery);
     this.#state.discovery = discovery;
     return discovery;
+  }
+
+  /**
+   * Issue #60: this workflow executes against one configured provider
+   * identity, so it only proposes to that provider. The selection, every
+   * signed artifact behind it, the requester allowlist and the configured
+   * provider signer must all name the same key. Checked after discovery and
+   * again immediately before the agreement root is built, signed or published,
+   * so a discovery result that skipped the allowlist cannot reach the relay.
+   */
+  #assertSelectedProviderIsConfigured(discovery: DiscoveryResult): void {
+    const selection = discovery.selected;
+    const configured = this.#identities.providerSigner.publicKey;
+    let allowed = false;
+    try {
+      allowed = selection !== undefined &&
+        isAllowedProvider(this.#dependencies.requesterPolicy, selection.selected.providerPublicKey);
+    } catch {
+      allowed = false;
+    }
+    if (
+      !allowed ||
+      selection === undefined ||
+      selection.selected.providerPublicKey !== configured ||
+      selection.candidate.providerPublicKey !== configured ||
+      selection.candidate.definition.event.pubkey !== configured ||
+      selection.candidate.offer.event.pubkey !== configured ||
+      selection.candidate.offer.content.provider !== configured ||
+      selection.candidate.escrowDescriptor.event.pubkey !== configured
+    ) {
+      workflowError("discovery_failed", "Selected provider is not the configured provider");
+    }
   }
 
   async #runRequesterDecision(
@@ -526,6 +559,7 @@ export class PactAgentWorkflow {
     createdAt: number,
     expiresAt: number,
   ): Promise<PactAgreementContext> {
+    this.#assertSelectedProviderIsConfigured(discovery);
     const termsCommitment = createPactTermsCommitment(
       DOCUMENT_SUMMARY_PROFILE_ID,
       privateTerms,
