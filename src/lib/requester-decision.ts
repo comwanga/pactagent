@@ -2,6 +2,7 @@ import { DOCUMENT_SUMMARY_PROFILE_ID } from "../domain/pact-service-agreement";
 import { findForbiddenPublicMaterial } from "../domain/forbidden-material";
 import {
   evaluateRequesterOfferPolicy,
+  isAllowedProvider,
   validateRequesterPolicy,
   type RequesterPolicy,
 } from "../domain/pact-agents";
@@ -97,6 +98,7 @@ export type RequesterDecisionReasonCode =
   | "model_declined"
   | "unknown_provider"
   | "selected_provider_mismatch"
+  | "provider_not_allowed"
   | "provider_definition_reference_mismatch"
   | "offer_reference_mismatch"
   | "escrow_reference_mismatch"
@@ -248,6 +250,7 @@ function createAuthoritativeSnapshot(
         ...input.requesterPolicy.allowedSettlementNetworks,
       ]) as unknown as readonly ["cashu"],
       autoRelease: input.requesterPolicy.autoRelease,
+      allowedProviders: Object.freeze([...input.requesterPolicy.allowedProviders]),
     });
     validateRequesterPolicy(requesterPolicy);
 
@@ -255,6 +258,11 @@ function createAuthoritativeSnapshot(
     if (!selected) return rejected("no_selected_provider");
     const selectedIndex = input.discovery.candidates.findIndex((candidate) => candidate === selected.candidate);
     if (selectedIndex < 0) return rejected("invalid_discovery_result");
+    // Issue #60: never approve a provider outside the requester's allowlist,
+    // even when handed a discovery result that did not filter it.
+    if (!isAllowedProvider(requesterPolicy, selected.selected.providerPublicKey)) {
+      return rejected("provider_not_allowed");
+    }
 
     const candidates = Object.freeze(input.discovery.candidates.map(projectCandidate));
     const selectedProjection = candidates[selectedIndex];

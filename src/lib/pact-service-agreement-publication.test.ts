@@ -254,6 +254,7 @@ async function createDiscoverySelectionFixture(): Promise<{
       maximumProviderPriceSats: sats(450n),
       allowedSettlementNetworks: ["cashu"],
       autoRelease: "deterministic_checks_only",
+      allowedProviders: [nostrPublicKey(provider.publicKey)],
     },
     capability: "document-summary",
     relay,

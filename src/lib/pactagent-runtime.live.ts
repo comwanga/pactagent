@@ -1,6 +1,5 @@
 import { createNostrIdentity, type NostrPublicKey } from "../domain/nostr";
 import { sats } from "../domain/money";
-import type { RequesterPolicy } from "../domain/pact-agents";
 import type { PactAgreementReferences } from "../domain/pact-service-agreement";
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
 import { createCashuEscrowDescriptor } from "../domain/pontmore-escrow";
@@ -23,7 +22,9 @@ import { signAndPublishCashuEscrowDescriptor } from "./pontmore-escrow-publicati
 import { signAndPublishPactServiceOffer } from "./pact-service-offer-publication";
 import {
   assertLiveDemoConfig,
+  configuredProviderPublicKey,
   createLiveDemoApprovalDecisionModel,
+  createRuntimeRequesterPolicy,
   createLiveDemoRequesterDefinition,
   readLiveDemoConfigFromEnv,
   type PactAgentLiveDemoConfig,
@@ -149,22 +150,13 @@ export async function publishRuntimeBootstrapArtifacts(
   const isHosted = "externalProvider" in config && config.externalProvider === true;
   if (isHosted) {
     // Discover the provider from the relay instead of publishing.
-    const providerPublicKey = (config as PactAgentHostedRuntimeConfig).providerPublicKeyHex as NostrPublicKey;
+    const providerPublicKey = configuredProviderPublicKey(config);
 
     // Discover providers through the relay using the actual production
-    // discovery path. This proves the provider service has published
-    // its artifacts and the runtime can find them.
-    const requesterPolicy: RequesterPolicy = {
-      maxBudgetSats: sats(500n),
-      allowedCapabilities: ["document-summary"],
-      maximumEscrowDurationSeconds: 15 * 60,
-      maximumProviderPriceSats: sats(450n),
-      allowedSettlementNetworks: ["cashu"],
-      autoRelease: "deterministic_checks_only",
-    };
-
+    // discovery path and the same policy every transaction uses (#60), so
+    // only the configured provider can be found.
     const discovery = await discoverProviders({
-      requesterPolicy,
+      requesterPolicy: createRuntimeRequesterPolicy(config),
       capability: "document-summary",
       relay,
       now,
@@ -324,14 +316,7 @@ async function wireDependencies(
     config.economicConfig,
   );
 
-  const requesterPolicy: RequesterPolicy = {
-    maxBudgetSats: sats(500n),
-    allowedCapabilities: ["document-summary"],
-    maximumEscrowDurationSeconds: 15 * 60,
-    maximumProviderPriceSats: sats(450n),
-    allowedSettlementNetworks: ["cashu"],
-    autoRelease: "deterministic_checks_only",
-  };
+  const requesterPolicy = createRuntimeRequesterPolicy(config);
 
   const decisionBounds: RequesterDecisionBounds = {
     maximumInstructionCharacters: 1000,

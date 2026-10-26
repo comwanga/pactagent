@@ -17,7 +17,7 @@ import {
   createPrivateCashuProofImport,
   type CashuTestMintPort,
 } from "./cashu-test-mint";
-import { createNostrIdentity } from "../domain/nostr";
+import { createNostrIdentity, nostrPublicKey, type NostrPublicKey } from "../domain/nostr";
 import { sats, type Sats } from "../domain/money";
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
 import { createCashuEscrowDescriptor } from "../domain/pontmore-escrow";
@@ -25,7 +25,7 @@ import {
   createPactServiceOffer,
   PACTAGENT_DOCUMENT_SUMMARY_CAPABILITY_ID,
 } from "../domain/pact-service-offer";
-import type { RequesterPolicy } from "../domain/pact-agents";
+import { validateRequesterPolicy, type RequesterPolicy } from "../domain/pact-agents";
 import {
   signAndPublishAgentDefinition,
 } from "./pontmore-agent-publication";
@@ -311,6 +311,39 @@ export interface LiveDemoWorkflow {
   readonly close: () => void;
 }
 
+/**
+ * Issue #60: the provider identity this runtime executes against, taken
+ * only from trusted configuration: the configured public key in hosted mode,
+ * or the key of the configured provider signer in local mode. Throws on a
+ * malformed key, so a bad value never widens the allowlist.
+ */
+export function configuredProviderPublicKey(config: PactAgentRuntimeConfig): NostrPublicKey {
+  if ("externalProvider" in config && config.externalProvider === true) {
+    return nostrPublicKey(config.providerPublicKeyHex);
+  }
+  return createLocalNostrSigner((config as PactAgentLiveDemoConfig).providerPrivateKeyHex).publicKey;
+}
+
+/**
+ * Issue #60: the one requester policy used for runtime bootstrap discovery,
+ * every transaction's discovery, and the live demonstration workflow. Its
+ * allowlist is exactly the configured provider identity, because the
+ * workflow can only execute against that provider until #84.
+ */
+export function createRuntimeRequesterPolicy(config: PactAgentRuntimeConfig): RequesterPolicy {
+  const policy: RequesterPolicy = Object.freeze({
+    maxBudgetSats: sats(500n),
+    allowedCapabilities: Object.freeze(["document-summary"] as const),
+    maximumEscrowDurationSeconds: 15 * 60,
+    maximumProviderPriceSats: sats(450n),
+    allowedSettlementNetworks: Object.freeze(["cashu"] as const),
+    autoRelease: "deterministic_checks_only",
+    allowedProviders: Object.freeze([configuredProviderPublicKey(config)]),
+  });
+  validateRequesterPolicy(policy);
+  return policy;
+}
+
 export async function createLiveDemoWorkflow(
   config: PactAgentRuntimeConfig,
   decisionModel: RequesterDecisionModel,
@@ -347,14 +380,7 @@ export async function createLiveDemoWorkflow(
     config.economicConfig,
   );
 
-  const requesterPolicy: RequesterPolicy = {
-    maxBudgetSats: sats(500n),
-    allowedCapabilities: ["document-summary"],
-    maximumEscrowDurationSeconds: 15 * 60,
-    maximumProviderPriceSats: sats(450n),
-    allowedSettlementNetworks: ["cashu"],
-    autoRelease: "deterministic_checks_only",
-  };
+  const requesterPolicy = createRuntimeRequesterPolicy(config);
 
   const decisionBounds: RequesterDecisionBounds = {
     maximumInstructionCharacters: 1000,

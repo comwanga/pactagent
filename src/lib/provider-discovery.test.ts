@@ -112,6 +112,8 @@ const REQUESTER_POLICY: RequesterPolicy = {
   maximumProviderPriceSats: btcToSats("0.00000450"),
   allowedSettlementNetworks: ["cashu"],
   autoRelease: "deterministic_checks_only",
+  // Issue #60: every provider these tests publish is allowed, so ranking is unchanged.
+  allowedProviders: [2, 3, 4, 9].map((seed) => createTestSigner(seed).signer.publicKey),
 };
 
 interface ProviderBundle {
@@ -1157,10 +1159,12 @@ describe("relay-backed provider discovery", () => {
       const provider = createProviderBundle(2);
       await publishBundle(provider, relay);
       const profile = relay.published.find((event) => event.kind === PIP00_AGENT_DEFINITION_KIND)!;
+      // Forged under an allowed provider key (#60): a key outside the
+      // allowlist would be filtered out before verification.
       relay.published.unshift({
         ...profile,
         id: "f".repeat(64),
-        pubkey: nostrPublicKey("ab".repeat(32)),
+        pubkey: createTestSigner(9).signer.publicKey,
         sig: "0".repeat(128),
       });
 

@@ -1,4 +1,4 @@
-import { createNostrIdentity } from "../domain/nostr";
+import { createNostrIdentity, nostrPublicKey } from "../domain/nostr";
 import { btcToSats } from "../domain/money";
 import type { ProviderAgent, RequesterAgent, ServiceOffer } from "../domain/pact-agents";
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
@@ -67,6 +67,7 @@ export function createPactDemoFixtures() {
       maximumProviderPriceSats: btcToSats("0.00000450"),
       allowedSettlementNetworks: ["cashu"],
       autoRelease: "deterministic_checks_only",
+      allowedProviders: [nostrPublicKey(providerIdentity.publicKey)],
     },
   };
   const provider: ProviderAgent = {

@@ -206,6 +206,7 @@ liveIt(
         maximumProviderPriceSats: sats(450n),
         allowedSettlementNetworks: ["cashu"],
         autoRelease: "deterministic_checks_only",
+        allowedProviders: [providerPublicKeyOnlySigner.publicKey],
       };
 
       const decisionBounds: RequesterDecisionBounds = {

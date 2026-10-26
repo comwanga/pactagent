@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { sats, type Sats } from "../domain/money";
-import { createNostrIdentity, type SignedNostrEvent, type UnsignedNostrEvent } from "../domain/nostr";
+import { createNostrIdentity, nostrPublicKey, type SignedNostrEvent, type UnsignedNostrEvent } from "../domain/nostr";
 import { DOCUMENT_SUMMARY_PROFILE_ID } from "../domain/pact-service-agreement";
 import type { RequesterPolicy } from "../domain/pact-agents";
 import { createPontmoreAgentDefinition } from "../domain/pontmore-agent";
@@ -34,6 +34,7 @@ const REQUESTER_POLICY: RequesterPolicy = {
   maximumProviderPriceSats: sats(450n),
   allowedSettlementNetworks: ["cashu"],
   autoRelease: "deterministic_checks_only",
+  allowedProviders: [nostrPublicKey("22".repeat(32)), nostrPublicKey("33".repeat(32))],
 };
 
 function signed(event: UnsignedNostrEvent, marker: string): SignedNostrEvent {
@@ -273,6 +274,25 @@ describe("bounded AI requester decision", () => {
       model: fakeModel(recommendationFor(input.discovery, { providerPublicKey: "33".repeat(32) })),
     });
     expect(result).toEqual({ status: "rejected", reason: "unknown_provider" });
+  });
+
+  it("Issue #60: rejects a supplied discovery result that selects a provider outside the allowlist", async () => {
+    // A caller-built discovery result whose selection skipped allowlist
+    // filtering. The model is never consulted.
+    const outsider = createCandidate({ seed: "44" });
+    const discovery = discoveryResult(outsider, [outsider]);
+    let modelCalls = 0;
+    const result = await runRequesterDecision({
+      ...requestInput({ discovery }),
+      model: {
+        async recommend() {
+          modelCalls += 1;
+          return recommendationFor(discovery);
+        },
+      },
+    });
+    expect(result).toEqual({ status: "rejected", reason: "provider_not_allowed" });
+    expect(modelCalls).toBe(0);
   });
 
   it("rejects a recommendation that contradicts Issue #9 selection", async () => {
