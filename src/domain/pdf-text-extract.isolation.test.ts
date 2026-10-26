@@ -166,6 +166,52 @@ const testLimits = (overrides: Partial<PdfExtractionLimits> = {}): PdfExtraction
 
 const VALID_PDF = buildPdf([line("A valid document.")]);
 
+/**
+ * Takes about 20 s to extract on the development machine and several seconds on
+ * fast CI runners: 500 pages share one stream of 4,000 whitespace-only text
+ * items, so the text cap never ends the reading early. Used to exceed a 1 s
+ * deadline regardless of machine speed.
+ */
+function slowToExtractPdf(): Buffer {
+  const content = Array.from({ length: 4_000 }, (_, index) => line("   ", 720 - (index % 60) * 12)).join("\n");
+  const stream = deflateSync(Buffer.from(content, "latin1"));
+  const objects: Buffer[] = [];
+  const add = (body: string | Buffer) => objects.push(typeof body === "string" ? Buffer.from(body, "latin1") : body);
+  add("<< /Type /Catalog /Pages 2 0 R >>");
+  add("");
+  add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  add(Buffer.concat([
+    Buffer.from(`<< /Length ${stream.length} /Filter /FlateDecode >>\nstream\n`, "latin1"),
+    stream,
+    Buffer.from("\nendstream", "latin1"),
+  ]));
+  const kids: string[] = [];
+  for (let page = 0; page < 500; page += 1) {
+    kids.push(`${add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>")} 0 R`);
+  }
+  objects[1] = Buffer.from(`<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${kids.length} >>`, "latin1");
+  const chunks: Buffer[] = [Buffer.from("%PDF-1.4\n", "latin1")];
+  let offset = chunks[0].length;
+  const offsets: number[] = [];
+  objects.forEach((body, index) => {
+    offsets.push(offset);
+    const object = Buffer.concat([Buffer.from(`${index + 1} 0 obj\n`, "latin1"), body, Buffer.from("\nendobj\n", "latin1")]);
+    chunks.push(object);
+    offset += object.length;
+  });
+  chunks.push(Buffer.from(
+    `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` +
+    offsets.map((value) => `${value.toString().padStart(10, "0")} 00000 n \n`).join("") +
+    `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF`,
+    "latin1",
+  ));
+  return Buffer.concat(chunks);
+}
+
+/** A 1 s deadline with no other limit close enough to trip first. */
+const DEADLINE_ONLY = { timeoutMs: 1_000, maxDecodedBytes: 1_024 * 1_024 * 1_024 } as const;
+const TIMED_OUT = { code: "resource_limit", message: "PDF extraction exceeded its time limit" } as const;
+
 describe("Issue #61 streaming text normalization", () => {
   /** The previous pipeline applied to already-extracted page texts. */
   const reference = (pages: readonly string[], maxChars: number) =>
@@ -350,10 +396,8 @@ describe("Issue #61 extraction limits", () => {
   }, 30_000);
 
   it("terminates an extraction that exceeds its deadline", async () => {
-    // 500 dense pages: well past a 1 s deadline, within the page limit.
-    const pdf = buildPdf(Array.from({ length: 500 }, (_, page) => lines(`Dense page ${page} text`, 40)), { flate: true });
     const started = performance.now();
-    expect(await currentExtract(pdf, { timeoutMs: 1_000 })).toBe("resource_limit");
+    await expect(createPdfTextExtractor(testLimits(DEADLINE_ONLY)).extract(slowToExtractPdf())).rejects.toMatchObject(TIMED_OUT);
     expect(performance.now() - started).toBeLessThan(4_000);
   }, 30_000);
 });
@@ -426,13 +470,13 @@ describe("Issue #61 concurrency and cleanup", () => {
   }, 30_000);
 
   it("keeps serving after repeated invalid PDFs and timeouts in the real worker", async () => {
-    const extractor = createPdfTextExtractor(testLimits({ maxConcurrentWorkers: 1, maxQueuedExtractions: 0, timeoutMs: 1_000 }));
-    const slow = buildPdf(Array.from({ length: 500 }, (_, page) => lines(`Dense page ${page} text`, 40)), { flate: true });
+    const extractor = createPdfTextExtractor(testLimits({ maxConcurrentWorkers: 1, maxQueuedExtractions: 0, ...DEADLINE_ONLY }));
+    const slow = slowToExtractPdf();
     for (let round = 0; round < 3; round += 1) {
       await expect(extractor.extract(Buffer.from("%PDF-1.4\nbroken", "latin1"))).rejects.toMatchObject({ code: "invalid_pdf" });
     }
     for (let round = 0; round < 2; round += 1) {
-      await expect(extractor.extract(slow)).rejects.toMatchObject({ code: "resource_limit" });
+      await expect(extractor.extract(slow)).rejects.toMatchObject(TIMED_OUT);
     }
     expect(await extractor.extract(VALID_PDF)).toEqual({ text: "A valid document.", pageCount: 1 });
   }, 60_000);
