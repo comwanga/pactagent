@@ -53,6 +53,12 @@ try {
   for (const [kind, bytes] of [[1, 32], [3921, 32], [1059, 32], [1, 4 * 1024 * 1024 - 1000]]) {
     console.log("BASELINE_EXPOSURE", JSON.stringify(await publish(kind, bytes)));
   }
+} catch (error) {
+  // This relay contains only synthetic public baseline events. Preserve its
+  // startup diagnostic before the disposable project is removed.
+  await runChecked("docker", [...compose, "logs", "--no-color", "--tail", "80", "strfry"])
+    .catch(() => undefined);
+  throw error;
 } finally {
   await runChecked("docker", [...compose, "down", "-v"]);
 }
