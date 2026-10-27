@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { deserializeProofs } from "@cashu/cashu-ts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import * as documentSummary from "../domain/document-summary-service";
 import { sats } from "../domain/money";
 import {
   nostrPublicKey,
@@ -479,6 +480,48 @@ describe("Pre-#37 recovery remediation", () => {
     expect(status.availableActions.refund).toBe(false);
     runtime.shutdown();
   });
+
+  it("refunds a funded transaction when provider extraction fails after successful preflight", async () => {
+    const shared = sharedStores();
+    const { runtime, relay, clock, cashu } = buildRuntime(fixture, shared);
+    const summarize = documentSummary.summarizeDocument;
+    const execution = vi.spyOn(documentSummary, "summarizeDocument")
+      .mockImplementationOnce(summarize)
+      // Fault injection at the executor boundary: the worker's resource and
+      // runtime failures all become this response. Parser limits are exercised
+      // separately against real PDF workers in pdf-text-extract.isolation.
+      .mockResolvedValueOnce({
+        status: "failed",
+        errorCode: "pdf_extraction_failed",
+        message: "PDF extraction worker failed",
+      });
+    try {
+      await runtime.start();
+      await expect(runtime.startTransaction(startInput("provider-extraction-failure")))
+        .rejects.toMatchObject({ code: "execution_failed" });
+      expect(execution).toHaveBeenCalledTimes(2);
+      expect(cashu.prepareCalls).toBe(1);
+      expect(cashu.spendCalls).toBe(0);
+      // Only the requester's task is published: no result or release follows
+      // a failed execution.
+      expect(relay.events.filter((event) => event.kind === NIP59_GIFT_WRAP_KIND)).toHaveLength(1);
+      expect(relay.events.some((event) => event.content.includes('"state":"result_submitted"'))).toBe(false);
+      const id = `txn_${createHash("sha256").update("provider-extraction-failure").digest("hex").slice(0, 32)}`;
+      expect((await runtime.status(id)).phase).toBe("task_delivered");
+      expect((await runtime.reclaimExpiredFundedEscrows()).reclaimed).toBe(0);
+      expect(cashu.spendCalls).toBe(0);
+
+      clock.advanceTo(ROOT_TIME + 1000);
+      expect((await runtime.reclaimExpiredFundedEscrows()).reclaimed).toBe(1);
+      expect((await runtime.status(id)).operationalState).toBe("refunded");
+      expect(cashu.spendCalls).toBe(1);
+      expect((await runtime.reclaimExpiredFundedEscrows()).reclaimed).toBe(0);
+      expect(cashu.spendCalls).toBe(1);
+    } finally {
+      execution.mockRestore();
+      await runtime.shutdown();
+    }
+  }, 30_000);
 
   it("expired funded escrow does NOT advertise resume and DOES advertise refund", async () => {
     const shared = sharedStores();

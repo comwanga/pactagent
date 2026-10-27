@@ -597,6 +597,45 @@ describe("PactAgent end-to-end workflow integration", () => {
       expect(s.cashu.spendCalls).toBe(0);
     }, 30_000);
 
+    it("Issue #61: rejects a PDF over the extraction page limit before funding any escrow", async () => {
+      const s = buildWorkflow();
+      // 501 one-line pages: under the 1 MiB source limit, over the 500-page extraction limit.
+      const objects = ["<< /Type /Catalog /Pages 2 0 R >>", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"];
+      const kids: string[] = [];
+      for (let page = 0; page < 501; page += 1) {
+        const content = "BT /F1 12 Tf 72 720 Td (x) Tj ET";
+        objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+        objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${objects.length} 0 R /Resources << /Font << /F1 3 0 R >> >> >>`);
+        kids.push(`${objects.length} 0 R`);
+      }
+      objects[1] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${kids.length} >>`;
+      let pdf = "%PDF-1.4\n";
+      const offsets: number[] = [];
+      objects.forEach((body, index) => {
+        offsets.push(pdf.length);
+        pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+      });
+      const xref = pdf.length;
+      pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("")}`;
+      pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+
+      await expect(
+        s.workflow.runSuccessfulTransaction({
+          requesterDefinition: s.requesterDefinition,
+          privateDocument: Buffer.from(pdf, "latin1").toString("base64"),
+          mediaType: "application/pdf",
+          privatePrompt: "PRIVATE-PROMPT Summarize concisely.",
+          maximumBudgetSats: sats(500n),
+          funding: privateFunding(),
+        }),
+      ).rejects.toMatchObject({
+        code: "execution_failed",
+        message: "Document cannot be summarized before funding: pdf_extraction_failed",
+      });
+      expect(s.cashu.prepareCalls).toBe(0);
+      expect(s.cashu.spendCalls).toBe(0);
+    }, 30_000);
+
     it("uses discovery rather than hard-coding P002", async () => {
       const s = buildWorkflow();
       const report = await s.workflow.runSuccessfulTransaction({
