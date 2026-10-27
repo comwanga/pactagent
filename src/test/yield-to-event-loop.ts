@@ -1,3 +1,4 @@
+import { setImmediate as realSetImmediate } from "node:timers";
 import { afterEach } from "vitest";
 
 /*
@@ -12,9 +13,7 @@ import { afterEach } from "vitest";
  * with "Timeout calling onTaskUpdate". Turning the loop between tests keeps
  * every stall far below the RPC timeout.
  *
- * The real setImmediate is captured here, before any test can install fake
+ * The real setImmediate is imported here, before any test can install fake
  * timers.
  */
-const realSetImmediate = globalThis.setImmediate;
-
 afterEach(() => new Promise<void>((resolve) => realSetImmediate(() => resolve())));

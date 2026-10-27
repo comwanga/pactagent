@@ -403,6 +403,14 @@ describe("Issue #61 extraction limits", () => {
 });
 
 describe("Issue #61 worker failures fail closed", () => {
+  it("reports an explicit worker_error with a fixed diagnostic", async () => {
+    const extractor = createPdfTextExtractor(testLimits(), fakeWorker("reply({ status: 'worker_error', message: 'SECRET-DOCUMENT /private/path' });"));
+    await expect(extractor.extract(VALID_PDF)).rejects.toMatchObject({
+      code: "resource_limit",
+      message: "PDF extraction worker failed",
+    });
+  });
+
   const failures: Record<string, string> = {
     "exits without a result": "process.exit(1);",
     "throws during extraction": "throw new Error('worker crashed: /private/path SECRET-DOCUMENT');",
@@ -430,6 +438,18 @@ describe("Issue #61 worker failures fail closed", () => {
 
 describe("Issue #61 concurrency and cleanup", () => {
   const slowWorker = fakeWorker("setTimeout(() => reply({ status: 'ok', text: 'done', pageCount: 1 }), 300);");
+
+  it("keeps the caller's unpooled Buffer intact across repeated transfers", async () => {
+    // A dedicated backing buffer would detach if passed directly to transferList.
+    const input = Buffer.allocUnsafeSlow(VALID_PDF.length);
+    VALID_PDF.copy(input);
+    const extractor = createPdfTextExtractor(testLimits(), fakeWorker("reply({ status: 'ok', text: 'done', pageCount: 1 });"));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect(await extractor.extract(input)).toEqual({ text: "done", pageCount: 1 });
+      expect(input.byteLength).toBe(VALID_PDF.length);
+      expect(input.equals(VALID_PDF)).toBe(true);
+    }
+  });
 
   it("runs simultaneous requests within the worker limit and completes them all", async () => {
     const extractor = createPdfTextExtractor(testLimits({ maxConcurrentWorkers: 2, maxQueuedExtractions: 8 }), slowWorker);
@@ -550,6 +570,13 @@ describe("Issue #61 limit configuration", () => {
       maxQueuedExtractions: 0,
     });
     expect(pdfExtractionLimitsFromEnv({})).toEqual(DEFAULT_PDF_EXTRACTION_LIMITS);
+  });
+
+  it("describes lexical errors without implying that a zero-length queue is invalid", () => {
+    expect(() => pdfExtractionLimitsFromEnv({ PACTAGENT_PDF_MAX_QUEUED: "-1" })).toThrow(
+      "PACTAGENT_PDF_MAX_QUEUED must be a non-negative decimal integer",
+    );
+    expect(pdfExtractionLimitsFromEnv({ PACTAGENT_PDF_MAX_QUEUED: "0" }).maxQueuedExtractions).toBe(0);
   });
 
   it.each([

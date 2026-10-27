@@ -9,8 +9,7 @@ import { DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES } from "./pact-service-agreement";
  * font encodings and ToUnicode CMaps, so text from real-world PDFs that subset
  * their fonts (Word, Chrome, LibreOffice, LaTeX) is recovered correctly rather
  * than as glyph-code gibberish. Extraction is deterministic for a given input
- * and engine version, so the requester preflight and the provider reach the
- * same extractable/not-extractable decision.
+ * and engine version when extraction completes within its resource limits.
  *
  * That holds for the text itself. The resource limits below are read by each
  * service from its own environment, and the deadline and heap limit depend on
@@ -126,7 +125,7 @@ export function pdfExtractionLimitsFromEnv(
     const raw = environment[name];
     if (raw === undefined) continue;
     if (!/^[0-9]+$/.test(raw.trim())) {
-      throw new InvalidDomainInputError(`${name} must be a positive integer`);
+      throw new InvalidDomainInputError(`${name} must be a non-negative decimal integer`);
     }
     limits[key] = Number(raw.trim()) * scale;
   }
@@ -164,6 +163,9 @@ function readWorkerMessage(message: unknown, limits: PdfExtractionLimits): Worke
   }
   if (status === "page_limit_exceeded") {
     return resourceLimit("PDF has more pages than the extraction limit");
+  }
+  if (status === "worker_error") {
+    return resourceLimit("PDF extraction worker failed");
   }
   if (
     status !== "ok" ||
@@ -219,6 +221,7 @@ function runInWorker(input: Buffer, limits: PdfExtractionLimits, workerPath: str
 
     let outcome: WorkerOutcome | undefined;
     const accept = (message: unknown) => {
+      clearTimeout(timer);
       outcome ??= readWorkerMessage(message, limits);
       void worker.terminate();
     };

@@ -77,11 +77,22 @@ after the escrow is funded, in two ways:
   or busier provider. The defaults leave a wide margin (15 s against 3.2 s for
   the slowest accepted fixture), which makes this unlikely but not impossible.
 
-When this happens the provider records `execution_failed` and publishes
-nothing, so the agreement stays at `escrow_funded`. No funds are lost: the
-requester runtime refunds the escrow automatically once its locktime passes
-(900 s by default). The requester's value is locked until then, and the
-transaction fails.
+When this happens the hosted provider records `execution_failed` and publishes
+no result, so the agreement stays at `escrow_funded`. The inline executor used
+by deterministic runtime tests has already published `task_delivered`. Neither
+path authorizes payment for failed execution. The existing refund rules still
+apply: `escrow_funded` waits for its locktime (900 s by default), while
+`task_delivered` may become refundable at the agreement's execution deadline.
+Automatic recovery requires the requester runtime to be running with its
+durable state, and the relay and mint to be available. Until recovery succeeds,
+the requester's value remains locked and the transaction has failed.
+
+The recovery regression injects `pdf_extraction_failed` after a successful
+preflight, then checks that the inline runtime publishes no result, does not
+spend before eligibility, and reclaims exactly once after timeout using a fake
+test mint. Worker limits are covered separately by real-worker PDF tests. This
+does not prove that independently configured requester and hosted provider
+limits are compatible; a negotiated resource profile is outside this change.
 
 ### Decoded bytes and memory
 
@@ -117,12 +128,16 @@ ligatures, tables, 10 pages). Each document is destroyed after extraction.
 
 | Situation | `summarizeDocument` error |
 |---|---|
-| Not a PDF, malformed, encrypted or unreadable | `unsupported_pdf` (unchanged) |
+| Not a PDF, or a recognized pdf.js document error (invalid PDF, password required, invalid format) | `unsupported_pdf` |
 | Valid PDF with no extractable text | `empty_document` (unchanged) |
-| Too many pages, deadline missed, decoded-bytes or heap limit, worker crash or unexpected exit, too many extractions waiting, misconfigured limits | `pdf_extraction_failed` |
+| Too many pages, deadline missed, decoded-bytes or heap limit, worker crash or unexpected exit, unexpected parser error, cancellation or page-cleanup failure, too many extractions waiting, misconfigured limits | `pdf_extraction_failed` |
 
 Error messages are fixed strings. They contain no document text, prompts,
 paths, stack traces or worker details.
+
+Cancellation and page-cleanup errors fail closed even when some text has
+already been read. Document destruction remains best effort: the parent always
+terminates the worker and waits for its exit before releasing its slot.
 
 A PDF that fails during requester preflight stops the transaction with
 `execution_failed` before any escrow is prepared or funded. The provider

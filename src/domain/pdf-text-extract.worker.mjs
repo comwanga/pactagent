@@ -123,14 +123,24 @@ function textOf(item) {
   return item.str + (item.hasEOL ? "\n" : "");
 }
 
+class PdfCleanupError extends Error {}
+
+function extractionFailure(error) {
+  // These are document errors from the pinned pdf.js engine. Unknown errors
+  // (including runtime failures) are not evidence of an unsupported PDF.
+  const invalidDocument = error instanceof Error &&
+    ["InvalidPDFException", "PasswordException", "FormatError"].includes(error.name);
+  return { status: invalidDocument ? "invalid_pdf" : "worker_error" };
+}
+
 /** Extracts bounded text from one document. Resolves to a status message. */
 export async function extractBoundedText(data, limits) {
   const { getDocumentProxy } = await import("unpdf");
   let pdf;
   try {
     pdf = await getDocumentProxy(data);
-  } catch {
-    return { status: "invalid_pdf" };
+  } catch (error) {
+    return extractionFailure(error);
   }
   try {
     const pageCount = pdf.numPages;
@@ -155,18 +165,25 @@ export async function extractBoundedText(data, limits) {
           if (text.full) {
             // pdf.js requires an Error reason; a bare cancel() (as from
             // breaking a for-await loop) throws an uncaught assertion.
-            await reader.cancel(new Error("Extracted text limit reached"));
+            try {
+              await reader.cancel(new Error("Extracted text limit reached"));
+            } catch {
+              throw new PdfCleanupError();
+            }
             break;
           }
         }
       } finally {
-        page.cleanup();
+        try {
+          page.cleanup();
+        } catch {
+          throw new PdfCleanupError();
+        }
       }
     }
     return { status: "ok", text: text.finish(), pageCount };
-  } catch {
-    // A malformed, encrypted, or otherwise unreadable PDF.
-    return { status: "invalid_pdf" };
+  } catch (error) {
+    return extractionFailure(error);
   } finally {
     // Releases the document's parsed objects, fonts and caches.
     try {

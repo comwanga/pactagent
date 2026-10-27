@@ -811,12 +811,10 @@ export class PactAgentWorkflow {
       );
     }
 
-    // Preflight the deterministic document-summary execution before any escrow
-    // is funded. The provider runs the exact same pure summarizer, so if it
-    // cannot produce a summary here it cannot produce one after funding either.
-    // Catching it now means an unsummarizable document (for example a PDF whose
-    // text cannot be extracted) fails before the requester locks any value,
-    // instead of leaving the escrow funded and stuck until a timeout refund.
+    // Preflight before funding so known execution failures do not lock value.
+    // The provider enforces its own resource limits again: different limits,
+    // load or machine speed can still cause a funded execution to fail. Such
+    // failures use the existing escrow refund path, not a successful result.
     const preflight = await summarizeDocument({
       source_document: privateTerms.source_document,
       input_media_type: privateTerms.input_media_type,
