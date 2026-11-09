@@ -39,6 +39,8 @@ export default defineConfig({
             "src/lib/recovery-remediation.test.ts",
           ],
           testTimeout: 30_000,
+          // Issue #61: see src/test/yield-to-event-loop.ts.
+          setupFiles: [resolve(root, "src/test/yield-to-event-loop.ts")],
           pool: "forks",
         },
       },
@@ -60,6 +62,8 @@ export default defineConfig({
             "src/lib/recovery-remediation.test.ts",
           ],
           testTimeout: 20_000,
+          // Issue #61: see src/test/yield-to-event-loop.ts.
+          setupFiles: [resolve(root, "src/test/yield-to-event-loop.ts")],
           pool: "vmThreads",
           poolOptions: { vmThreads: { singleThread: true } },
         },
