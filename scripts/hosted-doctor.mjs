@@ -279,8 +279,16 @@ export async function runHostedDoctor(options = {}) {
   const docker = runSync("docker", ["version", "--format", "{{.Server.Version}}"]).status === 0;
   add(checks, docker, "Docker", docker ? "daemon is available" : "daemon is unavailable");
 
-  const strfry = docker ? inspectContainer("pactagent-hosted-strfry") : undefined;
-  const caddy = docker ? inspectContainer("pactagent-hosted-caddy") : undefined;
+  const composeProject = environment.COMPOSE_PROJECT_NAME || "pactagent-hosted";
+  const composeContainer = (service) => {
+    const result = runSync("docker", ["compose", "-f", composeHostedPath,
+      "-p", composeProject, "ps", "-q", service], { env: environment });
+    return result.status === 0 ? result.stdout.trim() : "";
+  };
+  const strfryId = docker ? composeContainer("strfry") : "";
+  const caddyId = docker ? composeContainer("caddy") : "";
+  const strfry = strfryId ? inspectContainer(strfryId) : undefined;
+  const caddy = caddyId ? inspectContainer(caddyId) : undefined;
   const strfryHealthy = strfry?.Running === true && strfry?.Health?.Status === "healthy";
   const caddyHealthy = caddy?.Running === true && caddy?.Health?.Status === "healthy";
   add(checks, strfryHealthy, "hosted Strfry container", strfryHealthy ? "running and healthy" : "not running and healthy");
@@ -288,13 +296,14 @@ export async function runHostedDoctor(options = {}) {
 
   // Hosted Strfry is private to the Compose network. Probe its listener from
   // inside the container instead of requiring an unsafe host port mapping.
-  const strfryInternal = docker && runSync("docker", [
-    "exec", "pactagent-hosted-strfry", "curl", "-ILfSs", "http://localhost:7777/",
+  const strfryInternal = Boolean(strfryId) && runSync("docker", [
+    "exec", strfryId, "curl", "-ILfSs", "http://localhost:7777/",
   ]).status === 0;
-  const tlsPort = await checkPort(8443);
+  const wssPort = Number(environment.PACTAGENT_HOSTED_WSS_PORT || "8443");
+  const tlsPort = await checkPort(wssPort);
   add(checks, strfryInternal, "hosted Strfry internal listener",
     strfryInternal ? "reachable inside hosted container" : "unreachable inside hosted container");
-  add(checks, tlsPort, "hosted Caddy WSS port 8443", tlsPort ? "reachable" : "unreachable");
+  add(checks, tlsPort, `hosted Caddy WSS port ${wssPort}`, tlsPort ? "reachable" : "unreachable");
 
   // 11. WSS handshake through the intended hosted edge
   let nostrReadable = false;

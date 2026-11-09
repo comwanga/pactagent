@@ -7,6 +7,7 @@ import {
   MAX_NOSTR_WEBSOCKET_PAYLOAD_BYTES,
   measureNostrEventTransportSize,
   nostrEventTransportLimitViolation,
+  PRIVATE_GIFT_WRAP_RETENTION_SECONDS,
 } from "./private-task-transport";
 import { WebSocketNostrRelayAdapter } from "./nostr-relay";
 
@@ -19,7 +20,9 @@ function signedGiftWrap(contentLength: number): SignedNostrEvent {
     {
       kind: 1059,
       created_at: CREATED_AT,
-      tags: [["p", "1".repeat(64)], ["t", "pactagent-size-boundary"]],
+      tags: [["p", process.env.PACTAGENT_STRFRY_BOUNDARY_RECIPIENT ?? "1".repeat(64)],
+        ["expiration", String(CREATED_AT + PRIVATE_GIFT_WRAP_RETENTION_SECONDS)],
+        ["t", "pactagent-size-boundary"]],
       content: "A".repeat(contentLength),
     },
     SECRET,

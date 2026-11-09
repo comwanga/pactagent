@@ -15,6 +15,15 @@ import { readProviderServiceConfig } from "./provider-service-config";
 
 const RELAY_URL = process.env.PACTAGENT_HOSTED_PROTOCOL_URL ?? "wss://localhost:8443";
 
+function enrolledTestKey(name: string): string {
+  if (process.env.PACTAGENT_HOSTED_ACCEPTANCE === "true") {
+    const key = process.env[name];
+    if (!key) throw new Error(`Missing enrolled acceptance identity: ${name}`);
+    return key;
+  }
+  return bytesToHex(generateSecretKey());
+}
+
 function createTestStore() {
   const dir = mkdtempSync(join(tmpdir(), "pactagent-provider-test-"));
   return createSqliteProviderIdempotencyStore(join(dir, "provider-ops.sqlite"));
@@ -49,14 +58,17 @@ function isRelayAvailable(): Promise<boolean> {
 }
 
 const relayAvailable = await isRelayAvailable();
+if (process.env.PACTAGENT_HOSTED_ACCEPTANCE === "true" && !relayAvailable) {
+  throw new Error("Required acceptance relay is unavailable");
+}
 const liveIt = relayAvailable ? it : it.skip;
 
 describe("PactAgent hosted provider service protocol", () => {
   liveIt(
     "provider publishes artifacts and achieves protocol readiness through the relay",
     async () => {
-      const providerSk = bytesToHex(generateSecretKey());
-      const escrowSk = bytesToHex(generateSecretKey());
+      const providerSk = enrolledTestKey("PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY");
+      const escrowSk = enrolledTestKey("PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY");
 
       const providerSigner = createLocalNostrSigner(providerSk);
       const providerEncrypter = createLocalNostrEncrypter(providerSk);
@@ -108,8 +120,8 @@ describe("PactAgent hosted provider service protocol", () => {
   liveIt(
     "rejects agreements not addressed to this provider",
     async () => {
-      const providerSk = bytesToHex(generateSecretKey());
-      const escrowSk = bytesToHex(generateSecretKey());
+      const providerSk = enrolledTestKey("PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY");
+      const escrowSk = enrolledTestKey("PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY");
       const providerSigner = createLocalNostrSigner(providerSk);
       const providerEncrypter = createLocalNostrEncrypter(providerSk);
       const escrowAuthorityPublicKey = createLocalNostrSigner(escrowSk).publicKey as NostrPublicKey;
@@ -151,8 +163,8 @@ describe("PactAgent hosted provider service protocol", () => {
   );
 
   liveIt("provider identity is stable and does not change after restart", async () => {
-    const providerSk = bytesToHex(generateSecretKey());
-    const escrowSk = bytesToHex(generateSecretKey());
+    const providerSk = enrolledTestKey("PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY");
+    const escrowSk = enrolledTestKey("PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY");
     const providerSigner = createLocalNostrSigner(providerSk);
     const providerEncrypter = createLocalNostrEncrypter(providerSk);
     const escrowAuthorityPublicKey = createLocalNostrSigner(escrowSk).publicKey as NostrPublicKey;
