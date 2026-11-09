@@ -86,7 +86,7 @@ export default defineRailway(() => {
     build: { builder: "DOCKERFILE", dockerfilePath: "deploy/strfry.Dockerfile" },
     deploy: {
       startCommand: "/bin/bash /app/entrypoint.sh",
-      // The entrypoint execs Strfry as PID 1. Bound unexpected startup/runtime
+      // The PID 1 wrapper forwards shutdown to Strfry. Bound unexpected startup/runtime
       // failures at the platform layer; normal Railway restarts are explicit.
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
@@ -96,6 +96,10 @@ export default defineRailway(() => {
     volumeMounts: { "/app/strfry-db": strfryDb },
     env: {
       PORT: "7777",
+      PACTAGENT_RELAY_PROVIDER_AUTHORS: preserve(),
+      PACTAGENT_RELAY_REQUESTER_AUTHORS: preserve(),
+      PACTAGENT_RELAY_AUTHORITY_AUTHORS: preserve(),
+      PACTAGENT_RELAY_LEGACY_GIFT_IDS: preserve(),
     },
   });
 

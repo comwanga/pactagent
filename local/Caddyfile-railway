@@ -8,6 +8,8 @@
 # WebSocket upgrades are preserved by reverse_proxy so wss:// works end to
 # end. Strfry is reached over Railway private networking and is never
 # directly exposed to the public internet.
+# The proxy still exposes the Nostr protocol publicly. Reads are public;
+# Strfry's packaged write-policy plugin authorizes and bounds publication.
 #
 # B39-02: /health is UPSTREAM-AWARE readiness. It proxies to Strfry, so it
 # returns 200 only while the Caddy edge AND the Strfry relay path are both

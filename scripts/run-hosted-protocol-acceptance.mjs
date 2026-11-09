@@ -7,6 +7,7 @@ import WebSocket from "ws";
 
 import { LOCAL_ROOT, loadLocalEnvironment } from "./local-env.mjs";
 import { nextBinary, runChecked, runCommand, waitFor } from "./local-process.mjs";
+import { registerAcceptanceProject } from "./issue-62-ci.mjs";
 
 /*
  * Container-backed acceptance harness for Issue #38 (hosted Nostr/P002).
@@ -25,9 +26,10 @@ import { nextBinary, runChecked, runCommand, waitFor } from "./local-process.mjs
  */
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "..");
-const ACCEPTANCE_STATE = resolve(LOCAL_ROOT, "hosted-acceptance");
+const ACCEPTANCE_STATE = resolve(LOCAL_ROOT, `hosted-acceptance-${uniqueRunId()}`);
 const ACCEPTANCE_CA_PATH = resolve(ACCEPTANCE_STATE, "caddy-root.crt");
 const HOSTED_COMPOSE_FILE = resolve(PROJECT_ROOT, "compose.hosted.yml");
+const ACCEPTANCE_COMPOSE_FILE = resolve(PROJECT_ROOT, "local/compose.hosted-acceptance.yml");
 
 function openAcceptanceWebSocket(url) {
   return new WebSocket(url, { ca: readFileSync(ACCEPTANCE_CA_PATH) });
@@ -62,47 +64,33 @@ async function reserveEphemeralPort() {
 async function ensureInfrastructure(environment, runId, composeEnv) {
   console.log(`Starting hosted Strfry + Caddy (WSS) + Demo Mint infrastructure (run ${runId})...`);
 
-  // Hosted and local edges intentionally use the same host ports. Stop only
-  // the local relay edge; its persistent data is not removed and is restored
-  // after acceptance.
-  await runChecked("docker", ["compose", "-f", resolve(PROJECT_ROOT, "compose.local.yml"), "stop", "caddy", "strfry"], {
-    env: environment,
-  }).catch(() => undefined);
-
-  // F38-02C: Clean only this unique acceptance project before starting.
-  await runChecked("docker", ["compose", "-f", HOSTED_COMPOSE_FILE, "-p", composeEnv.COMPOSE_PROJECT_NAME, "down", "-v"], {
-    env: composeEnv,
-  }).catch(() => undefined);
-
   await runChecked("docker", [
     "compose",
     "-f",
     HOSTED_COMPOSE_FILE,
+    "-f", ACCEPTANCE_COMPOSE_FILE,
     "-p",
-    `pactagent-hosted-${runId}`,
+    composeEnv.COMPOSE_PROJECT_NAME,
     "up",
+    "--build",
     "-d",
     "--wait",
     "--wait-timeout",
     "60",
   ], { env: composeEnv });
 
-  // Also start the demo mint from local compose
-  await runChecked("docker", [
-    "compose",
-    "-f",
-    resolve(PROJECT_ROOT, "compose.local.yml"),
-    "up",
-    "-d",
-    "demo-mint",
-    "--wait",
-    "--wait-timeout",
-    "60",
-  ], { env: environment });
+  const compose = ["compose", "-f", HOSTED_COMPOSE_FILE, "-f", ACCEPTANCE_COMPOSE_FILE,
+    "-p", composeEnv.COMPOSE_PROJECT_NAME];
+  await runChecked("docker", [...compose, "exec", "-T", "strfry",
+    "/app/strfry-write-policy.py", "--check"], { env: composeEnv });
+  const missingPolicy = await runCommand("docker", [...compose, "run", "--rm", "--no-deps",
+    "-e", "PACTAGENT_RELAY_PROVIDER_AUTHORS=", "strfry"], { env: composeEnv, stdio: "inherit" });
+  if (missingPolicy.code !== 1) throw new Error("Missing mandatory policy configuration did not fail startup");
 
   await runChecked("docker", [
-    "cp",
-    "pactagent-hosted-caddy:/data/caddy/pki/authorities/local/root.crt",
+    "compose", "-f", HOSTED_COMPOSE_FILE, "-f", ACCEPTANCE_COMPOSE_FILE,
+    "-p", composeEnv.COMPOSE_PROJECT_NAME, "cp",
+    "caddy:/data/caddy/pki/authorities/local/root.crt",
     ACCEPTANCE_CA_PATH,
   ], { env: composeEnv });
   if (statSync(ACCEPTANCE_CA_PATH).size === 0) {
@@ -171,7 +159,10 @@ async function startProviderService(environment) {
     } catch {
       return false;
     }
-  }, { timeoutMs: 30_000, intervalMs: 500 });
+  }, { timeoutMs: 30_000, intervalMs: 500 }).catch(async error => {
+    await stopChild(child);
+    throw error;
+  });
   console.log("PASS: Standalone Provider Service process is started and protocol-ready");
   return child;
 }
@@ -204,7 +195,10 @@ async function startNextServer(environment) {
   await waitFor(() => {
     if (child.exitCode !== null) throw new Error(`Next.js process exited with code ${child.exitCode}`);
     return Promise.resolve(started);
-  }, { timeoutMs: 60_000, intervalMs: 1_000 });
+  }, { timeoutMs: 60_000, intervalMs: 1_000 }).catch(async error => {
+    await stopChild(child);
+    throw error;
+  });
   console.log("PASS: Next.js requester/runtime server is started");
   return child;
 }
@@ -251,15 +245,15 @@ async function runHostedDoctor(environment) {
  */
 async function relayPersistenceProof(environment, composeEnv) {
   console.log("Testing relay persistence (F38-02E)...");
-  const { generateSecretKey, finalizeEvent, getPublicKey } = await import("nostr-tools/pure");
+  const { finalizeEvent, getPublicKey } = await import("nostr-tools/pure");
   const { bytesToHex } = await import("nostr-tools/utils");
 
   // 1. Publish a unique known harmless signed Nostr event
-  const sk = generateSecretKey();
+  const sk = Uint8Array.from(Buffer.from(environment.PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY, "hex"));
   const pk = getPublicKey(sk);
   const uniqueTag = `persistence-probe-${Date.now()}-${bytesToHex(randomBytes(4))}`;
   const event = finalizeEvent({
-    kind: 1,
+    kind: 0,
     pubkey: pk,
     created_at: Math.floor(Date.now() / 1000),
     tags: [["t", uniqueTag]],
@@ -278,7 +272,8 @@ async function relayPersistenceProof(environment, composeEnv) {
         const value = JSON.parse(String(msg.data));
         if (value[0] === "OK" && value[1] === event.id) {
           socket.close();
-          resolvePromise();
+          if (value[2] === true) resolvePromise();
+          else rejectPromise(new Error("Persistence probe was rejected"));
         }
       } catch { /* ignore */ }
     });
@@ -364,23 +359,21 @@ async function relayPersistenceProof(environment, composeEnv) {
   console.log(`PASS: Event ${event.id} found after restart (persistence proven)`);
 }
 
-async function cleanupInfrastructure(composeEnv, localEnvironment) {
+async function cleanupInfrastructure(composeEnv) {
   console.log("Cleaning up infrastructure...");
-  await runChecked("docker", ["compose", "-f", HOSTED_COMPOSE_FILE, "-p", composeEnv.COMPOSE_PROJECT_NAME, "down", "-v"], {
+  await runChecked("docker", ["compose", "-f", HOSTED_COMPOSE_FILE, "-f", ACCEPTANCE_COMPOSE_FILE, "-p", composeEnv.COMPOSE_PROJECT_NAME, "down", "-v"], {
     env: composeEnv,
-  }).catch(() => undefined);
-  await runChecked("docker", ["compose", "-f", resolve(PROJECT_ROOT, "compose.local.yml"), "up", "-d", "strfry", "caddy"], {
-    env: localEnvironment,
   }).catch(() => undefined);
 }
 
 async function stopChild(child) {
-  if (!child || child.exitCode !== null || child.killed) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   await Promise.race([
     new Promise((resolveExit) => child.once("exit", resolveExit)),
     new Promise((resolveTimeout) => setTimeout(resolveTimeout, 5_000)),
   ]);
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 }
 
 async function main() {
@@ -389,23 +382,28 @@ async function main() {
   const runId = uniqueRunId();
   const runtimePort = await reserveEphemeralPort();
   const providerReadinessPort = await reserveEphemeralPort();
+  const relayPort = await reserveEphemeralPort();
+  const mintPort = await reserveEphemeralPort();
 
   // Clean acceptance state
   rmSync(ACCEPTANCE_STATE, { recursive: true, force: true });
   mkdirSync(ACCEPTANCE_STATE, { recursive: true });
 
-  const { generateSecretKey } = await import("nostr-tools/pure");
+  const { generateSecretKey, finalizeEvent } = await import("nostr-tools/pure");
   const { bytesToHex } = await import("nostr-tools/utils");
 
-  const providerPrivateKey = baseEnv.PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY || bytesToHex(generateSecretKey());
-  const requesterPrivateKey = baseEnv.PACTAGENT_LIVE_REQUESTER_PRIVATE_KEY || bytesToHex(generateSecretKey());
-  const escrowPrivateKey = baseEnv.PACTAGENT_LIVE_ESCROW_AUTHORITY_PRIVATE_KEY || bytesToHex(generateSecretKey());
+  const providerPrivateKey = bytesToHex(generateSecretKey());
+  const requesterPrivateKey = bytesToHex(generateSecretKey());
+  const escrowPrivateKey = bytesToHex(generateSecretKey());
 
   const { getPublicKey } = await import("nostr-tools/pure");
   const escrowPubkey = getPublicKey(Uint8Array.from(Buffer.from(escrowPrivateKey, "hex")));
   const providerPubkey = getPublicKey(Uint8Array.from(Buffer.from(providerPrivateKey, "hex")));
+  const legacyGift = finalizeEvent({ kind: 1059, created_at: Math.floor(Date.now() / 1000) - 10,
+    tags: [["p", providerPubkey]], content: "legacy-prepared-recovery-fixture" }, generateSecretKey());
+  const rateRecipients = Array.from({ length: 11 }, () => getPublicKey(generateSecretKey()));
 
-  const wssUrl = "wss://localhost:8443";
+  const wssUrl = `wss://localhost:${relayPort}`;
 
   const sharedEnvironment = {
     ...baseEnv,
@@ -415,8 +413,10 @@ async function main() {
     PACTAGENT_LIVE_ESCROW_AUTHORITY_PUBLIC_KEY: escrowPubkey,
     PACTAGENT_ECONOMIC_MODE: "demo",
     PACTAGENT_RUNTIME_MODE: "hosted",
-    PACTAGENT_DEMO_CASHU_MINT_URL: "http://localhost:3338",
+    PACTAGENT_DEMO_CASHU_MINT_URL: `http://localhost:${mintPort}`,
     PACTAGENT_DEMO_STATE_DIRECTORY: resolve(ACCEPTANCE_STATE, "demo-state"),
+    PACTAGENT_LIVE_STATE_DIRECTORY: resolve(ACCEPTANCE_STATE, "unused-live-state"),
+    PACTAGENT_REQUESTER_SESSION_DATABASE: resolve(ACCEPTANCE_STATE, "requester-sessions.sqlite"),
     PACTAGENT_DEMO_NORMAL_SPEND_KEY: bytesToHex(generateSecretKey()),
     PACTAGENT_DEMO_REFUND_SPEND_KEY: bytesToHex(generateSecretKey()),
     PACTAGENT_DEMO_FUNDING_REFERENCE: `hosted-acceptance-funding-${runId}`,
@@ -424,8 +424,20 @@ async function main() {
     PACTAGENT_LIVE_RELAY_URL: wssUrl,
     PACTAGENT_HOSTED_PROTOCOL_URL: wssUrl,
     PACTAGENT_HOSTED_WSS_HOSTNAME: "localhost",
+    PACTAGENT_HOSTED_WSS_PORT: String(relayPort),
+    PACTAGENT_HOSTED_BIND: "127.0.0.1",
+    PACTAGENT_ACCEPTANCE_MINT_PORT: String(mintPort),
+    PACTAGENT_RELAY_PROVIDER_AUTHORS: providerPubkey,
+    PACTAGENT_RELAY_REQUESTER_AUTHORS: [getPublicKey(Uint8Array.from(Buffer.from(requesterPrivateKey, "hex"))),
+      ...rateRecipients].join(","),
+    PACTAGENT_RELAY_RATE_TEST_RECIPIENTS: JSON.stringify(rateRecipients),
+    PACTAGENT_RELAY_AUTHORITY_AUTHORS: escrowPubkey,
+    PACTAGENT_RELAY_LEGACY_GIFT_IDS: legacyGift.id,
+    PACTAGENT_RELAY_LEGACY_TEST_EVENT: JSON.stringify(legacyGift),
+    PACTAGENT_STRFRY_BOUNDARY_URL: wssUrl,
+    PACTAGENT_STRFRY_BOUNDARY_RECIPIENT: providerPubkey,
     PACTAGENT_HOSTED_ACCEPTANCE: "true",
-    PACTAGENT_RUNTIME_API_TOKEN: baseEnv.PACTAGENT_RUNTIME_API_TOKEN || "hosted-acceptance-token",
+    PACTAGENT_RUNTIME_API_TOKEN: randomBytes(32).toString("hex"),
     PACTAGENT_RUNTIME_API_BASE: `http://localhost:${runtimePort}`,
     PACTAGENT_REQUESTER_UI_ORIGIN: `http://localhost:${runtimePort}`,
     PACTAGENT_PROVIDER_READINESS_URL: `http://127.0.0.1:${providerReadinessPort}/ready`,
@@ -455,12 +467,29 @@ async function main() {
   const composeEnv = {
     ...runtimeEnvironment,
     PACTAGENT_HOSTED_CADDYFILE: "Caddyfile-hosted-acceptance",
-    COMPOSE_PROJECT_NAME: `pactagent-hosted-${runId}`,
+    COMPOSE_PROJECT_NAME: `${baseEnv.PACTAGENT_ACCEPTANCE_PROJECT_PREFIX || "pactagent"}-hosted-${runId}`,
+  };
+  // Fixture tests need all freshly generated test keys to construct signed
+  // events. This environment is never given to either production process.
+  const acceptanceEnvironment = {
+    ...sharedEnvironment,
+    PACTAGENT_LIVE_PROVIDER_PRIVATE_KEY: providerPrivateKey,
+    PACTAGENT_RELAY_TEST_COMPOSE_PROJECT: composeEnv.COMPOSE_PROJECT_NAME,
   };
 
   let providerChild, nextChild;
+  registerAcceptanceProject(composeEnv.COMPOSE_PROJECT_NAME,
+    [HOSTED_COMPOSE_FILE, ACCEPTANCE_COMPOSE_FILE], composeEnv);
   try {
     await ensureInfrastructure(runtimeEnvironment, runId, composeEnv);
+    if (process.argv.includes("--relay-policy")) {
+      await runAcceptanceTest(acceptanceEnvironment, "src/lib/pactagent-provider-service.live.test.ts");
+      await runAcceptanceTest(runtimeEnvironment, "src/lib/strfry-size-boundary.live.test.ts");
+      await runAcceptanceTest(acceptanceEnvironment, "src/lib/strfry-write-policy.live.test.ts");
+      await relayPersistenceProof(runtimeEnvironment, composeEnv);
+      console.log("ISSUE #62 RELAY POLICY ACCEPTANCE: PASS");
+      return;
+    }
     providerChild = await startProviderService(providerEnvironment);
     nextChild = await startNextServer(runtimeEnvironment);
     const acceptanceTestFile = repeatabilityAcceptance
@@ -478,6 +507,7 @@ async function main() {
     }
     await runHostedDoctor({
       ...runtimeEnvironment,
+      COMPOSE_PROJECT_NAME: composeEnv.COMPOSE_PROJECT_NAME,
       PACTAGENT_PROVIDER_MODE: "hosted",
       PACTAGENT_PROVIDER_STATE_DIRECTORY: providerEnvironment.PACTAGENT_PROVIDER_STATE_DIRECTORY,
     });
@@ -492,7 +522,7 @@ async function main() {
   } finally {
     await stopChild(nextChild);
     await stopChild(providerChild);
-    await cleanupInfrastructure(composeEnv, runtimeEnvironment);
+    await cleanupInfrastructure(composeEnv);
   }
 }
 

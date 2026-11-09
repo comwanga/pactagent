@@ -58,7 +58,8 @@ Requester/Runtime
 
 ### Strfry Relay
 
-- **Image**: `dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d`
+- **Hosted image**: build `deploy/strfry.Dockerfile` (policy + shutdown wrapper),
+  based on `dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d`.
   (pinned Strfry 1.1.3)
 - **Persistence**: Strfry LMDB database on a persistent volume
   - Local: `./.local/strfry-db:/app/strfry-db`
@@ -158,8 +159,8 @@ limits and Strfry configuration agree. The doctor verifies this agreement.
 Accepted task documents and prompts are base64-normalized inside the encrypted
 private message, so JSON escaping cannot make one media type exceed the bound.
 At the inclusive 1 MiB source limit with a maximum prompt, the measured
-normalized event is 3,495,765 bytes and the complete WebSocket frame is
-3,495,775 bytes, leaving a 698,539-byte normalized-event margin.
+normalized event including its expiration tag is 3,495,793 bytes and the
+complete WebSocket frame is 3,495,803 bytes, leaving 698,511 bytes of headroom.
 
 ## Privacy Model
 
@@ -181,7 +182,20 @@ NIP-59 gift wrap is used for all private transport. No plaintext HTTP.
 Strfry enforces:
 - Maximum event size (4 MiB normalized)
 - Maximum WebSocket payload (4 MiB + 256 bytes)
-- No public relay access (internal network only in hosted mode)
+- Public reads through Caddy WSS; the private Strfry upstream is publicly
+  reachable through that proxy.
+- Hosted image write policy: only the nine PactAgent kinds, explicit participant
+  author enrollment, per-kind sizes, 60-second future skew, durable publication
+  quotas, separate finite storage reserves, and native gift-wrap expiration.
+
+Both Railway and hosted Compose build `deploy/strfry.Dockerfile`. All three
+`PACTAGENT_RELAY_{PROVIDER,REQUESTER,AUTHORITY}_AUTHORS` public-key lists are
+mandatory; startup fails if policy configuration/state is unusable. Independent
+requester definitions and agreement roots require requester enrollment, not
+provider identity. NIP-42 is disabled and does not grant operator approval.
+The developer-only loopback `compose.local.yml` relay remains unrestricted.
+See [Issue #62 policy, rollout and recovery](issue-62-relay-write-policy.md)
+for exact quotas, retention exceptions, capacity limits and required checks.
 
 Application enforces:
 - Event/tag validation (malformed events rejected)

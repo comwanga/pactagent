@@ -1,0 +1,33 @@
+# Only for the uniquely named disposable hosted acceptance project.
+services:
+  strfry:
+    # The pinned relay requests 1,000,000 descriptors. Hosted runners otherwise
+    # give containers a 65,536 hard limit, causing Strfry to fail before listen.
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+  demo-mint:
+    image: cashubtc/nutshell:0.21.0@sha256:beed25e291357368e35e1698bf2e4645d97ed435232a8f8ff6501c77d67c0b90
+    command: ["poetry", "run", "mint"]
+    ports:
+      - "127.0.0.1:${PACTAGENT_ACCEPTANCE_MINT_PORT:?test mint port required}:3338"
+    environment:
+      MINT_BACKEND_BOLT11_SAT: FakeWallet
+      MINT_LISTEN_HOST: 0.0.0.0
+      MINT_LISTEN_PORT: "3338"
+      MINT_PRIVATE_KEY: DEMO_ONLY_NO_MONETARY_VALUE
+      MINT_DATABASE: /app/data/mint
+      TOR: "FALSE"
+      DEBUG: "FALSE"
+      LOG_LEVEL: INFO
+    volumes:
+      - acceptance-mint:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:3338/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  acceptance-mint:

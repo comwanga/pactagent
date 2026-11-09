@@ -19,13 +19,17 @@ name: pactagent-hosted
 
 services:
   strfry:
-    image: dockurr/strfry@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d
-    container_name: pactagent-hosted-strfry
-    command: ["/app/strfry.sh"]
+    build:
+      context: .
+      dockerfile: deploy/strfry.Dockerfile
     restart: unless-stopped
+    environment:
+      PACTAGENT_RELAY_PROVIDER_AUTHORS: ${PACTAGENT_RELAY_PROVIDER_AUTHORS:?provider public keys required}
+      PACTAGENT_RELAY_REQUESTER_AUTHORS: ${PACTAGENT_RELAY_REQUESTER_AUTHORS:?requester public keys required}
+      PACTAGENT_RELAY_AUTHORITY_AUTHORS: ${PACTAGENT_RELAY_AUTHORITY_AUTHORS:?authority public keys required}
+      PACTAGENT_RELAY_LEGACY_GIFT_IDS: ${PACTAGENT_RELAY_LEGACY_GIFT_IDS:-}
     volumes:
       - strfry-db:/app/strfry-db
-      - ./local/strfry-hosted.conf:/etc/strfry.conf:ro
     healthcheck:
       test: ["CMD", "curl", "-ILfSs", "http://localhost:7777/"]
       interval: 5s
@@ -34,7 +38,6 @@ services:
 
   caddy:
     image: caddy@sha256:14a9c00d4e833ebc2b65d36515b37bde3b73f0b323a2663aaafc88953d8c4e3f
-    container_name: pactagent-hosted-caddy
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     restart: unless-stopped
     depends_on:
@@ -48,7 +51,7 @@ services:
       - PACTAGENT_HOSTED_WSS_HOSTNAME=${PACTAGENT_HOSTED_WSS_HOSTNAME:?PACTAGENT_HOSTED_WSS_HOSTNAME is required for hosted mode}
       - PACTAGENT_STRFRY_UPSTREAM=strfry:7777
     ports:
-      - "8443:443"
+      - "${PACTAGENT_HOSTED_BIND:-0.0.0.0}:${PACTAGENT_HOSTED_WSS_PORT:-8443}:443"
     volumes:
       - caddy-data:/data
       - ./local/${PACTAGENT_HOSTED_CADDYFILE:-Caddyfile-hosted}:/etc/caddy/Caddyfile:ro

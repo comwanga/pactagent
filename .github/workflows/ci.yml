@@ -19,6 +19,51 @@ env:
   NEXT_TELEMETRY_DISABLED: 1
 
 jobs:
+  relay-policy:
+    name: Strfry policy and hosted protocol (Linux / Node 22)
+    runs-on: ubuntu-24.04
+    # Phase deadlines total 28 minutes; leave setup and cleanup headroom.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      # Standard pull_request job: no environments, secrets, OIDC or deployment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.x
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated runner state and check Docker
+        timeout-minutes: 1
+        run: node scripts/issue-62-ci.mjs prepare
+      - name: Install locked dependencies without deployment credentials
+        timeout-minutes: 5
+        run: node scripts/issue-62-ci.mjs install
+      - name: Policy unit regressions
+        timeout-minutes: 3
+        run: node scripts/issue-62-ci.mjs unit
+      - name: Reproduce exposure on disposable pinned stock relay
+        timeout-minutes: 4
+        run: node scripts/issue-62-ci.mjs baseline
+      - name: Build policy image and verify real WSS security and retention
+        timeout-minutes: 8
+        run: node scripts/issue-62-ci.mjs relay
+      - name: Build production requester with webpack
+        timeout-minutes: 6
+        run: node scripts/issue-62-ci.mjs build
+      - name: Complete hosted transaction using disposable FakeWallet mint
+        timeout-minutes: 8
+        run: node scripts/issue-62-ci.mjs hosted
+      - name: Remove only this run's recorded Compose projects and volumes
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: node scripts/issue-62-ci.mjs cleanup
+
   quality:
     name: Lint, type-check, and test
     runs-on: ubuntu-latest
