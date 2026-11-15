@@ -6,14 +6,22 @@ The previous engineering phase established useful deterministic foundations. `Sa
 
 ## Protocol-facing models
 
-`NostrIdentity` contains only a validated public key and public relay URLs. `UnsignedNostrEvent` deliberately excludes `id` and `sig`; `NostrSigner` defines a future signing boundary without accepting or exposing a private key.
+`NostrIdentity` contains only a validated public key and public relay URLs. `UnsignedNostrEvent` deliberately excludes `id` and `sig`; `NostrSigner` defines the implemented signing boundary without accepting or exposing a private key through that interface.
 
-`PontmoreAgentDefinition` models a PIP-00 kind-30360 draft and validates its required tags and minimum versioned content. PIP-00 currently names content fields without fixing their nested value schemas, so PactAgent v1 documents `capabilities.names`, `capabilities.settlement_networks`, string policy references, and string escrow references as application conventions. P001/P002 identifiers and detailed policies remain separate PactAgent fields—not PIP numbers or additions to the protocol.
+`PontmoreAgentDefinition` models PactAgent's legacy kind-30360 wire shape,
+including `capabilities.names`, `capabilities.settlement_networks`, policy
+references, and escrow references. These fields do not match current PIP-00's
+versioned capability array and tags. The comparison is pinned in
+[Architecture](architecture.md#protocol-boundary); #75 tracks alignment.
+P001/P002 identifiers and detailed policies are PactAgent application data,
+not PIP numbers or additions to the protocol.
 
-`PontmoreEscrowDescriptor` models the current PIP-01 public compatibility object.
+`PontmoreEscrowDescriptor` models the implemented legacy PIP-01 compatibility object.
 Its strict allowlisted constructor and parser reject unsupported fields and named
 private settlement material. The public descriptor mirrors the existing
-recoverable PIP-03 refund-trigger timeout; the remaining `CashuEscrowPlan` fields
+refund-trigger timeout convention and retains the literal legacy `pip03` policy
+identifier. PIP-03 is not an active upstream specification, and the descriptor
+lacks current PIP-01's required `expires_at` (#76). The remaining `CashuEscrowPlan` fields
 are application funding/release/refund intent and have no execution method.
 
 `signCashuEscrowDescriptor` accepts the existing `NostrSigner` interface, confirms
@@ -23,9 +31,10 @@ selects the current addressable event, verifies it, and strictly parses it.
 `resolveAgentCashuEscrowDescriptor` follows the protocol-visible address stored in
 the PIP-00 content and `a` tag rather than relying on fixture identity.
 
-`PontmoreSwapRequestContent` and the canonical PIP-02 event-kind registry remain
-as swap-specific declarations. The repository does not attach document-summary
-states or transition semantics to PIP-02.
+`PontmoreSwapRequestContent` and the older 7300–7304/30362 registry are historical
+swap declarations. They are not the current PIP-02 v2 coordination kernel, and
+the document-summary path does not emit those historical swap events. Its
+kind-3921 agreement format remains a PactAgent application convention (#74).
 
 `PactServiceAgreementRoot` is the immutable requester proposal. It binds the two
 signed PIP-00 definitions, compatible signed PIP-01 descriptor, exact
@@ -129,6 +138,9 @@ human budget, checks `document-summary@1` and Cashu compatibility, and returns a
 safe approval or one stable rejection reason. Model rationale is discarded before
 the application result is returned. Timeouts, unavailable models, exceptions,
 malformed output, and contradictory recommendations fail closed.
+The model can decline the deterministically selected offer, acting as a veto.
+It cannot substitute another candidate or amount, and recommending the selected
+offer is not authorization: the deterministic gate must still approve it.
 
 This decision is advisory application data, not a Nostr event, Pontmore PIP,
 agreement authorization, lifecycle transition, completion decision, or Cashu

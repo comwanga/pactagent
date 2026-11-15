@@ -6,7 +6,12 @@ whether the mechanism is compatible; it does not hold or move funds.
 
 ## Public wire shape
 
-The descriptor content implemented by PactAgent is:
+The following is PactAgent's implemented **legacy v1 wire shape**, not the
+current Pontmore PIP-01 schema. The protocol comparison is pinned in
+[Architecture](architecture.md#protocol-boundary). Current PIP-01 requires
+`expires_at` and places service behavior in a referenced schema or coordination
+profile. This implementation instead retains the fields below; alignment is
+tracked in #76. No wire-format migration is performed here.
 
 ```json
 {
@@ -37,17 +42,16 @@ The event has one stable `d` tag and a `network` index tag:
 ["network", "cashu"]
 ```
 
-PIP-01 standardizes the minimum top-level content, `pip03` policy identifier,
-network declaration, funding cardinality, and addressable event. Draft PIP-01
-requires a declared fallback for any advertised timeout but does not currently
-standardize the timeout JSON field names. The nested `dispute_rules.timeout`
-object above is therefore a versioned PactAgent convention that directly mirrors
-the project's existing PIP-03 timeout policy. It is not presented as a new
-Pontmore-standard field.
+The `pip03` policy identifier, funding cardinality, `updated_at`,
+`reference_format`, `network` tag, and nested `dispute_rules.timeout` above belong
+to the implemented legacy format. PIP-03 has been removed upstream. These values
+describe PactAgent's supported compatibility and timeout conventions; they do
+not establish conformance to current PIP-01 or provide a dispute adjudicator.
 
 PactAgent currently supports one Cashu network entry, 1-of-1 funding, the `pip03`
-policy, a refund-trigger timeout, and `opaque_service_reference`. It does not add
-an optional PIP-01 service-schema pointer because no escrow service is implemented.
+policy identifier, a refund-trigger timeout, and `opaque_service_reference`. This
+descriptor has no `service.schema` pointer. Cashu settlement is implemented as an
+internal application boundary, not as a current PIP-01-advertised service API.
 
 ## PIP-00 reference and resolution
 
@@ -57,7 +61,8 @@ The descriptor's Nostr address is:
 30361:<descriptor-author-pubkey>:<d-tag-value>
 ```
 
-A PIP-00 definition stores that address in both `content.escrow` and its `a` tag.
+The implemented legacy PIP-00 definition stores that address in both
+`content.escrow` and its `a` tag; current PIP-00 does not use that content shape.
 Resolution parses the address, queries the relay with kind `30361`, the referenced
 author, and the referenced `d` value, then validates the current matching event.
 The relationship therefore survives serialization and relay transport and is not
@@ -99,5 +104,5 @@ and do not include rejected payloads or transport internals.
 
 The public descriptor contains no token creation, redemption, swapping, proof
 storage, funding, release, refund, wallet, mint connection, private task transport,
-or dispute adjudication behavior. Those remain later settlement and transport
-issues.
+or dispute adjudication behavior. Settlement and private transport are separate
+implemented components; the descriptor itself grants no economic authority.

@@ -13,10 +13,14 @@ design discussion, documentation, tests, and code.
 - Never post private keys, credentials, Cashu tokens, private documents, or other
   sensitive data in an issue, test fixture, commit, or pull request.
 
-PactAgent is currently a deterministic, local foundation. Relay publishing, event
-signing, AI execution, mint connections, and real-funds movement are outside the
-current implementation. Changes in those areas require explicit design and
-security review before implementation.
+PactAgent implements relay publication, event signing, private task transport,
+optional model-assisted requester decisions, and Cashu mint operations in local
+and hosted compositions. Deterministic policy remains the authorization boundary;
+model output can veto a candidate but cannot authorize an economic action.
+Changes to these boundaries require explicit design and security review. Use
+synthetic fixtures by default; configured mint access can move ecash, and neither
+the name `live` nor a configured URL establishes that it has no monetary value.
+Production financial use remains unsupported.
 
 ## Set up the project
 
@@ -38,7 +42,7 @@ the lockfile.
 4. Update documentation when interfaces, assumptions, or workflows change.
 5. Preserve the project's trust boundary: deterministic policy authorizes
    economic actions, public protocol models contain no private payloads, and key
-   material is not exposed to an AI or application layer.
+   material stays server-side, outside models, browser clients, and public events.
 
 Follow the existing TypeScript and React style. Prefer explicit domain types,
 deterministic behavior, and fixtures that do not depend on networks, credentials,

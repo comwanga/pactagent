@@ -1,10 +1,12 @@
 # PactAgent service agreements
 
 This document defines PactAgent application conventions implemented for issue
-#10. They are not Pontmore PIPs. Pontmore PIP-00 remains the identity/discovery
-source, PIP-01 remains the escrow compatibility surface, PIP-02 remains
-swap-specific, and PIP-03 remains associated with Pontmore swap dispute/timeout
-policy.
+#10. They are not Pontmore PIPs. The implementation retains historical
+PIP-00/PIP-01 wire shapes and the PactAgent kind-3921 agreement format. Current
+Pontmore PIP-02 v2 defines generalized coordination roots/actions, not the removed
+swap-specific PIP-02; PIP-03 has also been removed. See the
+[pinned protocol comparison](architecture.md#protocol-boundary). The future
+service-agreement profile is tracked in #74; no migration is implied here.
 
 ## Event kind and indexing
 

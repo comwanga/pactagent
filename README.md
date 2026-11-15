@@ -16,7 +16,7 @@ The integrated runtime executes the `document-summary@1` path end to end:
 Requester
   → Nostr provider discovery
   → signed 350-sat service offer
-  → deterministic or model-backed requester recommendation
+  → deterministic selection and optional model review
   → deterministic requester authorization
   → service agreement
   → Cashu escrow funding
@@ -27,10 +27,12 @@ Requester
 ```
 
 The requester-decision adapter is configurable: deterministic mode remains the default for local
-development and CI, while model mode uses a configured OpenAI model for an advisory recommendation.
-The bounded requester instruction is sent to that provider in model mode. The model cannot sign,
-fund, release, reconcile, or authorize. Deterministic policy independently decides whether an
-economic action is authorized, and the runtime remains authoritative for lifecycle and recovery.
+development and CI. In model mode, a configured OpenAI model reviews the already-selected offer
+and can decline it, acting as a veto. A recommendation must preserve that provider, its references,
+and its price; it cannot select another offer or override deterministic policy. The bounded
+requester instruction is sent to the configured model provider. The model cannot sign, fund,
+release, reconcile, or authorize. Deterministic policy decides whether an economic action is
+authorized, and the runtime remains authoritative for lifecycle and recovery.
 Public agreement events and API projections are separated from private task, result, Cashu, key,
 and credential material.
 
@@ -45,30 +47,49 @@ The local integration has been exercised end to end with a local Strfry relay, a
 proxy, the Testnut Cashu test mint, and durable SQLite state. The verified proof-of-concept uses an
 exact 350-sat service offer and demonstrates:
 
-- exactly-once funding and release;
+- funding and release coordinated through stable persisted operation identities;
 - a final `settled` lifecycle;
 - authorized private-result retrieval and safe terminal reporting;
-- durable restart and reload without repeating economic work.
+- durable restart and reload recovery from persisted transaction state.
 
 Testnut is test infrastructure and bearer test ecash is still single-use. It is not a production
 mint or production-money environment.
 
+The recovery design targets **at-most-once economic effect per persisted operation**,
+**at-least-once publication attempts on recovery**, and an **idempotent delivery identity**
+for recipient deduplication. These are not distributed exactly-once delivery or production
+availability guarantees. Ambiguous mint submissions require reconciliation; ALL-UNSPENT alone
+does not cancel an in-flight request or release its exposure. Durable state and correct mint
+behavior remain assumptions; see [custody and guarantee limits](docs/architecture.md#custody-and-economic-guarantees).
+Completion verification binds the private terms and result reference and checks the summary's
+structure, not its factual accuracy or fairness to an independent provider.
+
 ## Live Demo deployment
 
-A production-like Demo environment runs publicly on Railway
-([Issue #39 deployment docs](docs/issue-39-railway-deployment.md)):
+The configured public demo endpoints are on Railway
+([deployment documentation](docs/issue-39-railway-deployment.md)):
 
 - Public PactAgent Demo: `https://pactagent-web-production.up.railway.app`
 - Public relay (WSS): `wss://pactagent-relay-production.up.railway.app`
 
-Demo sats have no monetary value. Open the public URL and click **Start Demo**
-for the zero-setup judge flow. Read-only production checks:
+**Status (last verified: 2026-11-15 UTC):** the web root, `/api/health`, and relay
+HTTPS root returned HTTP 200; a read-only WSS query completed with an event and EOSE.
+The health response reported `runtimeInitialized: false` in the responding process.
+These probes establish reachability and a working public relay read, not authenticated
+runtime readiness, a verified deployed source revision, or successful economic execution.
+The 2026-10-22 audit's 404 observation is historical, not the current status. Monitoring
+and ongoing status maintenance are tracked in [#91](https://github.com/comwanga/pactagent/issues/91).
+
+Demo sats have no monetary value. **Start Demo** is the intended demo entry point;
+the dated reachability check did not run that flow. Operator diagnostics (requiring
+access to the linked Railway project's configuration):
 
 ```sh
 npm run railway:doctor
 ```
 
-and the full public acceptance:
+The full public acceptance is separately opt-in and creates demo economic activity;
+it is not a read-only availability probe:
 
 ```sh
 npm run railway:acceptance
@@ -78,15 +99,15 @@ npm run railway:acceptance
 ## Architecture
 
 ```text
-Requester UI â†’ explicit requester BFF â†’ authenticated HTTP API
-        │
-        ▼
+Requester UI -> explicit requester BFF -> authenticated HTTP API
+        |
+        v
 PactAgent runtime
-        │
-        ├── Nostr → local WSS relay → Strfry
-        ├── private task/result → NIP-59 boundary
-        ├── Cashu → configured test mint
-        └── durable state → SQLite
+        |
+        +-- Nostr -> configured WSS relay -> Strfry
+        +-- private task/result -> NIP-59 boundary
+        +-- Cashu -> configured mint (test/demo use only)
+        +-- durable state -> SQLite
 ```
 
 See the [architecture](docs/architecture.md), [runtime/API](docs/pactagent-runtime.md), and
@@ -138,10 +159,13 @@ state-reset details.
 ## Test lanes
 
 GitHub Actions runs these on every pull request to `main`:
-- `CI`: the deterministic lane, lint, type-check, the production build, and the client-bundle privacy audit (`npm run audit:client-bundle`);
+- `CI`: the deterministic lane, lint, type-check, the production build, the client-bundle privacy audit (`npm run audit:client-bundle`), and the #62 isolated Linux relay/FakeWallet hosted-protocol lane;
 - `Acceptance`: the process lane and the requester browser lane.
 
-The economic and live lanes run only locally, by explicit opt-in.
+The #62 lane exercises disposable containers without production credentials or
+funds. Tests against configured external mints or hosted deployments remain
+separately opt-in. Report test results per command, lane, and revision, including
+skips; a combined count is not evidence that every live lane ran successfully.
 
 ### Deterministic
 
@@ -235,9 +259,13 @@ trust path after startup. `runtime:start:local` loads the configuration and supp
 ## Current limitations
 
 PactAgent remains an integrated proof-of-concept and test environment, not production financial
-software. The runtime uses one explicitly configured Cashu test mint, has no production wallet or
-automatic Lightning acquisition of ecash, and has no real-sats/production mode. Developers provide
-their own isolated test keys, API token, and Testnut ecash. The requester-facing session boundary is
+software. Its configured mint path imports already-acquired ecash; there is no production wallet
+or automatic Lightning acquisition. The existing economic mode named `live` is not production
+approval or proof that configured ecash is valueless: operators must select and isolate test
+mints and credentials. The requester runtime controls the escrow-authority signer and both
+NUT-11 spending keys, so providers trust operator-controlled custody, not trust-minimized escrow.
+See the [custody assumptions](docs/architecture.md#custody-and-economic-guarantees).
+The requester-facing session boundary is
 PoC transaction ownership rather than production authentication or a multi-user account system.
 The initial optional model integration supports OpenAI's Responses API; generic provider routing,
 local-model hosting, and production credential management remain out of scope.
