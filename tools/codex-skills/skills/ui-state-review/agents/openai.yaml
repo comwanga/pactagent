@@ -1,0 +1,6 @@
+interface:
+  display_name: "UI State and Recovery Review"
+  short_description: "Trace async UI states, recovery, and safe test plans"
+  default_prompt: "Use $ui-state-review to review this existing journey for loading, errors, authorization, and recovery without implementing changes."
+policy:
+  allow_implicit_invocation: true
