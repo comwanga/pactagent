@@ -1,5 +1,8 @@
 # Engineering pivot: Minmo Maker to PactAgent
 
+This is the historical pivot rationale. Implementation-status notes below belong
+to that phase; see the [README](../README.md) for the present application scope.
+
 ## Original direction
 
 Minmo Maker began as a balanced and profitable Lightning swap-making policy layer. Phase 1 verified a proprietary SDK boundary, and Phase 2 built careful integer-safe maker inventory and projection models around its read-only market data.
@@ -12,7 +15,13 @@ This was productive engineering discovery, not discarded effort. Inspecting the 
 
 ## Why Pontmore
 
-Pontmore provides an inspectable, Nostr-native protocol family for public agent discovery, escrow compatibility, append-only lifecycle events, and dispute boundaries. PactAgent builds on PIP-00 through PIP-03 and treats those documents—not example applications—as authoritative. PactAgent does not claim to be Pontmore and does not introduce P001/P002 as PIPs.
+Pontmore provides a Nostr-native specification family for capability discovery,
+escrow compatibility, and coordination event chains. The pivot used the older
+PIP-00/PIP-01 formats and swap/dispute drafts. The old swap-specific PIP-02 and
+PIP-03 were subsequently removed; the current draft series is PIP-00, PIP-01,
+and generalized PIP-02 v2. See the [pinned comparison](architecture.md#protocol-boundary).
+Existing PactAgent wire formats are not automatically current-format conformance.
+P001/P002 remain application roles, not PIPs.
 
 ## Why Nostr identity
 
@@ -20,11 +29,23 @@ PIP-00 makes the Nostr public key the canonical agent identity. That lets capabi
 
 ## Why Cashu escrow
 
-Cashu offers an ecash settlement path suited to machine-sized payments. Current PIP-01 defines `cashu_escrow` as a canonical compatibility subtype using NUT-11 conditions, refund pubkeys, and locktime at the service layer. PactAgent now includes a network-capable test-mint adapter, durable private proof custody, NUT-11 lock/release/refund operations, and an agreement-bound settlement coordinator. It does not invent token formats or expose raw tokens. Funding currently imports already-acquired proofs; Lightning mint-quote acquisition and a production wallet remain out of scope.
+Cashu offers an ecash settlement path suited to machine-sized payments. Current
+PIP-01 identifies `cashu_escrow` as a compatibility type; service schemas and
+coordination profiles own spending and recovery behavior. PactAgent's selected
+implementation uses NUT-11 conditions, refund keys, locktime, private proof stores,
+and an agreement-bound coordinator. Its requester runtime controls the authority
+signer and both spending keys, so this is operator-controlled custody, not
+trust-minimized escrow. See the [custody assumptions](architecture.md#custody-and-economic-guarantees).
+Funding imports already-acquired proofs; Lightning acquisition and a production
+wallet remain outside the supported path.
 
 ## Why bounded AI
 
-AI becomes an economic proposal layer: discover, compare, evaluate, and recommend. Deterministic policy remains authoritative over capability allowlists, price and budget ceilings, duration, settlement network, escrow compatibility, completion checks, and signer access. The model never receives unrestricted wallet or secret-key authority.
+The requester model evaluates an already deterministically selected offer. It
+can veto proceeding, but cannot choose another provider or price or authorize
+spending. Deterministic policy remains authoritative over capability, budget,
+duration, settlement network, escrow compatibility, completion, and signer access.
+The model receives neither signing keys nor wallet authority.
 
 ## Retained code
 

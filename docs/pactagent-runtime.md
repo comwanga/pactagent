@@ -133,16 +133,35 @@ duplicated.
 
 Resume reconstructs the agreement from the persisted root event id plus the
 relay history, then re-invokes the workflow resume path, which delegates all
-economic operations to the #13 coordinator's idempotent operations. Economic
-work is therefore executed exactly once across restarts; an ambiguous mint
-outcome stays `reconciliation_required` and is reconciled, never blindly
-retried.
+economic operations to the #13 coordinator's idempotent operations. Stable
+operation identities, persisted prepared swaps, and the mint's spent-once behavior
+target at-most-once economic effects per persisted operation. For the escrow
+coordinator's `escrow_funded`, `settled`, and `refunded` transitions,
+`pendingTransition` persists the signed event for reuse on publication retries
+during recovery (at-least-once publication attempts). Requester `result_verified`
+and `release_authorized` methods may construct and sign new events when invoked
+again. Identical signed-event identity or publication deduplication is not
+guaranteed across every lifecycle retry. Private beneficiary callbacks reuse a stable delivery ID
+which the recipient must deduplicate. Neither repeated publication nor a stable
+delivery ID provides distributed exactly-once delivery or eventual availability.
+These properties depend on retained durable state and the configured mint; see
+the [custody and guarantee limits](architecture.md#custody-and-economic-guarantees).
 
-If NUT-07 proves every input UNSPENT, reconciliation resolves the attempt as
-not submitted, removes prepared material, releases exposure, and returns the
-current authoritative non-funded transaction status. It does not create a new
-funding attempt. Existing submitted operations remain recoverable after expiry,
-while genuinely fresh preparation stays prohibited.
+An ambiguous submission retains its prepared operation and exposure until a
+conclusive outcome is established. An
+[NUT-07](https://github.com/cashubtc/nuts/blob/1363de413294e2ef3a57b16950f9506af38fffc2/07.md)
+ALL-UNSPENT observation is not a cancellation fence: the original request can
+still complete after the observation. Inspection-only reconciliation does not
+replay the swap or free its exposure on that evidence alone. Where the recovery
+path permits replay, it re-inspects and submits only the exact persisted inputs
+and blinded outputs, never a newly prepared funding operation. If all inputs
+are spent, recovery attempts
+[NUT-09](https://github.com/cashubtc/nuts/blob/1363de413294e2ef3a57b16950f9506af38fffc2/09.md)
+output restoration; inconclusive evidence remains `reconciliation_required`.
+The advertised-action mismatch for ALL-UNSPENT funding is still tracked in #94;
+this documentation does not change that interface. Existing submitted operations
+can still be inspected after expiry, while fresh preparation remains prohibited;
+replay and spending remain subject to the operation's state and locktime rules.
 
 ## Bootstrap and live configuration
 

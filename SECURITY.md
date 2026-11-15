@@ -1,8 +1,17 @@
 # Security Policy
 
-PactAgent deals with protocols that may eventually control identities, contracts,
-ecash, and Bitcoin. Treat security and privacy defects carefully even though the
-current project does not connect to mints, sign events, or move real funds.
+PactAgent signs and publishes Nostr events, exchanges private task/result data,
+and connects to configured Cashu mints to lock, release, and refund ecash. Runtime
+compositions hold signing/spending keys and durable economic state; the requester
+API handles private inputs and session ownership through a server-only runtime
+transport. These are implemented attack surfaces, even when exercised with test
+ecash or demo balances.
+
+The requester runtime currently controls the escrow-authority signer and both
+NUT-11 spending keys. This is operator-controlled custody, not trust-minimized
+escrow; see the [custody assumptions](docs/architecture.md#custody-and-economic-guarantees).
+The project does not claim production financial safety. The name `live` is a
+configuration mode, not proof that a mint or its ecash is safe for testing.
 
 ## Supported versions
 
