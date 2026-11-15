@@ -1,0 +1,6 @@
+interface:
+  display_name: "Accessibility Review"
+  short_description: "Review keyboard, focus, semantics, and form errors"
+  default_prompt: "Use $fixing-accessibility to review the specified component; report evidence and propose minimal fixes without editing files."
+policy:
+  allow_implicit_invocation: true

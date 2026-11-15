@@ -1,0 +1,2 @@
+# Preserve reviewed payload bytes so manifest hashes survive checkout on all OSes.
+skills/** -text

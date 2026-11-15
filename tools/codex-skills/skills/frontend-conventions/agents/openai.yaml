@@ -1,0 +1,6 @@
+interface:
+  display_name: "Existing Frontend Conventions"
+  short_description: "Preserve design tokens and component conventions"
+  default_prompt: "Use $frontend-conventions to review this existing UI against its local design and component conventions without editing files."
+policy:
+  allow_implicit_invocation: true

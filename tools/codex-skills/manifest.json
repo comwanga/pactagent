@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "collection_version": "1.0.1",
+  "reviewed_on": "2026-11-15",
+  "default_scope": "user",
+  "default_location": "~/.agents/skills",
+  "source_policy": "Offline reviewed snapshots; no automatic upstream updates. Hashes are change detection, not signatures.",
+  "skills": [
+    {
+      "name": "fixing-accessibility",
+      "version": "1.0.0-local.1",
+      "kind": "adapted-external",
+      "upstream": {
+        "repository": "ibelick/ui-skills",
+        "revision": "65cc0edb4f64fe8bfe7e9c59466074de25bece76",
+        "path": "skills/fixing-accessibility",
+        "skill_sha256": "549261e8a53b53a1a20c0ddbf736821e5fc0876ad82eee76e0efab8e9ee9dadf",
+        "license_sha256": "c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b"
+      },
+      "license": "MIT",
+      "changes": [
+        "Codex dollar invocation syntax and task-scoped activation",
+        "Read-only review mode, repository precedence, evidence and privacy boundaries",
+        "Contextual keyboard/heading rules and non-duplicated error announcements"
+      ],
+      "files": {
+        "agents/openai.yaml": "4d7dc789ddc1a3875f7c6f7dc311f3b90a628d3ade8e6a70a1f2c843413ef97f",
+        "LICENSE": "c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b",
+        "PROVENANCE.md": "fe125502d0041fffa25bddb5286919606d91de73dd48cf77089dfc7fe0f54dd0",
+        "SKILL.md": "47461b486537bcfaddac3b39219ff6a2478fcf9698cc4f5c65b4e9e56e5295ae"
+      }
+    },
+    {
+      "name": "fixing-motion-performance",
+      "version": "1.0.0-local.1",
+      "kind": "adapted-external",
+      "upstream": {
+        "repository": "ibelick/ui-skills",
+        "revision": "65cc0edb4f64fe8bfe7e9c59466074de25bece76",
+        "path": "skills/fixing-motion-performance",
+        "skill_sha256": "0a2d654902bc04263ce68c8c02967ef03f17b482e855360a5463211d99d7baa9",
+        "license_sha256": "c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b"
+      },
+      "license": "MIT",
+      "changes": [
+        "Codex dollar invocation syntax and task-scoped activation",
+        "Read-only review mode, repository precedence, evidence and privacy boundaries",
+        "Reduced-motion behavior, measured performance findings, qualified blur/layer heuristics, illustrative-example warning"
+      ],
+      "files": {
+        "agents/openai.yaml": "ec9d012fb5fcfdce97188241f92262c2c90a350270c7dea9c60f7bd1a8243c46",
+        "LICENSE": "c615621c4cc1676ccde194e7a01b6469ba477780251bd71e007fc473a49c2c2b",
+        "PROVENANCE.md": "16be7a20f93d0b43d9e7c7e2040b68ee1ffe1c5ad2855bcffe6efb37ed824fc7",
+        "SKILL.md": "9973a0249149febc1f126290e82e9d312e62436304b6e453cd65ee7289d4bea8"
+      }
+    },
+    {
+      "name": "frontend-conventions",
+      "version": "1.0.0",
+      "kind": "original-local",
+      "license": "MIT",
+      "files": {
+        "agents/openai.yaml": "e0e7430e4ba12eb3d5fc83c315529e68781f186973706b6ff67fc45309273f37",
+        "LICENSE": "a1fd9e0c138d68ed6b243816592f901c34620d2407946734e6ed169f416af7d4",
+        "PROVENANCE.md": "4a6ab3e9787339bf31fa6ca34016263074b51655183ae2ac09ede0e0e4d1b493",
+        "SKILL.md": "a9ccfc74a1ef26563ec2a5c9f7b91f333a5fce1ed7354cc8aead3bb4e029d727"
+      }
+    },
+    {
+      "name": "ui-state-review",
+      "version": "1.0.0",
+      "kind": "original-local",
+      "license": "MIT",
+      "files": {
+        "agents/openai.yaml": "951780d9ed8f2a27dadca8d742a254677d95c5a0b2a46cace24e32e8a96aed22",
+        "LICENSE": "a1fd9e0c138d68ed6b243816592f901c34620d2407946734e6ed169f416af7d4",
+        "PROVENANCE.md": "4a6ab3e9787339bf31fa6ca34016263074b51655183ae2ac09ede0e0e4d1b493",
+        "SKILL.md": "190550ed062444fe05aca5794e565d7bd9caeff3fa4fd41a461f94643a2a2798"
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Motion Performance Review"
+  short_description: "Review motion cost and reduced-motion behavior"
+  default_prompt: "Use $fixing-motion-performance to review existing motion and reduced-motion behavior without editing files."
+policy:
+  allow_implicit_invocation: true
