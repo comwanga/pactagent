@@ -7,4 +7,4 @@
 # Mint state lives on the Railway volume mounted at /app/data
 # (MINT_DATABASE=/app/data/mint).
 
-FROM cashubtc/nutshell:0.21.0@sha256:beed25e291357368e35e1698bf2e4645d97ed435232a8f8ff6501c77d67c0b90
+FROM cashubtc/nutshell:0.22.1@sha256:05b536e0e3d6beee75417ece319a3f89a687d34cfb3cc12c6b19d253104b450e
