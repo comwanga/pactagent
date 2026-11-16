@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      nextjs:
+        patterns: ["next", "eslint-config-next", "@next/*"]
+        update-types: [minor, patch]
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      runner-setup:
+        patterns: ["actions/checkout", "actions/setup-node", "actions/setup-python"]
+        update-types: [minor, patch]
+
+  # All four image manifests use the supported *.Dockerfile naming convention.
+  # Keep financial and relay infrastructure updates separate for review.
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
