@@ -1,3 +1,4 @@
+import { admissionHeaders } from "@/lib/admission-control";
 import { NextResponse } from "next/server";
 
 import { logRuntimeApiError } from "../support";
@@ -45,6 +46,6 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ ok: true, generation: result.generation }, { headers: NO_STORE });
   } catch (error) {
     logRuntimeApiError("reset-demo", error);
-    return NextResponse.json(toApiError(error), { status: apiStatusForError(error), headers: NO_STORE });
+    return NextResponse.json(toApiError(error), { status: apiStatusForError(error), headers: { ...NO_STORE, ...admissionHeaders(error) } });
   }
 }

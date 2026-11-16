@@ -1,3 +1,4 @@
+import { admissionHeaders } from "@/lib/admission-control";
 import { NextResponse } from "next/server";
 
 import { sats } from "@/domain/money";
@@ -24,7 +25,7 @@ function apiToken(): string | undefined {
 }
 
 function jsonError(error: unknown): NextResponse {
-  return transactionJson(toApiError(error), { status: apiStatusForError(error) });
+  return transactionJson(toApiError(error), { status: apiStatusForError(error), headers: admissionHeaders(error) });
 }
 
 export async function POST(request: Request): Promise<NextResponse> {

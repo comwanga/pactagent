@@ -1,4 +1,6 @@
 import "server-only";
+import { isAdmissionLimitError, admissionHeaders } from "@/lib/admission-control";
+import { admitRequester } from "@/lib/requester-admission.server";
 
 import { NextResponse } from "next/server";
 
@@ -17,7 +19,6 @@ import {
   type RequesterTransportResponse,
 } from "@/lib/requester-runtime-transport.server";
 import { requesterSessionStoreFromEnv } from "@/lib/requester-session-store.server";
-import { readRequesterSession } from "@/lib/requester-session.server";
 
 // JSON may escape one input byte as six ASCII bytes (for example, control
 // characters). This is a wire limit only; the contract parser enforces the
@@ -103,11 +104,16 @@ export function runtimeTransport(fundingReferenceOverride?: string): RequesterRu
 /** Checks requester ownership before a route constructs or calls the #33 transport. */
 export function requesterOwnsTransaction(request: Request, transactionId: string): boolean {
   const store = requesterSessionStoreFromEnv();
-  const session = readRequesterSession(request, store);
+  const session = admitRequester(request, store, { recovery: true });
   return session !== undefined && store.ownsTransaction(session.hash, transactionId, Date.now());
 }
 
 export function unavailableRequester(error: unknown): NextResponse {
+  if (isAdmissionLimitError(error)) {
+    return requesterJson({ error: error.message, code: error.code } satisfies RequesterApiErrorDto, {
+      status: 429, headers: admissionHeaders(error),
+    });
+  }
   const status = error instanceof RequesterTransportConfigurationError ? 503 : 500;
   // Server-side operator log only; responses remain redacted. Error messages
   // produced by the runtime are sanitized by design (no keys, proofs, or
@@ -123,7 +129,10 @@ export function unavailableRequester(error: unknown): NextResponse {
 }
 
 export function transportResponse<T>(result: RequesterTransportResponse<T>): NextResponse {
-  return requesterJson(result.body, { status: result.status });
+  return requesterJson(result.body, {
+    status: result.status,
+    headers: !result.ok && result.status === 429 ? { "Retry-After": String(result.retryAfterSeconds ?? 1) } : {},
+  });
 }
 
 export async function readRequesterCreateInput(request: Request): Promise<RequesterTransactionCreateInput> {

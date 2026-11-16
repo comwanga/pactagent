@@ -3,6 +3,7 @@ import "server-only";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ADMISSION_DAY_MS, AdmissionLimitError, isAdmissionLimitError, readAdmissionLimits, resetRequesterBudgetsForTesting } from "./admission-control";
 
 const SESSION_HASH = /^[a-f0-9]{64}$/;
 const TRANSACTION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$/;
@@ -53,6 +54,7 @@ function validTimestamp(value: number): number {
  * one-way SHA-256 digest.
  */
 export function createSqliteRequesterSessionStore(databasePath: string): RequesterSessionStore {
+  const dailyLimit = readAdmissionLimits().sessionsPerDay;
   if (typeof databasePath !== "string" || databasePath.length === 0 || databasePath === ":memory:") {
     throw new RequesterSessionStoreError();
   }
@@ -66,6 +68,10 @@ export function createSqliteRequesterSessionStore(databasePath: string): Request
       PRAGMA synchronous = FULL;
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 1000;
+      CREATE TABLE IF NOT EXISTS requester_creation_usage (
+        day INTEGER PRIMARY KEY,
+        count INTEGER NOT NULL CHECK (count >= 0)
+      );
       CREATE TABLE IF NOT EXISTS requester_sessions (
         session_hash TEXT PRIMARY KEY,
         created_at_ms INTEGER NOT NULL,
@@ -94,6 +100,9 @@ export function createSqliteRequesterSessionStore(databasePath: string): Request
   const cleanupExpired = database.prepare(
     "DELETE FROM requester_sessions WHERE expires_at_ms <= ?",
   );
+  const readUsage = database.prepare("SELECT day, count FROM requester_creation_usage ORDER BY day DESC LIMIT 1");
+  const writeUsage = database.prepare("INSERT INTO requester_creation_usage(day, count) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET count = excluded.count");
+  const cleanupUsage = database.prepare("DELETE FROM requester_creation_usage WHERE day < ?");
   const insertSession = database.prepare(`
     INSERT INTO requester_sessions (session_hash, created_at_ms, expires_at_ms, current_transaction_id)
     VALUES (?, ?, ?, NULL)
@@ -157,9 +166,24 @@ export function createSqliteRequesterSessionStore(databasePath: string): Request
       const expires = validTimestamp(expiresAtMs);
       if (expires <= created) throw new RequesterSessionStoreError();
       try {
+        database.exec("BEGIN IMMEDIATE");
+        const day = Math.floor(created / ADMISSION_DAY_MS);
+        const usage = readUsage.get() as { day: number; count: number } | undefined;
+        if (usage && (!Number.isSafeInteger(usage.day) || usage.day < 0 ||
+          !Number.isSafeInteger(usage.count) || usage.count < 0)) {
+          throw new RequesterSessionStoreError();
+        }
+        if (usage && usage.day > day) throw new AdmissionLimitError(((usage.day + 1) * ADMISSION_DAY_MS - created) / 1000);
+        const count = usage?.day === day ? usage.count : 0;
+        if (count >= dailyLimit) throw new AdmissionLimitError(((day + 1) * ADMISSION_DAY_MS - created) / 1000);
         cleanup(created);
         insertSession.run(hash, created, expires);
+        writeUsage.run(day, count + 1);
+        cleanupUsage.run(day - 1);
+        database.exec("COMMIT");
       } catch (error) {
+        try { database.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+        if (isAdmissionLimitError(error)) throw error;
         if (error instanceof RequesterSessionStoreError) throw error;
         throw new RequesterSessionStoreError();
       }
@@ -323,4 +347,5 @@ export function requesterSessionStoreFromEnv(
 /** Test-only dependency seam; production route code always uses the durable environment store. */
 export function configureRequesterSessionStoreForTesting(store: RequesterSessionStore | undefined): void {
   configuredStore = store;
+  resetRequesterBudgetsForTesting();
 }

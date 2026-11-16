@@ -192,6 +192,7 @@ export interface RequesterSafeReport {
 }
 
 export type RequesterApiErrorCode =
+  | "rate_limited"
   | "unauthorized"
   | "invalid_request"
   | "document_too_large"
@@ -319,6 +320,7 @@ const RECONCILIATION_STATES = new Set<RequesterReconciliationState>([
   "refund_reconciliation_required",
 ]);
 const ERROR_CODES = new Set<RequesterApiErrorCode>([
+  "rate_limited",
   "unauthorized",
   "invalid_request",
   "document_too_large",
@@ -689,4 +691,11 @@ export function parseRequesterRecoveryResult(value: unknown): RequesterRecoveryR
   return Object.hasOwn(parsed, "workflowVersion")
     ? parseRequesterSafeReport(parsed)
     : parseRequesterTransactionStatus(parsed);
+}
+
+/** Accept only bounded delta-seconds; never forward arbitrary upstream header text. */
+export function safeRetryAfter(value: string | null): number {
+  if (!value || !/^[1-9][0-9]*$/.test(value)) return 1;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds <= 86_400 ? seconds : 1;
 }

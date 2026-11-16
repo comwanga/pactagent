@@ -1,3 +1,4 @@
+import { admitRequester } from "@/lib/requester-admission.server";
 import { type NextResponse } from "next/server";
 
 import {
@@ -20,6 +21,14 @@ export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<NextResponse> {
   if (!isTrustedRequesterRequest(request)) return unauthorizedRequester();
+  let store;
+  let session;
+  try {
+    store = requesterSessionStoreFromEnv();
+    session = admitRequester(request, store);
+  } catch (error) {
+    return unavailableRequester(error);
+  }
   const idempotencyKey = request.headers.get("idempotency-key");
   if (!idempotencyKey) {
     return requesterJson(
@@ -43,8 +52,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
   try {
-    const store = requesterSessionStoreFromEnv();
-    const session = ensureRequesterSession(request, store);
+    session ??= ensureRequesterSession(request, store);
     const walletKey = store.demoWalletKey(session.hash, Date.now());
     if (process.env.PACTAGENT_ECONOMIC_MODE === "demo" && !walletKey) {
       return attachRequesterSessionCookie(requesterJson(

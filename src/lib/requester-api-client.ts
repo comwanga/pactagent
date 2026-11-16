@@ -2,6 +2,7 @@
 
 import {
   parseRequesterApiError,
+  safeRetryAfter,
   parseRequesterCurrentTransaction,
   parseRequesterCurrentTransactionCleared,
   parseRequesterDemoWallet,
@@ -37,12 +38,14 @@ const TRANSACTION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$/;
 export class RequesterApiClientError extends Error {
   readonly status: number;
   readonly detail: RequesterApiErrorDto;
+  readonly retryAfterSeconds?: number;
 
-  constructor(status: number, detail: RequesterApiErrorDto) {
+  constructor(status: number, detail: RequesterApiErrorDto, retryAfterSeconds?: number) {
     super(detail.error);
     this.name = "RequesterApiClientError";
     this.status = status;
     this.detail = detail;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -148,7 +151,7 @@ export class RequesterApiClient {
     }
     if (!response.ok) {
       try {
-        throw new RequesterApiClientError(response.status, parseRequesterApiError(body));
+        throw new RequesterApiClientError(response.status, parseRequesterApiError(body), response.status === 429 ? safeRetryAfter(response.headers.get("retry-after")) : undefined);
       } catch (error) {
         if (error instanceof RequesterApiClientError) throw error;
         throw new RequesterApiClientError(502, safeInvalidResponse());

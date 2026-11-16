@@ -1,4 +1,5 @@
 import "server-only";
+import { readAdmissionLimits, reserveWalletAllocation } from "./admission-control";
 
 import { getDecodedToken, type Proof } from "@cashu/cashu-ts";
 import { createHash } from "node:crypto";
@@ -856,6 +857,7 @@ export async function createDemoEconomicEnvironment(
   const mintUrl = normalizeCashuMintUrl(config.mintUrl, "demo-loopback", allowedPrivateHosts);
   const stateDirectory = resolve(config.stateDirectory);
   const initialBalanceSats = config.initialBalanceSats ?? 1000;
+  const walletDailyLimit = readAdmissionLimits().walletsPerDay;
 
   if (
     !Number.isSafeInteger(initialBalanceSats) ||
@@ -1218,6 +1220,9 @@ export async function createDemoEconomicEnvironment(
           }
         }
 
+        // Charge only a fresh allocation attempt, after idempotency and unresolved
+        // exposure checks. Retrying durable provisioning never consumes a new cap.
+        await reserveWalletAllocation(privateStore, walletDailyLimit);
         const proofWallet = await getProofWallet();
         const quote = await proofWallet.createMintQuote("bolt11", { amount: initialBalanceSats });
         const provisioning: ProvisioningRecord = {
