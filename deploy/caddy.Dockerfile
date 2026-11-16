@@ -10,6 +10,6 @@
 # The upstream image CMD already runs:
 #   caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
 
-FROM caddy@sha256:14a9c00d4e833ebc2b65d36515b37bde3b73f0b323a2663aaafc88953d8c4e3f
+FROM caddy@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c
 
 COPY local/Caddyfile-railway /etc/caddy/Caddyfile
