@@ -1,3 +1,4 @@
+import { TransactionAdmission } from "./admission-control";
 import { createHash } from "node:crypto";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { deserializeProofs } from "@cashu/cashu-ts";
@@ -356,6 +357,7 @@ function buildRuntime(
   fixture: RuntimeFixture,
   shared: SharedStores,
   options: {
+    transactionAdmission?: TransactionAdmission;
     relay?: MemoryRelay;
     cashu?: FakeCashuPort;
     requesterDecisionSource?: "deterministic" | "model";
@@ -381,6 +383,7 @@ function buildRuntime(
     refundSpendKey: fixture.refundSpendKey,
   };
   const runtime = createPactAgentRuntime({
+    transactionAdmission: options.transactionAdmission,
     identities: fixture.identities,
     dependencies,
     privateStore: shared.privateStore,
@@ -1014,7 +1017,8 @@ describe("PactAgent runtime", () => {
     relay.events.push(...fixture.referenceEvents);
     const cashu = new FakeCashuPort();
     cashu.reconciliationSpend = true;
-    const runtime = buildRuntime(fixture, shared, { relay, cashu }).runtime;
+    // Admit both recovery calls so the economic serialization assertions remain exercised.
+    const runtime = buildRuntime(fixture, shared, { relay, cashu, transactionAdmission: new TransactionAdmission(2, 2) }).runtime;
     await runtime.start();
     await expect(runtime.startTransaction(startInput("concurrent-recovery-0001")))
       .rejects.toMatchObject({ code: "reconciliation_required" });

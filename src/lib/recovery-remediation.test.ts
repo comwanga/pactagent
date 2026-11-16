@@ -1,3 +1,4 @@
+import { TransactionAdmission } from "./admission-control";
 import { createHash } from "node:crypto";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { deserializeProofs } from "@cashu/cashu-ts";
@@ -365,6 +366,7 @@ function buildRuntime(
   fixture: RuntimeFixture,
   shared: SharedStores,
   options: {
+    transactionAdmission?: TransactionAdmission;
     relay?: MemoryRelay;
     cashu?: FakeCashuPort;
     clock?: DeterministicPactAgentClock;
@@ -390,6 +392,7 @@ function buildRuntime(
     refundSpendKey: fixture.refundSpendKey,
   };
   const runtime = createPactAgentRuntime({
+    transactionAdmission: options.transactionAdmission,
     identities: fixture.identities,
     dependencies,
     privateStore: shared.privateStore,
@@ -810,7 +813,8 @@ describe("Pre-#37 recovery remediation", () => {
     const shared = sharedStores();
     const relay = new GiftWrapFailingRelay();
     relay.events.push(...fixture.referenceEvents);
-    const { runtime, clock, cashu } = buildRuntime(fixture, shared, { relay });
+    // Admit both recovery calls so the economic serialization assertions remain exercised.
+    const { runtime, clock, cashu } = buildRuntime(fixture, shared, { relay, transactionAdmission: new TransactionAdmission(2, 2) });
     const idempotencyKey = "concurrent-refund-one-001";
     const id = `txn_${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`;
 
@@ -829,7 +833,8 @@ describe("Pre-#37 recovery remediation", () => {
     const shared = sharedStores();
     const relay = new AlwaysGiftWrapFailingRelay();
     relay.events.push(...fixture.referenceEvents);
-    const { runtime, clock, cashu } = buildRuntime(fixture, shared, { relay });
+    // Admit both recovery calls so the economic serialization assertions remain exercised.
+    const { runtime, clock, cashu } = buildRuntime(fixture, shared, { relay, transactionAdmission: new TransactionAdmission(2, 2) });
     const keys = ["independent-refund-a-001", "independent-refund-b-001"] as const;
     const ids = keys.map(
       (idempotencyKey) => `txn_${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`,

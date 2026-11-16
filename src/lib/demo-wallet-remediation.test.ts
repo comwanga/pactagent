@@ -456,3 +456,39 @@ describe("Issue #37 remediation: provisioning and generation authority", () => {
     }
   });
 });
+
+
+describe("Issue #65 wallet allocation caps", () => {
+  it("counts starts and resets together, preserves idempotency at the cap, and persists across restart", async () => {
+    vi.stubEnv("PACTAGENT_WALLET_ALLOCATIONS_PER_DAY", "2");
+    const stateDirectory = temporaryDirectory(), wallet = proofWallet();
+    let env = await createDemoEconomicEnvironment(config(stateDirectory), factories(wallet));
+    try {
+      const started = await env.startDemoWallet!("quota-wallet");
+      expect(await env.startDemoWallet!("quota-wallet")).toEqual(started);
+      const reset = await env.resetDemoWallet!("quota-wallet", "quota-reset-one");
+      expect(await env.resetDemoWallet!("quota-wallet", "quota-reset-one")).toEqual(reset);
+      await expect(env.resetDemoWallet!("quota-wallet", "quota-reset-two")).rejects.toMatchObject({ code: "rate_limited" });
+      await expect(env.startDemoWallet!("quota-other-wallet")).rejects.toMatchObject({ code: "rate_limited" });
+      expect(wallet.createMintQuote).toHaveBeenCalledTimes(2);
+      env.close();
+      env = await createDemoEconomicEnvironment(config(stateDirectory), factories(wallet));
+      await expect(env.startDemoWallet!("quota-after-restart")).rejects.toMatchObject({ code: "rate_limited" });
+      expect((await env.demoWalletStatus!("quota-wallet")).generation).toBe(2);
+    } finally { env.close(); vi.unstubAllEnvs(); }
+  });
+
+  it("bounds concurrent wallets and charges failed quote attempts without minting", async () => {
+    vi.stubEnv("PACTAGENT_WALLET_ALLOCATIONS_PER_DAY", "1");
+    const wallet = proofWallet();
+    vi.mocked(wallet.createMintQuote).mockRejectedValue(new Error("controlled quote failure"));
+    const env = await createDemoEconomicEnvironment(config(temporaryDirectory()), factories(wallet));
+    try {
+      const results = await Promise.allSettled([env.startDemoWallet!("quota-concurrent-a"), env.startDemoWallet!("quota-concurrent-b")]);
+      expect(results.every(r => r.status === "rejected")).toBe(true);
+      expect(results.filter(r => r.status === "rejected" && r.reason.code === "rate_limited")).toHaveLength(1);
+      expect(wallet.createMintQuote).toHaveBeenCalledTimes(1);
+      expect(wallet.mintProofsBolt11).not.toHaveBeenCalled();
+    } finally { env.close(); vi.unstubAllEnvs(); }
+  });
+});

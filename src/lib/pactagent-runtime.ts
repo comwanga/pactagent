@@ -1,3 +1,4 @@
+import { processTransactionAdmission, type TransactionAdmission } from "./admission-control";
 import { createHash, randomBytes } from "node:crypto";
 import { getEventHash } from "nostr-tools/pure";
 
@@ -75,7 +76,10 @@ export type PactAgentRuntimeErrorCode =
   | "invalid_configuration"
   | "not_running";
 
+const runtimeErrorKey = Symbol.for("pactagent.runtime-error");
+
 export class PactAgentRuntimeError extends Error {
+  readonly [runtimeErrorKey] = true;
   readonly code: PactAgentRuntimeErrorCode;
 
   constructor(code: PactAgentRuntimeErrorCode, message: string) {
@@ -85,7 +89,17 @@ export class PactAgentRuntimeError extends Error {
   }
 }
 
+/** Recognize errors from the process-shared runtime across route bundles. */
+export function isPactAgentRuntimeError(error: unknown): error is PactAgentRuntimeError {
+  return typeof error === "object" && error !== null && runtimeErrorKey in error &&
+    error[runtimeErrorKey] === true && "message" in error && typeof error.message === "string" &&
+    "code" in error && typeof error.code === "string" &&
+    ["invalid_request", "result_not_available", "report_not_available", "transaction_in_progress", "transaction_not_found", "corrupt_record", "invalid_configuration", "not_running"].includes(error.code);
+}
+
 export interface PactAgentRuntimeConfig {
+  /** Explicit injection for deterministic admission tests; production shares the process gate. */
+  readonly transactionAdmission?: TransactionAdmission;
   readonly identities: PactAgentParticipantIdentities;
   readonly dependencies: PactAgentWorkflowDependencies;
   /** Durable private store reused for the transaction recovery records. */
@@ -761,6 +775,7 @@ function resultReferenceFromHistory(history: PactAgreementHistory): string | und
 
 export class PactAgentRuntime {
   readonly #config: PactAgentRuntimeConfig;
+  readonly #admission: TransactionAdmission;
   readonly #decision: ApprovedRequesterDecision;
   readonly #selectedOffer: PactAgentRuntimeSelectedOffer;
   readonly #decisionSource: "deterministic" | "model";
@@ -771,6 +786,7 @@ export class PactAgentRuntime {
 
   constructor(config: PactAgentRuntimeConfig) {
     this.#config = config;
+    this.#admission = config.transactionAdmission ?? processTransactionAdmission();
     this.#decision = buildDecision(config.selectedReferences);
     this.#selectedOffer = buildSelectedOffer(config.selectedReferences);
     this.#decisionSource = config.requesterDecisionSource ?? "deterministic";
@@ -963,10 +979,12 @@ export class PactAgentRuntime {
     const transactionId = deriveTransactionId(idempotencyKey);
     return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
       const existing = await this.#loadRecord(transactionId);
-      const record = existing ?? this.#createInitialRecord(transactionId, idempotencyKey, input);
-      if (!existing) await this.#persistRecord(record);
-      const report = await this.#executeAndPersist(record);
-      return { transactionId, report };
+      return this.#admission.run(existing ? "recovery" : "new", async () => {
+        const record = existing ?? this.#createInitialRecord(transactionId, idempotencyKey, input);
+        if (!existing) await this.#persistRecord(record);
+        const report = await this.#executeAndPersist(record);
+        return { transactionId, report };
+      });
     });
   }
 
@@ -978,52 +996,68 @@ export class PactAgentRuntime {
     this.#ensureRunning();
     const idempotencyKey = validateIdempotencyKey(input.idempotencyKey);
     const transactionId = deriveTransactionId(idempotencyKey);
-    const accepted = await this.#config.privateStore.withExclusiveLock(
-      TRANSACTION_SCOPE,
-      transactionId,
-      async () => {
-        const existing = await this.#loadRecord(transactionId);
-        if (existing) return { record: existing, created: false as const };
-        let fundingReference = input.fundingReference;
-        if (this.#config.economicMode === "demo" && this.#config.bindDemoTransactionFunding) {
+    let pendingRelease: (() => void) | undefined;
+    try {
+      const accepted = await this.#config.privateStore.withExclusiveLock(
+        TRANSACTION_SCOPE,
+        transactionId,
+        async () => {
+          const existing = await this.#loadRecord(transactionId);
+          if (existing) return { record: existing, created: false as const };
+          const release = this.#admission.acquire("new");
+          pendingRelease = release;
           try {
-            const binding = await this.#config.bindDemoTransactionFunding(
-              validateFundingReference(input.fundingReference),
-              transactionId,
-            );
-            fundingReference = binding.fundingReference;
-          } catch (error) {
-            if (error instanceof EconomicEnvironmentError) {
-              throw new PactAgentRuntimeError("invalid_request", "Start Demo before creating a transaction");
+            let fundingReference = input.fundingReference;
+            if (this.#config.economicMode === "demo" && this.#config.bindDemoTransactionFunding) {
+              try {
+                const binding = await this.#config.bindDemoTransactionFunding(
+                  validateFundingReference(input.fundingReference),
+                  transactionId,
+                );
+                fundingReference = binding.fundingReference;
+              } catch (error) {
+                if (error instanceof EconomicEnvironmentError) {
+                  throw new PactAgentRuntimeError("invalid_request", "Start Demo before creating a transaction");
+                }
+                throw error;
+              }
             }
+            const record = this.#createInitialRecord(transactionId, idempotencyKey, input, fundingReference);
+            // The transaction identity is durable before execution can publish or
+            // perform any economic work.
+            try {
+              await this.#persistRecord(record);
+            } catch (error) {
+              if (fundingReference !== input.fundingReference && this.#config.finalizeDemoTransaction) {
+                try {
+                  await this.#config.finalizeDemoTransaction(
+                    fundingReference,
+                    transactionId,
+                    "resolved_not_funded",
+                  );
+                } catch {
+                  // The durable generation binding deliberately remains visible
+                  // and blocks Reset when cleanup cannot be proven complete.
+                }
+              }
+              throw error;
+            }
+            return { record, created: true as const, release };
+          } catch (error) {
+            release();
             throw error;
           }
-        }
-        const record = this.#createInitialRecord(transactionId, idempotencyKey, input, fundingReference);
-        // The transaction identity is durable before execution can publish or
-        // perform any economic work.
-        try {
-          await this.#persistRecord(record);
-        } catch (error) {
-          if (fundingReference !== input.fundingReference && this.#config.finalizeDemoTransaction) {
-            try {
-              await this.#config.finalizeDemoTransaction(
-                fundingReference,
-                transactionId,
-                "resolved_not_funded",
-              );
-            } catch {
-              // The durable generation binding deliberately remains visible
-              // and blocks Reset when cleanup cannot be proven complete.
-            }
-          }
-          throw error;
-        }
-        return { record, created: true as const };
-      },
-    );
-    if (accepted.created) this.#scheduleExecution(accepted.record);
-    return Object.freeze({ transactionId });
+        },
+      );
+      if (accepted.created) {
+        this.#scheduleExecution(accepted.record, accepted.release);
+        pendingRelease = undefined; // Ownership transferred only after the lock wrapper completed.
+      }
+      return Object.freeze({ transactionId });
+    } finally {
+      // A durable-store lease check may throw after its operation callback returns.
+      pendingRelease?.();
+    }
   }
 
   #createInitialRecord(
@@ -1058,8 +1092,8 @@ export class PactAgentRuntime {
     });
   }
 
-  #scheduleExecution(record: DurableTransactionRecord): void {
-    if (this.#executions.has(record.transactionId)) return;
+  #scheduleExecution(record: DurableTransactionRecord, release: () => void): void {
+    if (this.#executions.has(record.transactionId)) { release(); return; }
     const execution = Promise.resolve()
       .then(async () => {
         // Just-in-time exposure relief: before a newly accepted transaction
@@ -1068,7 +1102,7 @@ export class PactAgentRuntime {
         // this funding. Reclaim never touches this not-yet-funded transaction
         // and fails closed internally, so it is always safe to run first.
         try {
-          await this.reclaimExpiredFundedEscrows();
+          await this.#reclaimExpiredFundedEscrows();
         } catch {
           // Funding proceeds regardless; reclaim is strictly additive relief.
         }
@@ -1087,6 +1121,7 @@ export class PactAgentRuntime {
       })
       .finally(() => {
         this.#executions.delete(record.transactionId);
+        release();
       });
     this.#executions.set(record.transactionId, execution);
   }
@@ -1387,13 +1422,15 @@ export class PactAgentRuntime {
     if (this.#executions.has(transactionId)) {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
-    await this.#ensureRelayConnected();
-    return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
-      const record = await this.#loadRecord(transactionId);
-      if (!record) {
-        throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
-      }
-      return this.#executeAndPersist(record);
+    return this.#admission.run("recovery", async () => {
+      await this.#ensureRelayConnected();
+      return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
+        const record = await this.#loadRecord(transactionId);
+        if (!record) {
+          throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
+        }
+        return this.#executeAndPersist(record);
+      });
     });
   }
 
@@ -1402,38 +1439,40 @@ export class PactAgentRuntime {
     if (this.#executions.has(transactionId)) {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
-    await this.#ensureRelayConnected();
-    return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
-      const record = await this.#loadRecord(transactionId);
-      if (!record) {
-        throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
-      }
-      const before = record.agreementRootEventId
-        ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
-        : undefined;
-      try {
-        const report = await this.#resumeExisting(record, true);
-        await this.#persistRecoveredRecord(record, report);
-        return report;
-      } catch (error) {
-        if (
-          error instanceof PactAgentWorkflowError &&
-          error.code === "escrow_failed" &&
-          before?.operationalState === "funding_reconciliation_required"
-        ) {
-          const after = record.agreementRootEventId
-            ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
-            : undefined;
-          if (
-            after?.reference === before.reference &&
-            after.operationalState === "prepared" &&
-            after.fundingOperationStatus === "failed"
-          ) {
-            return this.#statusForRecord(record);
-          }
+    return this.#admission.run("recovery", async () => {
+      await this.#ensureRelayConnected();
+      return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
+        const record = await this.#loadRecord(transactionId);
+        if (!record) {
+          throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
         }
-        throw error;
-      }
+        const before = record.agreementRootEventId
+          ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
+          : undefined;
+        try {
+          const report = await this.#resumeExisting(record, true);
+          await this.#persistRecoveredRecord(record, report);
+          return report;
+        } catch (error) {
+          if (
+            error instanceof PactAgentWorkflowError &&
+            error.code === "escrow_failed" &&
+            before?.operationalState === "funding_reconciliation_required"
+          ) {
+            const after = record.agreementRootEventId
+              ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
+              : undefined;
+            if (
+              after?.reference === before.reference &&
+              after.operationalState === "prepared" &&
+              after.fundingOperationStatus === "failed"
+            ) {
+              return this.#statusForRecord(record);
+            }
+          }
+          throw error;
+        }
+      });
     });
   }
 
@@ -1454,8 +1493,10 @@ export class PactAgentRuntime {
     if (this.#executions.has(transactionId)) {
       throw new PactAgentRuntimeError("transaction_in_progress", "Transaction execution is already in progress");
     }
-    await this.#ensureRelayConnected();
-    return (await this.#refundTransaction(transactionId, "manual"))!;
+    return this.#admission.run("recovery", async () => {
+      await this.#ensureRelayConnected();
+      return (await this.#refundTransaction(transactionId, "manual"))!;
+    });
   }
 
   /**
@@ -1531,6 +1572,13 @@ export class PactAgentRuntime {
     Readonly<{ inspected: number; reclaimed: number; failed: number }>
   > {
     this.#ensureRunning();
+    return this.#admission.run("recovery", () => this.#reclaimExpiredFundedEscrows());
+  }
+
+  // Internal callers already own a new-work permit; never acquire a nested permit.
+  async #reclaimExpiredFundedEscrows(): Promise<
+    Readonly<{ inspected: number; reclaimed: number; failed: number }>
+  > {
     const store = this.#config.privateStore;
     if (typeof store.list !== "function") {
       return Object.freeze({ inspected: 0, reclaimed: 0, failed: 0 });
@@ -1766,7 +1814,7 @@ export class PactAgentRuntime {
     if (record.phase !== "settled" && record.phase !== "refunded") {
       throw new PactAgentRuntimeError("report_not_available", "Report is not available");
     }
-    return this.#resumeExisting(record);
+    return this.#admission.run("recovery", () => this.#resumeExisting(record));
   }
 
   /** Complete private summary, available only to the authorized requester. */

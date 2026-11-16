@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import {
@@ -88,6 +88,26 @@ async function reachReview(
 }
 
 describe("requester transaction UI", () => {
+  it("honors rate-limit retry seconds without automatically retrying an economic mutation", async () => {
+    vi.useFakeTimers();
+    const api = fakeApi({ status: async () => { throw new RequesterApiClientError(429, { code: "rate_limited", error: "Please wait" }, 30); } });
+    vi.mocked(api.currentTransaction).mockResolvedValue({ transactionId: safeStatusFixture().transactionId });
+    try {
+      await act(async () => { render(<RequesterTransactionApp api={api} />); });
+      expect(api.status).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(/Request capacity is temporarily unavailable/)).toBeTruthy();
+      await act(async () => { await vi.advanceTimersByTimeAsync(29_999); });
+      expect(api.status).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(api.status).toHaveBeenCalledTimes(2);
+      expect(api.createSubmission).not.toHaveBeenCalled();
+      expect(api.resume).not.toHaveBeenCalled();
+      expect(api.refund).not.toHaveBeenCalled();
+    } finally {
+      cleanup(); vi.useRealTimers();
+    }
+  });
+
   it("offers Start Demo before a wallet exists and then displays its authoritative balance", async () => {
     let started = false;
     const api = fakeApi();

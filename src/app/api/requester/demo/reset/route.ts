@@ -1,3 +1,4 @@
+import { admitRequester } from "@/lib/requester-admission.server";
 import { type NextResponse } from "next/server";
 
 import {
@@ -11,7 +12,6 @@ import {
 import { requesterSessionStoreFromEnv } from "@/lib/requester-session-store.server";
 import {
   attachRequesterSessionCookie,
-  readRequesterSession,
 } from "@/lib/requester-session.server";
 
 export const dynamic = "force-dynamic";
@@ -22,7 +22,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (!isTrustedRequesterRequest(request)) return unauthorizedRequester();
   try {
     const store = requesterSessionStoreFromEnv();
-    const session = readRequesterSession(request, store);
+    const session = admitRequester(request, store);
     if (!session) return unauthorizedRequester();
     if (process.env.PACTAGENT_ECONOMIC_MODE !== "demo") {
       return requesterJson(

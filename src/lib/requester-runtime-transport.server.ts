@@ -2,6 +2,7 @@ import "server-only";
 
 import {
   parseRequesterApiError,
+  safeRetryAfter,
   parseRequesterPrivateResult,
   parseRequesterRecoveryResult,
   parseRequesterSafeReport,
@@ -23,6 +24,7 @@ const TRANSACTION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
 
 const SAFE_ERROR_MESSAGES: Readonly<Record<RequesterApiErrorCode, string>> = Object.freeze({
+  rate_limited: "Request capacity is temporarily unavailable; please retry later",
   unauthorized: "Unauthorized",
   invalid_request: "The transaction request is invalid",
   document_too_large: "The document exceeds the 1 MiB upload limit",
@@ -58,6 +60,7 @@ export interface RequesterTransportFailure {
   readonly ok: false;
   readonly status: number;
   readonly body: RequesterApiErrorDto;
+  readonly retryAfterSeconds?: number;
 }
 
 export type RequesterTransportResponse<T> = RequesterTransportSuccess<T> | RequesterTransportFailure;
@@ -223,6 +226,7 @@ export class RequesterRuntimeTransport {
           ok: false,
           status: response.status,
           body: redactedError(upstream.code),
+          ...(response.status === 429 ? { retryAfterSeconds: safeRetryAfter(response.headers.get("retry-after")) } : {}),
         });
       } catch {
         return Object.freeze({ ok: false, status: 502, body: redactedError("upstream_invalid_response") });

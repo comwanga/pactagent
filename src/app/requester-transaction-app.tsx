@@ -90,6 +90,7 @@ const OPERATIONAL_COPY: Readonly<Record<RequesterOperationalState, string>> = {
 };
 
 const ERROR_COPY: Readonly<Partial<Record<RequesterApiErrorCode, string>>> = {
+  rate_limited: "Request capacity is temporarily unavailable. Please wait before retrying.",
   unauthorized: "This requester is not authorized to use the transaction service.",
   invalid_request: "The transaction request was rejected as invalid.",
   document_too_large: "The document exceeds the 1 MiB upload limit.",
@@ -472,6 +473,7 @@ export function RequesterTransactionApp({
   const recoveryInFlightRef = useRef(false);
   const resetIdempotencyRef = useRef<string | undefined>(undefined);
   const demoRefreshVersionRef = useRef(0);
+  const demoRetryAtRef = useRef(0);
   const authoritativeStatusFocusedRef = useRef(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
@@ -514,6 +516,7 @@ export function RequesterTransactionApp({
   }, [client]);
 
   const refreshDemoWallet = useCallback(async (): Promise<void> => {
+    if (Date.now() < demoRetryAtRef.current) return;
     const refreshVersion = ++demoRefreshVersionRef.current;
     try {
       const wallet = await client.demoWallet();
@@ -524,6 +527,11 @@ export function RequesterTransactionApp({
     } catch (error) {
       if (refreshVersion !== demoRefreshVersionRef.current) return;
       if (error instanceof RequesterApiClientError) {
+        if (error.detail.code === "rate_limited") {
+          demoRetryAtRef.current = Date.now() + (error.retryAfterSeconds ?? 1) * 1000;
+          setDemoError(redactedUiError(error));
+          return;
+        }
         setDemoWallet(undefined);
         setDemoUnavailable(true);
         setDemoError(undefined);
@@ -565,7 +573,9 @@ export function RequesterTransactionApp({
         if (cancelled) return;
         setStatusError(redactedUiError(error));
         if (!(error instanceof RequesterApiClientError) || error.detail.code !== "transaction_not_found") {
-          timer = setTimeout(() => { void refresh(); }, pollIntervalMs);
+          const delay = error instanceof RequesterApiClientError && error.retryAfterSeconds
+            ? Math.max(pollIntervalMs, error.retryAfterSeconds * 1000) : pollIntervalMs;
+          timer = setTimeout(() => { void refresh(); }, delay);
         }
       } finally {
         if (!cancelled) setPolling(false);

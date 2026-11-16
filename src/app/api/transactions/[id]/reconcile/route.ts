@@ -1,3 +1,4 @@
+import { admissionHeaders } from "@/lib/admission-control";
 import { NextResponse } from "next/server";
 
 import {
@@ -27,6 +28,6 @@ export async function POST(
     const report = await runtime.reconcile(id);
     return transactionJson(report);
   } catch (error) {
-    return transactionJson(toApiError(error), { status: apiStatusForError(error) });
+    return transactionJson(toApiError(error), { status: apiStatusForError(error), headers: admissionHeaders(error) });
   }
 }

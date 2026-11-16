@@ -112,7 +112,10 @@ export type PactAgentWorkflowErrorCode =
   | "privacy_boundary_violation"
   | "unexpected_state";
 
+const workflowErrorKey = Symbol.for("pactagent.workflow-error");
+
 export class PactAgentWorkflowError extends Error {
+  readonly [workflowErrorKey] = true;
   readonly code: PactAgentWorkflowErrorCode;
 
   constructor(code: PactAgentWorkflowErrorCode, message: string) {
@@ -124,6 +127,14 @@ export class PactAgentWorkflowError extends Error {
   toJSON(): Readonly<{ name: string; code: PactAgentWorkflowErrorCode; message: string }> {
     return Object.freeze({ name: this.name, code: this.code, message: this.message });
   }
+}
+
+/** Recognize errors from the process-shared runtime across route bundles. */
+export function isPactAgentWorkflowError(error: unknown): error is PactAgentWorkflowError {
+  return typeof error === "object" && error !== null && workflowErrorKey in error &&
+    error[workflowErrorKey] === true && "message" in error && typeof error.message === "string" &&
+    "code" in error && typeof error.code === "string" &&
+    ["invalid_configuration", "discovery_failed", "decision_rejected", "agreement_publication_failed", "escrow_failed", "reconciliation_required", "private_transport_failed", "private_task_transport_too_large", "execution_failed", "completion_failed", "settlement_failed", "reconstruction_failed", "privacy_boundary_violation", "unexpected_state"].includes(error.code);
 }
 
 function workflowError(code: PactAgentWorkflowErrorCode, message: string): never {

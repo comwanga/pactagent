@@ -1,11 +1,13 @@
+import { isAdmissionLimitError } from "./admission-control";
 import {
   createPactAgentRuntime,
   PactAgentRuntimeError,
+  isPactAgentRuntimeError,
   type PactAgentRuntime,
   type PactAgentRuntimeConfig,
 } from "./pactagent-runtime";
 import { createPactAgentRuntimeFromEnv, type PactAgentRuntimeEnv } from "./pactagent-runtime.live";
-import { PactAgentWorkflowError } from "./pactagent-workflow";
+import { isPactAgentWorkflowError } from "./pactagent-workflow";
 
 /*
  * Process-wide PactAgent runtime singleton used by the HTTP API surface.
@@ -19,73 +21,108 @@ import { PactAgentWorkflowError } from "./pactagent-workflow";
  *     error on first use — never a fallback to production or an arbitrary mint.
  */
 
-let explicitConfig: PactAgentRuntimeConfig | undefined;
-let runtime: PactAgentRuntime | undefined;
-let started = false;
-let liveEnv: PactAgentRuntimeEnv | undefined;
-let shutdownInFlight: Promise<void> | undefined;
-let configuredClose: (() => void) | undefined;
+interface RuntimeSingletonState {
+  explicitConfig?: PactAgentRuntimeConfig;
+  runtime?: PactAgentRuntime;
+  started: boolean;
+  liveEnv?: PactAgentRuntimeEnv;
+  initializationInFlight?: Promise<PactAgentRuntime>;
+  shutdownInFlight?: Promise<void>;
+  shutdownPending: boolean;
+  configuredClose?: () => void;
+}
+
+// Route bundles must share initialization ownership as well as execution permits.
+const runtimeStateKey = Symbol.for("pactagent.runtime.singleton");
+const runtimeGlobal = globalThis as typeof globalThis & { [runtimeStateKey]?: RuntimeSingletonState };
+const state = runtimeGlobal[runtimeStateKey] ??= { started: false, shutdownPending: false };
 
 export function configurePactAgentRuntime(
   config: PactAgentRuntimeConfig,
   closeResources?: () => void,
 ): void {
-  if (explicitConfig !== undefined || runtime !== undefined) {
+  if (state.explicitConfig !== undefined || state.runtime !== undefined ||
+      state.initializationInFlight || state.shutdownInFlight) {
     throw new Error("PactAgent runtime is already configured");
   }
-  explicitConfig = config;
-  configuredClose = closeResources;
+  state.explicitConfig = config;
+  state.configuredClose = closeResources;
 }
 
 export function resetPactAgentRuntime(): void {
-  explicitConfig = undefined;
-  runtime = undefined;
-  started = false;
-  liveEnv = undefined;
-  shutdownInFlight = undefined;
-  configuredClose = undefined;
+  // Synchronous test reset must not orphan resources owned by an unfinished lifecycle.
+  if (state.initializationInFlight || state.shutdownPending) {
+    throw new Error("PactAgent runtime lifecycle is still in progress");
+  }
+  state.explicitConfig = undefined;
+  state.runtime = undefined;
+  state.started = false;
+  state.liveEnv = undefined;
+  state.shutdownInFlight = undefined;
+  state.configuredClose = undefined;
 }
 
 export async function getPactAgentRuntime(): Promise<PactAgentRuntime> {
-  if (!runtime) {
-    if (explicitConfig) {
-      runtime = createPactAgentRuntime(explicitConfig);
+  if (state.shutdownInFlight) {
+    throw new PactAgentRuntimeError("invalid_configuration", "Runtime is shutting down");
+  }
+  if (state.runtime && state.started) return state.runtime;
+  const initialization = state.initializationInFlight ??= Promise.resolve().then(async () => {
+    if (state.explicitConfig) {
+      state.runtime ??= createPactAgentRuntime(state.explicitConfig);
+      await state.runtime.start();
     } else {
-      liveEnv = await createPactAgentRuntimeFromEnv();
-      runtime = liveEnv.runtime;
-      started = true;
+      // The factory owns cleanup on failure. Publish only its completed environment.
+      const environment = await createPactAgentRuntimeFromEnv();
+      state.liveEnv = environment;
+      state.runtime = environment.runtime;
     }
+    state.started = true;
+    return state.runtime;
+  });
+  try {
+    const initialized = await initialization;
+    if (state.shutdownInFlight) {
+      throw new PactAgentRuntimeError("invalid_configuration", "Runtime is shutting down");
+    }
+    return initialized;
+  } finally {
+    // All waiters observe the same outcome; a failed attempt can be retried.
+    if (state.initializationInFlight === initialization) state.initializationInFlight = undefined;
   }
-  if (!started) {
-    await runtime.start();
-    started = true;
-  }
-  return runtime;
 }
 
 /** Return the composition of the runtime actually instantiated in this process. */
 export function getRunningPactAgentRuntimeComposition(): PactAgentRuntimeEnv["composition"] | undefined {
-  return liveEnv?.composition;
+  return state.liveEnv?.composition;
 }
 
 export async function shutdownPactAgentRuntime(): Promise<void> {
-  if (shutdownInFlight) return shutdownInFlight;
-  shutdownInFlight = (async () => {
+  if (state.shutdownInFlight) return state.shutdownInFlight;
+  state.shutdownPending = true;
+  state.shutdownInFlight = Promise.resolve().then(async () => {
     try {
-      if (runtime && started) await runtime.shutdown();
+      // Do not close stores while startup still owns them. Failed factories clean up themselves.
+      await state.initializationInFlight?.catch(() => undefined);
+      if (state.runtime && state.started) await state.runtime.shutdown();
     } finally {
-      started = false;
-      if (liveEnv) {
-        liveEnv.close();
-        liveEnv = undefined;
-      } else if (configuredClose) {
-        const close = configuredClose;
-        configuredClose = undefined;
-        close();
+      state.started = false;
+      try {
+        if (state.liveEnv) {
+          const environment = state.liveEnv;
+          state.liveEnv = undefined;
+          environment.close();
+        } else if (state.configuredClose) {
+          const close = state.configuredClose;
+          state.configuredClose = undefined;
+          close();
+        }
+      } finally {
+        state.shutdownPending = false;
       }
     }
-  })();
-  return shutdownInFlight;
+  });
+  return state.shutdownInFlight;
 }
 
 export async function runBoundedRuntimeShutdown(timeoutMilliseconds = 5_000): Promise<void> {
@@ -131,10 +168,11 @@ if (process.env.NODE_ENV !== "test") registerPactAgentRuntimeShutdownHandlers();
 
 /** Redacted, secret-free API error DTO. Never exposes raw causes or stack traces. */
 export function toApiError(error: unknown): { error: string; code: string } {
-  if (error instanceof PactAgentRuntimeError) {
+  if (isAdmissionLimitError(error)) return { error: error.message, code: error.code };
+  if (isPactAgentRuntimeError(error)) {
     return { error: error.message, code: error.code };
   }
-  if (error instanceof PactAgentWorkflowError) {
+  if (isPactAgentWorkflowError(error)) {
     // A workflow error is a handled, durably-persisted transaction outcome
     // (the authoritative failure is observable through status), not a server
     // fault — with the sole exception of a privacy-boundary assertion, whose
@@ -154,13 +192,14 @@ export function toApiError(error: unknown): { error: string; code: string } {
 }
 
 export function apiStatusForError(error: unknown): number {
-  if (error instanceof PactAgentWorkflowError) {
+  if (isAdmissionLimitError(error)) return 429;
+  if (isPactAgentWorkflowError(error)) {
     // Handled, durably-recorded workflow outcomes are not internal faults; the
     // client should re-read the authoritative status. Only an internal
     // privacy-boundary assertion is treated as a genuine 500.
     return error.code === "privacy_boundary_violation" ? 500 : 409;
   }
-  if (!(error instanceof PactAgentRuntimeError)) return 500;
+  if (!isPactAgentRuntimeError(error)) return 500;
   switch (error.code) {
     case "transaction_not_found":
       return 404;
