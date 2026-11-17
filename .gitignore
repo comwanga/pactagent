@@ -1,6 +1,7 @@
 /node_modules
 /.next
 /out
+/dist
 /coverage
 /.local
 .env*

@@ -15,6 +15,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:provider": "node scripts/build-provider.mjs",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

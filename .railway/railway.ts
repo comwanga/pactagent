@@ -56,7 +56,7 @@ export default defineRailway(() => {
 
   const provider = service("pactagent-provider", {
     build: { builder: "DOCKERFILE", dockerfilePath: "deploy/web.Dockerfile" },
-    start: "node --conditions=react-server --import tsx scripts/provider-start.mjs",
+    start: "node --conditions=react-server dist/provider-start.mjs",
     healthcheck: "/health",
     healthcheckTimeout: 300,
     volumeMounts: { "/data": providerData },

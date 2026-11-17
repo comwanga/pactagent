@@ -10,3 +10,4 @@ e2e
 e2e-live
 *.md
 railway-plan.json
+dist
