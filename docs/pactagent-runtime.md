@@ -28,6 +28,44 @@ All transaction endpoints require `Authorization: Bearer <token>` (the
 allowlisted DTOs. Errors are redacted to `{ error, code }` — never a raw cause
 or stack.
 
+### Origin restriction (Issue #67)
+
+The runtime API routes (`/api/transactions/**`, `/api/runtime/**`) are served
+by the same Next.js process as the public browser BFF (`/api/requester/**`).
+The BFF calls the runtime over loopback HTTP
+(`PACTAGENT_RUNTIME_API_BASE`, default `http://127.0.0.1:3000`).
+
+`src/proxy.ts` intercepts requests to `/api/transactions/**` and
+`/api/runtime/**` and returns `404` when the `Host` header does not resolve to
+a loopback hostname (`127.0.0.1`, `localhost`, `::1`). A valid bearer token
+alone does not override this restriction; bearer verification in each route
+handler is a separate, independent control.
+
+Trust boundary (deployment-verified on Railway): Railway's edge proxy uses
+the HTTP `Host` header for routing. A request with a forged loopback `Host`
+(e.g., `Host: localhost`) is rejected by the edge with `404 "Application not
+found"` before reaching the container. The container only sees `Host` values
+that match the configured public domain for public traffic, or
+`127.0.0.1:3000` for loopback BFF traffic. The container port is not directly
+exposed. If the deployment does not overwrite `Host` or exposes the container
+port directly, this restriction does not hold; document the actual ingress
+topology before relying on it.
+
+### Bearer verification (Issue #67)
+
+`isAuthorized` compares the presented bearer credential against the configured
+token using `crypto.timingSafeEqual` over fixed-length SHA-256 digests. The
+comparison does not fall back to plaintext string equality. Missing, malformed,
+empty, or incorrect credentials are all rejected without revealing whether
+the scheme or the token value was the mismatch. The token format (at least 16
+alphanumeric, dash, or underscore characters) is validated at startup by
+`validateRuntimeApiToken`; a missing or below-minimum token throws
+`invalid_configuration` before the runtime initializes. The token is a
+privileged operator credential, not per-user authorization; it grants read
+access to every transaction's private result and control of refund, reconcile,
+and reset. Generate it with a cryptographically random source; character
+length alone does not establish entropy.
+
 ```
 POST   /api/transactions                 (Idempotency-Key header) → 202 + Location + { transactionId }
 GET    /api/transactions/:id             → safe status DTO

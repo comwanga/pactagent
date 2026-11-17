@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
+import { request as httpRequest, type OutgoingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -354,6 +355,81 @@ describe("PactAgent runtime black-box configuration failure", () => {
       expect(findForbiddenPublicMaterial(body)).toBeUndefined();
     } finally {
       await stopServer(noConfig);
+    }
+  }, 180_000);
+});
+
+describe("PactAgent runtime proxy origin restriction (Issue #67)", () => {
+  let proxyServer: ServerHandle | undefined;
+
+  afterAll(async () => {
+    if (proxyServer) await stopServer(proxyServer);
+  });
+
+  function fetchWithHost(
+    baseUrl: string,
+    path: string,
+    host: string,
+    init?: { method?: string; headers?: OutgoingHttpHeaders },
+  ): Promise<{ status: number; body: string }> {
+    const url = new URL(baseUrl);
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        hostname: url.hostname,
+        port: url.port,
+        path,
+        method: init?.method ?? "GET",
+        headers: { ...init?.headers, host },
+      });
+      req.on("response", (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  it("returns 404 for a public Host on runtime API routes, even with a valid token", async () => {
+    const token = `proxy-test-${randomBytes(24).toString("hex")}`;
+    const stripped: Record<string, string | undefined> = { ...process.env };
+    for (const key of Object.keys(stripped)) {
+      if (key.startsWith(LIVE_ENV_PREFIX) || key === "PACTAGENT_CASHU_TEST_MINT_URL") {
+        stripped[key] = undefined;
+      }
+    }
+    stripped.PACTAGENT_RUNTIME_API_TOKEN = token;
+    proxyServer = await startServer(stripped);
+    try {
+      const publicHost = await fetchWithHost(
+        proxyServer.baseUrl,
+        "/api/transactions",
+        "pactagent.up.railway.app",
+        { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" } },
+      );
+      expect(publicHost.status).toBe(404);
+      expect(publicHost.body).not.toContain("transactionId");
+      expect(publicHost.body).not.toContain(token);
+
+      const publicRuntime = await fetchWithHost(
+        proxyServer.baseUrl,
+        "/api/runtime/bootstrap",
+        "pactagent.up.railway.app",
+        { method: "POST", headers: { authorization: `Bearer ${token}` } },
+      );
+      expect(publicRuntime.status).toBe(404);
+
+      const loopback = await fetchWithHost(
+        proxyServer.baseUrl,
+        "/api/transactions",
+        "localhost",
+        { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "idempotency-key": "proxy-loopback" } },
+      );
+      expect(loopback.status).not.toBe(404);
+    } finally {
+      await stopServer(proxyServer);
+      proxyServer = undefined;
     }
   }, 180_000);
 });
