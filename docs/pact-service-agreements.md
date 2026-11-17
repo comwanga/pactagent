@@ -107,10 +107,43 @@ evidence cannot enter public event content or tags. `result_submitted` accepts
 only an opaque `sha256:<lowercase hex digest>` reference. The
 `document-summary@1` profile accepts `text/plain` and `application/pdf` inputs up
 to 1 MiB (1,048,576 original bytes), enforces the documented 300-second execution ceiling, and
-requires a non-empty summary. No numeric summary-size limit is imposed because
-the issue, repository policy, and fixtures do not define one. PDF text
+applies deterministic result-acceptance checks. PDF text
 extraction is isolated and bounded in pages, time, memory and extracted text;
 see [document-summary-pdf-limits.md](document-summary-pdf-limits.md) (#61).
+
+### Deterministic result-acceptance checks
+
+A `document-summary@1` private result is a `{ summary: string }` object. The
+profile's `validatePrivateResult` and `validateResultAcceptance` apply the same
+deterministic checks on the provider pre-check and the requester completion
+decision, so the two sides cannot drift on acceptance criteria:
+
+1. **Structure.** The result is an object with exactly a `summary` string that is
+   non-empty after trimming.
+2. **Length bounds.** The summary is no longer than
+   `DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS` (800 Unicode code units, the
+   deterministic executor's clamp), and no shorter than an input-relative floor:
+   `min(DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS, substantive-source-length)`
+   (8 code units, scaled down to the source document's non-whitespace length so a
+   degenerate single-token document is not falsely rejected while an implausibly
+   trivial summary of a larger document is).
+3. **Character-class sanity.** The summary contains at least one Unicode Letter
+   (`\p{L}`) or Number (`\p{N}`) and no Unicode Control (`\p{Cc}`) character, so
+   whitespace-only, punctuation-only, symbol-only, and control-character output
+   fail without assuming ASCII or English script.
+4. **Distinct-token floor.** When the summary contains two or more word tokens
+   (maximal Letter/Number runs), at least two must be distinct, so repeated filler
+   cannot satisfy the diversity requirement. A single-token summary is not rejected
+   by this rule; the input-relative length bound rejects an implausibly short
+   single-token summary of a larger document.
+
+These checks establish **structure and bounded content only**. They do **not**
+establish that the summary is factually correct, faithful to the source document,
+semantically accurate, useful to the requester, or independently verified as a
+correct task completion. A string can satisfy all of these deterministic checks
+and still be an incorrect summary. `release_authorized` therefore means "the
+result passed the agreement's deterministic acceptance policy and release is
+authorized under that policy", not "the summary was verified correct".
 
 The requester can create a completion decision only by reopening the committed
 private terms with the private salt and validating the exact private result whose
@@ -120,6 +153,19 @@ submitted-transition event ID, and result reference. A `result_verified`
 transition repeats that safe result reference and is rejected unless the local
 validated decision matches it; consequently `release_authorized` can follow only
 a previously validated verification.
+
+**Reconstruction compatibility.** The acceptance policy is defined by the
+deployed validator, not by a versioned field in the signed agreement content.
+When the runtime restarts, it reconstructs the completion decision for
+agreements that have already reached `result_verified` or later by re-opening
+the private result from the relay. Reconstruction applies **structural
+validation only** (shape, keys, non-empty string) — the same level as the
+pre-Issue-#68 profile — and the result-reference match check, so tightening the
+content checks does not retroactively un-verify a committed result. New
+completion decisions always apply the full acceptance policy. In-flight
+agreements whose results fail the current policy take the existing
+rejection/refund path. Already-settled agreements with a stored terminal report
+are not reconstructed and are unaffected.
 
 ## Lifecycle and authorization
 

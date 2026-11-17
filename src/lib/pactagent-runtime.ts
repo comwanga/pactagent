@@ -801,6 +801,7 @@ async function reconstructCompletionDecision(
     privateTerms,
     privateSalt,
     privateResult,
+    reconstruct: true,
   });
 }
 

@@ -26,9 +26,11 @@ import {
   createPactResultReference,
   createPactServiceAgreementRoot,
   createPactTermsCommitment,
+  DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS,
   parsePactAgreementTransitionEvent,
   parsePactServiceAgreementRootEvent,
   reconstructPactAgreementHistory,
+  validatePactResultAcceptance,
   validatePactServiceAgreementRoot,
   verifyPactTermsCommitment,
   type PactAgreementContext,
@@ -1497,3 +1499,256 @@ function manualRefundEvent(
     content: JSON.stringify(content),
   };
 }
+
+/*
+ * Issue #68: deterministic result-acceptance checks gate release
+ * authorization. These tests exercise the same profile rules the provider
+ * pre-check (validatePactResultAcceptance) and the requester completion
+ * decision (createPactCompletionDecision) apply, using the existing
+ * deterministic agreement fixture. No live economic operation is performed;
+ * release authorization is observed through the validated completion-decision
+ * and result_verified transition path.
+ */
+describe("document-summary@1 deterministic result acceptance (Issue #68)", () => {
+  it("the agreed source has enough substantive content to apply the floor", () => {
+    const fixture = createFixture();
+    const sourceSubstantive = fixture.privateTerms.source_document.replace(/\s/gu, "").length;
+    expect(sourceSubstantive).toBeGreaterThanOrEqual(DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS);
+  });
+
+  it("rejects an implausibly short summary of the agreed document on both sides", () => {
+    const fixture = createFixture();
+    // The provider pre-check rejects a one-character summary of the agreed
+    // document, so the provider would treat it as an execution failure rather
+    // than submit it.
+    expect(() =>
+      validatePactResultAcceptance(DOCUMENT_SUMMARY_PROFILE_ID, fixture.privateTerms, { summary: "x" }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+
+    // The requester completion decision applies the same rule and therefore
+    // cannot produce a validated decision for such a result, so no
+    // result_verified transition can follow and release is not authorized.
+    const submitted = advanceToSubmitted(fixture);
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: { summary: "x" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+  });
+
+  it("rejects repeated-filler output of the agreed document on both sides", () => {
+    const fixture = createFixture();
+    expect(() =>
+      validatePactResultAcceptance(
+        DOCUMENT_SUMMARY_PROFILE_ID,
+        fixture.privateTerms,
+        { summary: "filler filler filler filler" },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+
+    const submitted = advanceToSubmitted(fixture);
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: { summary: "filler filler filler filler" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+  });
+
+  it("a valid result authorizes release through the existing deterministic path", () => {
+    const fixture = createFixture();
+    const submitted = advanceToSubmitted(fixture);
+
+    // The provider pre-check accepts the valid result.
+    expect(() =>
+      validatePactResultAcceptance(
+        DOCUMENT_SUMMARY_PROFILE_ID,
+        fixture.privateTerms,
+        fixture.privateResult,
+      ),
+    ).not.toThrow();
+
+    const decision = createPactCompletionDecision({
+      context: fixture.context,
+      history: submitted,
+      privateTerms: fixture.privateTerms,
+      privateSalt: fixture.privateSalt,
+      privateResult: fixture.privateResult,
+    });
+    fixture.context = { ...fixture.context, completionDecisions: [decision] };
+    const verified = appendTransition(
+      fixture,
+      submitted,
+      "result_verified",
+      "requester",
+      fixture.requesterKey,
+    );
+    expect(verified.content).toContain(fixture.resultReference);
+    expect(() =>
+      createPactAgreementTransition({
+        context: fixture.context,
+        history: submitted,
+        predecessorEventId: verified.id,
+        nextState: "release_authorized",
+        actor: fixture.requesterIdentity.publicKey,
+        actorRole: "requester",
+        createdAt: ROOT_TIME + 6,
+      }),
+    ).not.toThrow();
+  });
+
+  it("provider pre-check and requester completion agree on an invalid result", () => {
+    const fixture = createFixture();
+    const invalid = { summary: "x" };
+    // Both reject with the same boundary-violation code.
+    expect(() =>
+      validatePactResultAcceptance(DOCUMENT_SUMMARY_PROFILE_ID, fixture.privateTerms, invalid),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+
+    const submitted = advanceToSubmitted(fixture);
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: invalid,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+  });
+});
+
+/*
+ * Issue #68 economic compatibility: reconstruction of already-verified
+ * agreements must not re-apply tightened acceptance rules retroactively.
+ *
+ * An agreement whose result was verified under the previous (lenient)
+ * validation rules must remain reconstructable after the validator is
+ * upgraded. The result_verified transition on the relay is the committed
+ * proof that the result was accepted under the policy in effect at
+ * verification time; reconstruction re-creates the completion decision
+ * object using structural-only validation so a tightened content policy
+ * does not un-verify a committed result.
+ *
+ * These tests use degenerate results that pass the old structural check
+ * (non-empty string) but fail the new content checks (character-class,
+ * distinct-token, input-relative minimum). They verify that:
+ *   - New completion decisions (reconstruct: false/omitted) reject them.
+ *   - Reconstructed completion decisions (reconstruct: true) accept them.
+ *   - The reconstructed reference matches the submitted reference.
+ *   - A result that fails even structural validation is still rejected.
+ */
+describe("document-summary@1 reconstruction compatibility (Issue #68)", () => {
+  it("rejects a degenerate result under full validation but accepts it under reconstruction", () => {
+    const fixture = createFixture();
+    // "x" passes old structural (non-empty string) but fails new content
+    // checks (input-relative minimum, no distinct tokens for a larger doc).
+    const degenerate = { summary: "x" };
+    const degenerateReference = createPactResultReference(
+      DOCUMENT_SUMMARY_PROFILE_ID,
+      fixture.root.event.id,
+      degenerate,
+    );
+    const submitted = advanceToSubmitted(fixture, degenerate);
+
+    // Full validation rejects the degenerate result.
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: degenerate,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+
+    // Reconstruction accepts the same result and produces the same reference.
+    const decision = createPactCompletionDecision({
+      context: fixture.context,
+      history: submitted,
+      privateTerms: fixture.privateTerms,
+      privateSalt: fixture.privateSalt,
+      privateResult: degenerate,
+      reconstruct: true,
+    });
+    expect(decision.resultReference).toBe(degenerateReference);
+    expect(decision.agreementRoot).toBe(fixture.root.event.id);
+  });
+
+  it("rejects even under reconstruction when the result fails structural validation", () => {
+    const fixture = createFixture();
+    const submitted = advanceToSubmitted(fixture);
+
+    // Empty string fails even the structural check (pre-#68 level).
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: { summary: "" },
+        reconstruct: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+
+    // Non-object fails structural validation.
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: "not an object",
+        reconstruct: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "privacy_boundary_violation" }));
+  });
+
+  it("rejects under reconstruction when the result reference does not match the submitted one", () => {
+    const fixture = createFixture();
+    const submitted = advanceToSubmitted(fixture);
+
+    // A structurally valid but different result produces a different reference.
+    expect(() =>
+      createPactCompletionDecision({
+        context: fixture.context,
+        history: submitted,
+        privateTerms: fixture.privateTerms,
+        privateSalt: fixture.privateSalt,
+        privateResult: { summary: "a different result that is long enough" },
+        reconstruct: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "invalid_transition" }));
+  });
+
+  it("reconstructs a valid result identically under both full and reconstruct modes", () => {
+    const fixture = createFixture();
+    const submitted = advanceToSubmitted(fixture);
+
+    const fullDecision = createPactCompletionDecision({
+      context: fixture.context,
+      history: submitted,
+      privateTerms: fixture.privateTerms,
+      privateSalt: fixture.privateSalt,
+      privateResult: fixture.privateResult,
+    });
+    const reconstructedDecision = createPactCompletionDecision({
+      context: fixture.context,
+      history: submitted,
+      privateTerms: fixture.privateTerms,
+      privateSalt: fixture.privateSalt,
+      privateResult: fixture.privateResult,
+      reconstruct: true,
+    });
+    expect(reconstructedDecision.resultReference).toBe(fullDecision.resultReference);
+    expect(reconstructedDecision.agreementRoot).toBe(fullDecision.agreementRoot);
+    expect(reconstructedDecision.submittedTransition).toBe(fullDecision.submittedTransition);
+  });
+});
