@@ -107,6 +107,12 @@ without requiring a redeploy.
 | `pactagent-strfry-db` | `/app/strfry-db` | strfry | Strfry LMDB event database | Events survive restart/redeploy |
 | `pactagent-demo-mint-data` | `/app/data` | demo-mint | Nutshell SQLite (keysets, proofs, quotes) | Mint state survives restart/redeploy |
 
+Both application services run as the non-root `node` user (UID 1000); see
+section 15. The `/data` mount is created node-owned in the image, so a FRESH
+volume inherits node ownership and works without intervention. An EXISTING
+volume that contains files written by the previous root-running image must be
+migrated once before the hardened image can start (see section 15.6).
+
 ## 5. Variables (names only)
 
 ### pactagent-web
@@ -356,3 +362,160 @@ macaroon, rune, Demo spend/refund key, runtime bearer, or provider key.
 - Requester sessions are PoC browser-cookie ownership, not production
   authentication.
 - The generated `*.up.railway.app` domains are Railway-assigned.
+
+## 15. Container image hardening (Issue #69)
+
+The shared `deploy/web.Dockerfile` image (used by `pactagent-web` and
+`pactagent-provider`) is hardened against three findings from the Issue #69
+audit: an unpinned base image, root execution, and development dependencies
+shipped to production because the provider ran TypeScript through `tsx`.
+
+### 15.1 Base image pinning
+
+Every stage (`deps`, `build`, `runner`) uses the same digest-pinned Node.js
+image:
+
+```
+node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1
+```
+
+The digest is the multi-arch OCI image index (amd64 + arm64), obtained from
+the authoritative registry. The existing Dependabot `/deploy` docker ecosystem
+entry (`.github/dependabot.yml`) keeps the digest current.
+
+### 15.2 Non-root runtime identity
+
+The runner stage ends with `USER node` (the base image's `node` user,
+UID/GID 1000). Both `next start` (web) and the provider process therefore run
+as UID 1000; PID 1 is not root. Runtime writes are confined to:
+
+- `/data` — Railway persistent volume (SQLite stores); node-owned in the image.
+- `/app/.next` — Next.js data/route cache; node-owned via `COPY --chown`.
+
+`node_modules`, `public`, `dist`, `next.config.ts` and the worker are
+root-owned and world-readable (read-only at runtime).
+
+### 15.3 Provider compilation
+
+The provider is compiled ahead of time during the build stage:
+
+```
+npm run build:provider   # scripts/build-provider.mjs -> esbuild
+```
+
+esbuild (a transitive dependency of the devDependency `tsx`) bundles
+`scripts/provider-start.mjs` and every local TypeScript module it imports into
+`dist/provider-start.mjs`. All `node_modules` imports are kept external so the
+runtime resolves them from the production `node_modules` with the same
+`--conditions=react-server` flag the previous `tsx` runtime used. `tsx` is no
+longer present or executed at runtime.
+
+The Railway provider start command is therefore:
+
+```
+node --conditions=react-server dist/provider-start.mjs
+```
+
+The PDF text-extraction worker (`src/domain/pdf-text-extract.worker.mjs`) is
+plain JavaScript loaded by path at runtime
+(`resolve(process.cwd(), "src", "domain", "pdf-text-extract.worker.mjs")`); it
+is copied into the image at that path and imports `unpdf` from `node_modules`
+inside the worker thread. No other `src/` TypeScript is required at runtime.
+
+### 15.4 Production dependencies
+
+The runner installs with `npm ci --omit=dev`, which excludes every top-level
+devDependency: `tsx`, `vitest`, `typescript` (as a direct devDependency),
+`eslint`, `eslint-config-next`, `@types/*`, `@testing-library/*`,
+`@playwright/test`, `jsdom`, `railway`, `@next/swc-wasm-nodejs`, and
+`@playwright/test`. The platform-native SWC binary (`@next/swc-linux-x64-gnu`
+on linux/amd64) is an optionalDependency of `next` and is retained.
+
+Two peer dependencies of production packages are auto-installed by npm and
+remain: `typescript` (a peer of `nostr-tools`, used only for type-checking)
+and `@playwright/test` (an optional peer of `next`, used only for testing).
+Neither is executed at runtime — the provider is pre-compiled and `next start`
+uses the native SWC, not `tsc` or Playwright.
+
+### 15.5 Required writable directories
+
+| Path | Owner | Purpose |
+|---|---|---|
+| `/data` | node (1000) | SQLite stores (provider idempotency; web cashu/escrow/sessions) |
+| `/app/.next` | node (1000) | Next.js data/route cache |
+
+### 15.6 Existing-volume migration
+
+A non-root process cannot write to files created by the previous root-running
+container. A fresh Railway volume works without intervention (the image's
+node-owned `/data` is copied into the empty volume). An EXISTING volume that
+already contains root-owned SQLite files requires a one-time ownership fix
+before the hardened image can start. The provider fails closed
+(`store_unavailable`) rather than silently losing durability.
+
+This applies to both application volumes: `pactagent-web-data` (`/data` on
+`pactagent-web`) and `pactagent-provider-data` (`/data` on `pactagent-provider`).
+
+Safe migration procedure (per volume, as an explicit operator action — NOT
+baked into the image entrypoint):
+
+1. **Stop the service.** The service must not hold SQLite files open during
+   the ownership change. On Railway: `railway stop --service <name> --yes`.
+   A clean stop lets SQLite checkpoint the WAL (`-wal` → main `.sqlite`).
+2. **Back up the volume** (optional but recommended). Railway volumes can be
+   snapshotted; alternatively copy the SQLite files aside. The migration below
+   changes ownership only and does not read, alter, or delete database
+   contents, but a backup protects against operator error.
+3. **Fix ownership** to the non-root user (UID/GID 1000):
+
+   ```sh
+   docker run --rm --user 0 -v <volume>:/data <image> \
+     chown -R 1000:1000 /data
+   ```
+
+   `-R` covers every file in `/data`, including the WAL sidecar files
+   (`*.sqlite-wal`, `*.sqlite-shm`) that must accompany each main `.sqlite`
+   database. Do NOT delete the `-wal` or `-shm` files — they may hold
+   uncheckpointed durable state. `chown` preserves the existing restrictive
+   mode bits (e.g. `-rw-------` on `provider-operations.sqlite`).
+
+4. **Start the service.** On Railway: `railway up --service <name> --detach`.
+   The non-root process opens the now-node-owned SQLite files and resumes
+   normally.
+
+On Railway, if a privileged `chown` job is unavailable, reformat the volume
+(fresh volumes inherit node ownership automatically) — but this loses existing
+state, so back up first and use it only when the volume has no durable state
+worth preserving.
+
+**Recovery if migration fails:** the `chown` is reversible — re-run it with
+`0:0` to restore root ownership, then restart the previous (pre-hardening)
+image. If a backup was taken, restore the volume from it. The migration does
+not modify database contents, so a failed or partial `chown` leaves the data
+intact; only the ownership is intermediate.
+
+### 15.7 Local verification
+
+```sh
+# Build the hardened image
+docker build -f deploy/web.Dockerfile -t pactagent-web:69 .
+
+# Non-root UID (must be 1000)
+docker run --rm pactagent-web:69 id
+
+# Dev dependencies absent; native SWC present
+docker run --rm pactagent-web:69 ls node_modules/@next
+docker run --rm pactagent-web:69 ls node_modules/tsx   # No such file
+docker run --rm pactagent-web:69 ls node_modules/unpdf # present
+
+# Web health (start the container, then probe /api/health)
+docker run -d --name web -p 3000:3000 pactagent-web:69
+docker exec web node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>r.text()).then(console.log)"
+
+# Provider (needs a wss:// relay; reuse compose.local.yml caddy + CA)
+docker compose -f compose.local.yml up -d caddy
+node --conditions=react-server dist/provider-start.mjs  # with PACTAGENT_* env
+```
+
+The production acceptance (`npm run railway:acceptance`) and doctor
+(`npm run railway:doctor`) remain the authoritative deployed-system checks.
