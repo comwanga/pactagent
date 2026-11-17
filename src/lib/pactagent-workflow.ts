@@ -17,6 +17,7 @@ import {
   isPactExecutionDeadlineRefund,
   pactAgreementExecutionDeadline,
   parsePactAgreementTransitionEvent,
+  validatePactResultAcceptance,
   verifyPactTermsCommitment,
   type DocumentSummaryPrivateResult,
   type DocumentSummaryPrivateTerms,
@@ -912,6 +913,23 @@ export class PactAgentWorkflow {
     }
 
     const privateResult: DocumentSummaryPrivateResult = { summary: outcome.summary };
+    // Provider-side deterministic pre-check against the agreed private terms.
+    // The requester repeats the same profile rules in createPactCompletionDecision,
+    // so the two sides cannot drift on acceptance criteria.
+    try {
+      validatePactResultAcceptance(
+        DOCUMENT_SUMMARY_PROFILE_ID,
+        {
+          source_document: task.source_document,
+          input_media_type: task.input_media_type,
+          ...(task.private_prompt !== undefined ? { private_prompt: task.private_prompt } : {}),
+        },
+        privateResult,
+      );
+    } catch (error) {
+      if (error instanceof PactAgentWorkflowError) throw error;
+      workflowError("execution_failed", "Document summary failed deterministic acceptance checks");
+    }
     const resultReference = createPactResultReference(
       DOCUMENT_SUMMARY_PROFILE_ID,
       context.root.event.id,

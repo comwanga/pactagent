@@ -35,6 +35,26 @@ export const PACT_TERMS_COMMITMENT_SCHEME = "sha256-salted-canonical-json-v1";
 export const DOCUMENT_SUMMARY_MAXIMUM_INPUT_BYTES = DOCUMENT_SOURCE_MAXIMUM_BYTES;
 export const DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS = 5 * 60;
 export const DOCUMENT_SUMMARY_INPUT_MEDIA_TYPES = ["text/plain", "application/pdf"] as const;
+/**
+ * Document-summary@1 deterministic result-acceptance bounds.
+ *
+ * The deterministic executor clamps every emitted summary to
+ * {@link DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS} Unicode code units, so any
+ * accepted result longer than that clamp is clearly excessive.
+ *
+ * The minimum is input-relative: a result must be at least
+ * {@link DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS} code units, but the floor
+ * scales down to the source document's substantive (non-whitespace) length so
+ * a degenerate single-token document is not falsely rejected while an
+ * implausibly trivial summary of a larger document is. These bounds, the
+ * character-class sanity check, and the distinct-token requirement form the
+ * deterministic acceptance profile. They establish structure and bounded
+ * content only; they do not establish factual accuracy, faithfulness, or
+ * semantic quality (see {@link validatePrivateResult},
+ * {@link validateResultAcceptance}).
+ */
+export const DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS = 800;
+export const DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS = 8;
 /** Longest acyclic document-summary@1 path from proposed to a terminal state. */
 export const PACT_AGREEMENT_MAX_TRANSITIONS = 8;
 export const PACT_AGREEMENT_CLOCK_SKEW_SECONDS = 60;
@@ -213,8 +233,32 @@ export interface PactCapabilityProfile<TPrivateTerms, TPrivateResult> {
   readonly executionGraceSeconds: number;
   validatePrivateTerms(value: unknown): TPrivateTerms;
   validatePrivateResult(value: unknown): TPrivateResult;
+  /**
+   * Structural validation only (shape, keys, non-empty string). Same level
+   * as the pre-Issue-#68 profile. Used by reconstruction of completion
+   * decisions for agreements whose results were already verified under the
+   * acceptance policy in effect at verification time, so tightening the
+   * content checks does not retroactively un-verify a committed result.
+   */
+  validatePrivateResultStructure(value: unknown): TPrivateResult;
+  /**
+   * Deterministic acceptance check binding a private result to the agreed
+   * private terms. Applied on both the provider pre-check and the requester
+   * completion decision so the two paths cannot drift. It establishes
+   * structure and bounded content only, never semantic quality.
+   */
+  validateResultAcceptance(input: {
+    readonly privateTerms: unknown;
+    readonly privateResult: unknown;
+  }): void;
   validateAgreement(content: PactServiceAgreementContent): void;
   createResultReference(agreementRoot: string, privateResult: unknown): string;
+  /**
+   * Computes a result reference using structural-only validation. Used by
+   * reconstruction of already-verified completion decisions so tightened
+   * content checks do not block reconstruction of committed agreements.
+   */
+  createResultReferenceForReconstruction(agreementRoot: string, privateResult: unknown): string;
   validateCompletion(input: {
     readonly agreement: PactServiceAgreementContent;
     readonly agreementRoot: string;
@@ -314,7 +358,63 @@ const DOCUMENT_SUMMARY_PROFILE: PactCapabilityProfile<
     if (typeof value.summary !== "string" || value.summary.trim().length === 0) {
       agreementError("privacy_boundary_violation", "Private document-summary result is invalid");
     }
+    const summary = value.summary as string;
+    // Excessive length: the deterministic executor clamps every emitted
+    // summary to DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS code units, so any
+    // accepted result longer than that clamp is clearly excessive.
+    if (summary.length > DOCUMENT_SUMMARY_MAXIMUM_SUMMARY_CHARS) {
+      agreementError("privacy_boundary_violation", "Private document-summary result exceeds the profile maximum length");
+    }
+    // Character-class sanity: a real summary contains at least one Letter or
+    // Number and no Control character. This rejects whitespace-only,
+    // punctuation-only, symbol-only, and control-character output without
+    // assuming ASCII or English script.
+    if (!resultHasSubstantiveCharacter(summary)) {
+      agreementError("privacy_boundary_violation", "Private document-summary result has no letter or number content");
+    }
+    if (resultHasControlCharacter(summary)) {
+      agreementError("privacy_boundary_violation", "Private document-summary result contains a control character");
+    }
+    // Distinct-token floor: when a result contains two or more word tokens,
+    // at least two must be distinct, so repeated filler cannot satisfy it.
+    // A single-token result is not rejected here; the input-relative minimum
+    // in validateResultAcceptance rejects an implausibly short single-token
+    // summary of a larger document.
+    const tokens = countResultTokens(summary);
+    if (tokens.total >= 2 && tokens.distinct < 2) {
+      agreementError("privacy_boundary_violation", "Private document-summary result repeats a single token");
+    }
     return value as unknown as DocumentSummaryPrivateResult;
+  },
+  validatePrivateResultStructure(value) {
+    if (!isRecord(value)) {
+      agreementError("privacy_boundary_violation", "Private document-summary result is invalid");
+    }
+    assertExactKeys(value, ["summary"], "privacy_boundary_violation");
+    if (typeof value.summary !== "string" || value.summary.trim().length === 0) {
+      agreementError("privacy_boundary_violation", "Private document-summary result is invalid");
+    }
+    return value as unknown as DocumentSummaryPrivateResult;
+  },
+  validateResultAcceptance(input) {
+    const terms = this.validatePrivateTerms(input.privateTerms);
+    const result = this.validatePrivateResult(input.privateResult);
+    // Input-relative minimum: a result must be at least
+    // DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS code units, but the floor scales
+    // down to the source document's substantive length so a degenerate
+    // single-token document is not falsely rejected while an implausibly
+    // trivial summary of a larger document is. The source-document string is
+    // the agreed private representation; for text/plain it is UTF-8 text and
+    // for application/pdf it is standard base64, both of which are bounded by
+    // the profile's input-size check.
+    const sourceSubstantive = countSubstantiveChars(terms.source_document);
+    const minimumLength = Math.min(DOCUMENT_SUMMARY_MINIMUM_SUMMARY_CHARS, sourceSubstantive);
+    if (result.summary.length < minimumLength) {
+      agreementError(
+        "privacy_boundary_violation",
+        "Private document-summary result is implausibly short for the agreed document",
+      );
+    }
   },
   validateAgreement(content) {
     if (content.maximum_execution_seconds > DOCUMENT_SUMMARY_MAXIMUM_EXECUTION_SECONDS) {
@@ -336,8 +436,23 @@ const DOCUMENT_SUMMARY_PROFILE: PactCapabilityProfile<
       )
       .digest("hex")}`;
   },
+  createResultReferenceForReconstruction(agreementRoot, privateResult) {
+    const result = this.validatePrivateResultStructure(privateResult);
+    return `sha256:${createHash("sha256")
+      .update(
+        canonicalizePactJson({
+          agreement_root: agreementRoot,
+          capability_profile: this.id,
+          result: result as unknown as CanonicalJson,
+        }),
+      )
+      .digest("hex")}`;
+  },
   validateCompletion(input) {
-    this.validatePrivateTerms(input.privateTerms);
+    this.validateResultAcceptance({
+      privateTerms: input.privateTerms,
+      privateResult: input.privateResult,
+    });
     this.validateAgreement(input.agreement);
     return this.createResultReference(input.agreementRoot, input.privateResult);
   },
@@ -380,12 +495,69 @@ export function createPactResultReference(
   return getPactCapabilityProfile(profileId).createResultReference(agreementRoot, privateResult);
 }
 
+/**
+ * Provider-side deterministic pre-check for a private result against the
+ * agreed private terms. A provider calls this before submitting a result so
+ * that an output the requester would reject under
+ * {@link createPactCompletionDecision} is caught locally as an execution
+ * failure instead. The same profile rules are applied on both sides, so the
+ * provider and requester cannot drift on acceptance criteria.
+ */
+export function validatePactResultAcceptance(
+  profileId: PactCapabilityProfileId,
+  privateTerms: unknown,
+  privateResult: unknown,
+): void {
+  getPactCapabilityProfile(profileId).validateResultAcceptance({ privateTerms, privateResult });
+}
+
 type CanonicalJson = null | boolean | number | string | readonly CanonicalJson[] | {
   readonly [key: string]: CanonicalJson;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/*
+ * Deterministic document-summary result helpers.
+ *
+ * These are structural and bounded-content checks over Unicode text. They use
+ * the Unicode-aware `\p{L}` (Letter), `\p{N}` (Number), `\p{Cc}` (Control),
+ * and `\s` (White_Space) character classes with the `u` flag, so they do not
+ * assume ASCII or English word separation. A token is a maximal run of Letter
+ * or Number characters; scripts that do not separate words (e.g. Han) produce
+ * one token per run, which is acceptable for a deterministic diversity floor.
+ *
+ * The checks establish only that a result is a non-empty, bounded, reasonably
+ * diverse, letter- or number-bearing string of plausible length for the
+ * agreed document. They do NOT establish that the summary is faithful, factually
+ * correct, or semantically useful; a string can satisfy all of these checks and
+ * still be an incorrect summary (see `validatePrivateResult`).
+ */
+
+/** Counts substantive (non-White_Space) Unicode characters in a string. */
+function countSubstantiveChars(value: string): number {
+  return value.replace(/\s/gu, "").length;
+}
+
+/** True when the string contains at least one Letter or Number character. */
+function resultHasSubstantiveCharacter(value: string): boolean {
+  return /\p{L}|\p{N}/u.test(value);
+}
+
+/** True when the string contains any Unicode Control character. */
+function resultHasControlCharacter(value: string): boolean {
+  return /\p{Cc}/u.test(value);
+}
+
+/** Counts word tokens (maximal Letter/Number runs) and the distinct count. */
+function countResultTokens(value: string): { total: number; distinct: number } {
+  const tokens = value
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((token) => token.length > 0);
+  return { total: tokens.length, distinct: new Set(tokens).size };
 }
 
 function canonicalJson(value: unknown): string {
@@ -1473,6 +1645,15 @@ export function createPactCompletionDecision(input: {
   readonly privateTerms: unknown;
   readonly privateSalt: PactPrivateCommitmentSalt;
   readonly privateResult: unknown;
+  /**
+   * When true, the completion decision is reconstructed for an agreement
+   * whose result was already verified under the acceptance policy in effect
+   * at verification time. Structural validation and the result-reference
+   * match check are applied; the current acceptance policy is not retried,
+   * so tightening the content checks does not retroactively un-verify a
+   * committed result. New completion decisions always use full validation.
+   */
+  readonly reconstruct?: boolean;
 }): PactCompletionDecision {
   const context = validatedContext(input.context);
   const history = reconstructPactAgreementHistory(context, input.history);
@@ -1500,12 +1681,22 @@ export function createPactCompletionDecision(input: {
     agreementError("invalid_transition", "Completion terms do not match the agreement commitment");
   }
   const profile = getPactCapabilityProfile(context.root.content.capability_profile);
-  const resultReference = profile.validateCompletion({
-    agreement: context.root.content,
-    agreementRoot: context.root.event.id,
-    privateTerms: input.privateTerms,
-    privateResult: input.privateResult,
-  });
+  let resultReference: string;
+  if (input.reconstruct === true) {
+    profile.validatePrivateTerms(input.privateTerms);
+    profile.validateAgreement(context.root.content);
+    resultReference = profile.createResultReferenceForReconstruction(
+      context.root.event.id,
+      input.privateResult,
+    );
+  } else {
+    resultReference = profile.validateCompletion({
+      agreement: context.root.content,
+      agreementRoot: context.root.event.id,
+      privateTerms: input.privateTerms,
+      privateResult: input.privateResult,
+    });
+  }
   if (resultReference !== submitted.content.result_reference) {
     agreementError("invalid_transition", "Completion result does not match the submitted result");
   }

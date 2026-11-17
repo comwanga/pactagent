@@ -23,6 +23,7 @@ import {
   parsePactServiceAgreementRootEvent,
   validatePactServiceAgreementRoot,
   createPactResultReference,
+  validatePactResultAcceptance,
   type PactAgreementContext,
   type PactAgreementHistory,
   type PactAgreementReferences,
@@ -1489,6 +1490,24 @@ export class PactAgentProviderService {
     }
 
     const privateResult = { summary: outcome.summary };
+    // Provider-side deterministic pre-check against the agreed private terms.
+    // An output the requester would reject under createPactCompletionDecision
+    // is caught here as an execution failure so it cannot authorize release.
+    // The same profile rules apply on both sides (validateResultAcceptance).
+    const privateTerms = {
+      source_document: task.source_document,
+      input_media_type: task.input_media_type,
+      ...(task.private_prompt !== undefined ? { private_prompt: task.private_prompt } : {}),
+    };
+    try {
+      validatePactResultAcceptance(
+        DOCUMENT_SUMMARY_PROFILE_ID,
+        privateTerms,
+        privateResult,
+      );
+    } catch {
+      throw new ProviderServiceError("execution_failed", "Document summary failed deterministic acceptance checks");
+    }
     const resultReference = createPactResultReference(
       DOCUMENT_SUMMARY_PROFILE_ID,
       rootEvent.id,

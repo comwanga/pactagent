@@ -163,7 +163,8 @@ instruction and safe verified-candidate projection. In both modes deterministic
 policy remains the economic authorization boundary. The model may decline the
 already-selected offer (a veto); it cannot choose a different provider or price,
 and a recommendation cannot bypass deterministic validation. Completion checks
-bind the private terms and result reference and require a non-empty summary;
+bind the private terms and result reference and apply bounded deterministic
+acceptance checks (length, character-class, and distinct-token floors);
 they do not prove the summary's factual correctness or provider fairness.
 This is not a production wallet:
 Lightning mint-quote acquisition, generic accounts, multi-mint routing, and
