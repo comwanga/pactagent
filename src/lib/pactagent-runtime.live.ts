@@ -1,3 +1,4 @@
+import { privateDataConfigurationFromEnv } from "./private-data";
 import { createNostrIdentity, type NostrPublicKey } from "../domain/nostr";
 import { sats } from "../domain/money";
 import type { PactAgreementReferences } from "../domain/pact-service-agreement";
@@ -374,7 +375,9 @@ export async function createPactAgentRuntimeFromEnv(
 ): Promise<PactAgentRuntimeEnv> {
   let config: PactAgentRuntimeEnvConfig;
   let requesterDecision: LiveRequesterDecision;
+  let privateData: ReturnType<typeof privateDataConfigurationFromEnv>;
   try {
+    privateData = privateDataConfigurationFromEnv();
     config = assertLiveDemoConfig(readLiveDemoConfigFromEnv());
     requesterDecision = createLiveRequesterDecisionFromEnv();
   } catch (error) {
@@ -416,6 +419,8 @@ export async function createPactAgentRuntimeFromEnv(
     }
 
     const runtimeConfig: PactAgentRuntimeConfig = {
+      privateData,
+      privateDataAccountingComplete: wired.economicEnvironment.privateDataAccountingComplete,
       identities: wired.identities,
       dependencies: wired.dependencies,
       privateStore: wired.economicEnvironment.privateStore,

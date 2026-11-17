@@ -1,3 +1,4 @@
+import { readPrivateTransaction, writeLegacyPrivateTransaction } from "./private-data-test-fixture";
 import { describe, expect, it } from "vitest";
 
 import { sats } from "../domain/money";
@@ -360,8 +361,8 @@ describe("runtime execution-deadline refund recovery", () => {
     const { runtime, clock, id, shared, cashu } = await abandon("runtime-deadline-stale");
     // A process killed between task_delivered and the progress checkpoint
     // leaves the durable record at escrow_funded.
-    const record = (await shared.privateStore.read("transaction", id)) as Record<string, unknown>;
-    await shared.privateStore.write("transaction", id, { ...record, phase: "escrow_funded" });
+    const record = (await readPrivateTransaction(shared.privateStore, id)) as Record<string, unknown>;
+    await writeLegacyPrivateTransaction(shared.privateStore, id, { ...record, phase: "escrow_funded" });
     clock.advanceTo(DEADLINE);
     expect((await runtime.status(id)).availableActions.refund).toBe(false);
     await expect(runtime.refund(id)).resolves.toMatchObject({ finalOutcome: "refunded" });
@@ -482,7 +483,8 @@ describe("runtime execution-deadline refund recovery", () => {
     const { runtime, clock, relay, id, cashu } = await abandon("runtime-deadline-fork");
     const status = await runtime.status(id);
     clock.advanceTo(DEADLINE);
-    await expect(runtime.refund(id)).resolves.toMatchObject({ finalOutcome: "refunded" });
+    const completedReport = await runtime.refund(id);
+    expect(completedReport.finalOutcome).toBe("refunded");
     const spends = cashu.spendCalls;
 
     // The provider returns after the irreversible refund and publishes a
@@ -518,7 +520,9 @@ describe("runtime execution-deadline refund recovery", () => {
       }),
     }));
 
-    await expect(runtime.report(id)).rejects.toMatchObject({ code: "reconstruction_failed" });
+    // Reporting preserves the verified completion snapshot, without resuming or
+    // treating a later relay fork as authorization for another economic effect.
+    await expect(runtime.report(id)).resolves.toEqual(completedReport);
     await expect(runtime.refund(id)).rejects.toMatchObject({ code: "reconstruction_failed" });
     await expect(runtime.reclaimExpiredFundedEscrows()).resolves.toMatchObject({ reclaimed: 0 });
     expect(cashu.spendCalls).toBe(spends);

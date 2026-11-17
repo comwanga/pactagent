@@ -167,6 +167,7 @@ export interface EconomicEnvironment {
     walletKey: string,
     transactionId: string,
   ) => Promise<DemoTransactionFundingBinding>;
+  readonly privateDataAccountingComplete?: (fundingReference: string, transactionId: string, outcome: "settled" | "refunded", escrowReference: string) => Promise<boolean>;
   readonly finalizeDemoTransaction?: (
     fundingReference: string,
     transactionId: string,
@@ -197,6 +198,7 @@ export interface CreateEconomicEnvironmentInput {
     walletKey: string,
     transactionId: string,
   ) => Promise<DemoTransactionFundingBinding>;
+  readonly privateDataAccountingComplete?: (fundingReference: string, transactionId: string, outcome: "settled" | "refunded", escrowReference: string) => Promise<boolean>;
   readonly finalizeDemoTransaction?: (
     fundingReference: string,
     transactionId: string,
@@ -259,6 +261,7 @@ export function createEconomicEnvironment(
     ...(input.bindDemoTransactionFunding === undefined
       ? {}
       : { bindDemoTransactionFunding: input.bindDemoTransactionFunding }),
+    ...(input.privateDataAccountingComplete === undefined ? {} : { privateDataAccountingComplete: input.privateDataAccountingComplete }),
     ...(input.finalizeDemoTransaction === undefined
       ? {}
       : { finalizeDemoTransaction: input.finalizeDemoTransaction }),
@@ -487,6 +490,7 @@ export async function createLiveEconomicEnvironment(
         }
         return funding;
       },
+      privateDataAccountingComplete: async () => true,
       collectWalletOutputs: async () => {
         // Live mode does not use the Demo Wallet model. Output handles from
         // live escrow operations are managed by the operator, not aggregated
@@ -1519,6 +1523,13 @@ export async function createDemoEconomicEnvironment(
       },
       bindDemoTransactionFunding,
       finalizeDemoTransaction,
+      privateDataAccountingComplete: async (fundingReference, transactionId, outcome, escrowReference) => {
+        const binding = asDemoWalletTransactionBinding(await privateStore.read(DEMO_WALLET_TRANSACTION_SCOPE, fundingReference));
+        if (!binding || binding.state !== "complete" || binding.transactionId !== transactionId ||
+            binding.fundingReference !== fundingReference || binding.outcome !== outcome || binding.escrowReference !== escrowReference) return false;
+        const generation = await readGeneration(binding.walletKey, binding.generation);
+        return generation !== undefined && generation.walletId === binding.walletId && generation.generation === binding.generation;
+      },
       resetDemoWallet: async (walletKey: string, idempotencyKey: string): Promise<WalletSnapshot> => {
         return provisionWallet(walletKey, "reset", idempotencyKey);
       },

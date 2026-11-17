@@ -1,3 +1,4 @@
+import { testPrivateData } from "./private-data-test-fixture";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -371,6 +372,8 @@ async function buildRuntimeConfig(): Promise<{
   const clock = new DeterministicPactAgentClock(ROOT_TIME + clockOffsetSeconds);
   return {
     config: {
+      privateData: testPrivateData(),
+      privateDataAccountingComplete: async () => true,
       identities: fixture.identities,
       references: fixture.references,
       selectedReferences: fixture.selectedReferences,

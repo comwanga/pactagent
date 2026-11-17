@@ -17,6 +17,15 @@ import { RequesterTransactionApp, TransactionStatusView } from "./requester-tran
 
 afterEach(() => cleanup());
 
+it("discloses the configured retention window without promising erasure of every copy", async () => {
+  await act(async () => { render(<RequesterTransactionApp api={fakeApi()} retentionDays={14} />); });
+  const user = userEvent.setup();
+  await reachReview(user);
+  expect(screen.getByText(/14 days after verified settlement or refund/)).toBeTruthy();
+  expect(screen.getByText(/Unfinished transactions stay available for recovery/)).toBeTruthy();
+  expect(screen.getByText(/Relay, provider, and backup copies have separate lifetimes/)).toBeTruthy();
+});
+
 function activeStatus(
   overrides: Partial<RequesterTransactionStatus> = {},
 ): RequesterTransactionStatus {

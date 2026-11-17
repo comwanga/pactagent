@@ -363,6 +363,7 @@ describe("Issue #37 remediation: provisioning and generation authority", () => {
         escrowReference,
       )).rejects.toThrow("injected output owner persistence failure");
       expect((await env.demoWalletStatus!(walletKey)).accountingPending).toBe(true);
+      expect(await env.privateDataAccountingComplete!(binding.fundingReference, transactionId, "settled", escrowReference)).toBe(false);
 
       env.close();
       failOwnerPersistence = false;
@@ -371,9 +372,15 @@ describe("Issue #37 remediation: provisioning and generation authority", () => {
         factories(proofWallet()),
       );
       try {
+        // Inspection must not collect outputs or convert pending accounting to complete.
+        expect(await recoveredEnvironment.privateDataAccountingComplete!(binding.fundingReference, transactionId, "settled", escrowReference)).toBe(false);
         const recovered = await recoveredEnvironment.demoWalletStatus!(walletKey);
         expect(recovered.accountingPending).toBe(false);
         expect(recovered.availableSats).toBe(1000n);
+        expect(await recoveredEnvironment.privateDataAccountingComplete!(binding.fundingReference, transactionId, "settled", escrowReference)).toBe(true);
+        expect(await recoveredEnvironment.privateDataAccountingComplete!(binding.fundingReference, "txn_other", "settled", escrowReference)).toBe(false);
+        expect(await recoveredEnvironment.privateDataAccountingComplete!(binding.fundingReference, transactionId, "refunded", escrowReference)).toBe(false);
+        expect(await recoveredEnvironment.privateDataAccountingComplete!(binding.fundingReference, transactionId, "settled", "other-escrow")).toBe(false);
         await recoveredEnvironment.finalizeDemoTransaction!(
           binding.fundingReference,
           transactionId,

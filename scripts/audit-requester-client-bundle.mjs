@@ -44,6 +44,19 @@ const files = collectFiles(staticDirectory).map((path) => ({
 }));
 const environment = parseLocalEnvironment();
 const failures = [];
+// Inspect the supplied environment too, without printing any key material.
+const privateKeyring = process.env.PACTAGENT_PRIVATE_DATA_KEYRING ?? environment.get("PACTAGENT_PRIVATE_DATA_KEYRING");
+if (privateKeyring) {
+  let values;
+  try {
+    const parsed = JSON.parse(privateKeyring);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    values = Object.values(parsed);
+    if (values.length === 0 || values.some(value => typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value))) throw new Error();
+  } catch { throw new Error("Cannot audit malformed private-data keyring configuration"); }
+  if (values.some(value => files.some(({ content }) => content.includes(value)))) failures.push("private-data encryption key");
+  console.log(`private-data encryption keys: ${failures.length ? "VALUE MATCH" : "no value match"}`);
+}
 
 for (const key of [
   "PACTAGENT_RUNTIME_API_TOKEN",
@@ -75,6 +88,7 @@ for (const sentinel of [
   "PRIVATE-SUMMARY-FOR-",
   "LIVE-ACCEPTANCE-ALPHA",
   "LIVE-PROMPT-ALPHA",
+  "ab".repeat(32), // Synthetic private-data fixture key must never reach a client bundle.
 ]) {
   const matches = files.filter(({ content }) => content.includes(sentinel));
   console.log(`${sentinel}: ${matches.length === 0 ? "absent" : "MATCH"}`);
@@ -88,9 +102,12 @@ for (const identifier of [
   "fundingReference",
   "privateDocument",
   "privatePrompt",
+  "PACTAGENT_PRIVATE_DATA_KEYRING",
+  "PACTAGENT_PRIVATE_DATA_ACTIVE_KEY_ID",
 ]) {
   const matches = files.filter(({ content }) => content.includes(identifier));
   console.log(`${identifier} identifier: ${matches.length} client file(s)`);
+  if (identifier.startsWith("PACTAGENT_PRIVATE_DATA_") && matches.length) failures.push(identifier);
 }
 
 if (failures.length > 0) {

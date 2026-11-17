@@ -1,4 +1,10 @@
 import { processTransactionAdmission, type TransactionAdmission } from "./admission-control";
+import { type PrivateDataCipher, PrivateDataError, isPrivateDataError } from "./private-data";
+import { PrivateTransactionRecords } from "./private-transaction-records";
+import { privateRetentionEligible, privateTransactionFinality } from "./private-retention";
+import { PRIVATE_DATA_SWEEP_INTERVAL_MS } from "./private-data-policy";
+import { parseRequesterSafeReport } from "./requester-api-contracts";
+import { PrivateTaskPublicationError } from "./private-task-transport";
 import { createHash, randomBytes } from "node:crypto";
 import { getEventHash } from "nostr-tools/pure";
 
@@ -50,6 +56,7 @@ import type { NostrRelayAdapter } from "./nostr-relay";
 import {
   PactAgreementPublicationError,
   buildContextFromRelay,
+  retrieveEscrowAuthoritySource,
   retrieveAndReconstructPactAgreement,
   retrievePactAgreementTransitions,
   retrievePactServiceAgreementRoot,
@@ -98,6 +105,9 @@ export function isPactAgentRuntimeError(error: unknown): error is PactAgentRunti
 }
 
 export interface PactAgentRuntimeConfig {
+  readonly privateData: { readonly cipher: PrivateDataCipher; readonly retentionSeconds: number };
+  /** Read-only proof of generation-bound output accounting; never performs collection. */
+  readonly privateDataAccountingComplete?: (fundingReference: string, transactionId: string, outcome: "settled" | "refunded", escrowReference: string) => Promise<boolean>;
   /** Explicit injection for deterministic admission tests; production shares the process gate. */
   readonly transactionAdmission?: TransactionAdmission;
   readonly identities: PactAgentParticipantIdentities;
@@ -273,13 +283,22 @@ interface DurableTransactionRecord {
   readonly requesterDecision?: PactAgentRuntimeRequesterDecision;
   readonly failureCode?: "transaction_failed";
   readonly failureReason?: PactAgentWorkflowErrorCode;
-  readonly privateTerms: DocumentSummaryPrivateTerms;
-  readonly privateSaltHex: string;
+  readonly storageRevision?: number;
+  readonly privateTerms?: DocumentSummaryPrivateTerms;
+  readonly privateSaltHex?: string;
+  readonly retentionStartedAt?: number;
+  readonly purgedAt?: number;
+  readonly terminalReport?: PactAgentWorkflowReport;
+  readonly reportUnavailable?: true;
   readonly escrowReference?: string;
   readonly escrowVersion?: number;
   readonly resultReference?: string;
   readonly settlementReference?: string;
   readonly refundReference?: string;
+}
+
+function requirePrivateData(record: DurableTransactionRecord): asserts record is DurableTransactionRecord & { privateTerms: DocumentSummaryPrivateTerms; privateSaltHex: string } {
+  if (record.purgedAt !== undefined || !record.privateTerms || !record.privateSaltHex) throw new PrivateDataError();
 }
 
 function deriveTransactionId(idempotencyKey: string): string {
@@ -398,12 +417,21 @@ function parseDurableTransactionRecord(value: unknown): DurableTransactionRecord
     (candidate.failureCode !== undefined && candidate.failureCode !== "transaction_failed") ||
     (candidate.failureReason !== undefined &&
       (typeof candidate.failureReason !== "string" || !WORKFLOW_FAILURE_REASONS.has(candidate.failureReason))) ||
-    typeof candidate.privateSaltHex !== "string" ||
-    !/^[0-9a-f]{64}$/.test(candidate.privateSaltHex)
+    (candidate.storageRevision !== undefined && (!Number.isSafeInteger(candidate.storageRevision) || (candidate.storageRevision as number) < 0))
   ) {
     throw new PactAgentRuntimeError("corrupt_record", "Transaction record identity is malformed");
   }
-  const privateTerms = parsePrivateTerms(candidate.privateTerms);
+  const purged = candidate.purgedAt !== undefined;
+  const terminal = candidate.phase === "settled" || candidate.phase === "refunded";
+  const terminalReport = candidate.terminalReport === undefined ? undefined : parseRequesterSafeReport(candidate.terminalReport);
+  if ((candidate.retentionStartedAt !== undefined && (!Number.isSafeInteger(candidate.retentionStartedAt) || (candidate.retentionStartedAt as number) < 0)) ||
+      (candidate.reportUnavailable !== undefined && candidate.reportUnavailable !== true) ||
+      (terminalReport && (!terminal || terminalReport.agreementId !== candidate.agreementId || terminalReport.agreementRootEventId !== candidate.agreementRootEventId || terminalReport.finalOutcome !== candidate.phase || terminalReport.escrowReference !== candidate.escrowReference)) ||
+      (terminalReport && candidate.reportUnavailable) ||
+      (purged && (!terminal || !Number.isSafeInteger(candidate.purgedAt) || (candidate.purgedAt as number) < 0 || candidate.retentionStartedAt === undefined ||
+        candidate.privateTerms !== undefined || candidate.privateSaltHex !== undefined || (!terminalReport && candidate.reportUnavailable !== true)))) throw new PrivateDataError();
+  const privateTerms = purged ? undefined : parsePrivateTerms(candidate.privateTerms);
+  if (!purged && (typeof candidate.privateSaltHex !== "string" || !/^[0-9a-f]{64}$/.test(candidate.privateSaltHex))) throw new PrivateDataError();
   const selectedOffer = parseSelectedOffer(candidate.selectedOffer);
   const requesterDecision = parseRequesterDecision(candidate.requesterDecision);
   return Object.freeze({
@@ -431,8 +459,11 @@ function parseDurableTransactionRecord(value: unknown): DurableTransactionRecord
     ...(candidate.failureReason === undefined
       ? {}
       : { failureReason: candidate.failureReason as PactAgentWorkflowErrorCode }),
-    privateTerms,
-    privateSaltHex: candidate.privateSaltHex,
+    storageRevision: (candidate.storageRevision as number | undefined) ?? 0,
+    ...(purged ? { purgedAt: candidate.purgedAt as number } : { privateTerms, privateSaltHex: candidate.privateSaltHex as string }),
+    ...(candidate.retentionStartedAt === undefined ? {} : { retentionStartedAt: candidate.retentionStartedAt as number }),
+    ...(terminalReport === undefined ? {} : { terminalReport }),
+    ...(candidate.reportUnavailable === true ? { reportUnavailable: true as const } : {}),
     ...(candidate.escrowReference === undefined ? {} : { escrowReference: candidate.escrowReference as string }),
     ...(candidate.escrowVersion === undefined ? {} : { escrowVersion: candidate.escrowVersion as number }),
     ...(candidate.resultReference === undefined ? {} : { resultReference: candidate.resultReference as string }),
@@ -487,6 +518,11 @@ function serializeDurableTransactionRecord(record: DurableTransactionRecord): un
     ...(record.failureReason === undefined ? {} : { failureReason: record.failureReason }),
     privateTerms: record.privateTerms,
     privateSaltHex: record.privateSaltHex,
+    storageRevision: record.storageRevision ?? 0,
+    ...(record.retentionStartedAt === undefined ? {} : { retentionStartedAt: record.retentionStartedAt }),
+    ...(record.purgedAt === undefined ? {} : { purgedAt: record.purgedAt }),
+    ...(record.terminalReport === undefined ? {} : { terminalReport: record.terminalReport }),
+    ...(record.reportUnavailable === true ? { reportUnavailable: true } : {}),
     ...(record.escrowReference === undefined ? {} : { escrowReference: record.escrowReference }),
     ...(record.escrowVersion === undefined ? {} : { escrowVersion: record.escrowVersion }),
     ...(record.resultReference === undefined ? {} : { resultReference: record.resultReference }),
@@ -776,6 +812,9 @@ function resultReferenceFromHistory(history: PactAgreementHistory): string | und
 export class PactAgentRuntime {
   readonly #config: PactAgentRuntimeConfig;
   readonly #admission: TransactionAdmission;
+  readonly #records: PrivateTransactionRecords;
+  #maintenance?: Promise<Readonly<{ inspected: number; purged: number; failed: number }>>;
+  #maintenanceTimer?: ReturnType<typeof setTimeout>;
   readonly #decision: ApprovedRequesterDecision;
   readonly #selectedOffer: PactAgentRuntimeSelectedOffer;
   readonly #decisionSource: "deterministic" | "model";
@@ -783,9 +822,12 @@ export class PactAgentRuntime {
   readonly #executions = new Map<string, Promise<void>>();
   readonly #reclaimFailures = new Map<string, string>();
   #started = false;
+  #stopping = false;
 
   constructor(config: PactAgentRuntimeConfig) {
     this.#config = config;
+    if (!config.privateData || !config.privateStore.listPage || !Number.isSafeInteger(config.privateData.retentionSeconds) || config.privateData.retentionSeconds < 1) throw new PrivateDataError();
+    this.#records = new PrivateTransactionRecords(config.privateStore, config.privateData.cipher);
     this.#admission = config.transactionAdmission ?? processTransactionAdmission();
     this.#decision = buildDecision(config.selectedReferences);
     this.#selectedOffer = buildSelectedOffer(config.selectedReferences);
@@ -802,10 +844,17 @@ export class PactAgentRuntime {
     if (this.#started) return;
     await this.#config.dependencies.relay.connect();
     this.#started = true;
+    this.#stopping = false;
+    void this.maintainPrivateData();
+    this.#scheduleMaintenance();
   }
 
   async shutdown(): Promise<void> {
     if (!this.#started) return;
+    this.#stopping = true;
+    if (this.#maintenanceTimer) clearTimeout(this.#maintenanceTimer);
+    this.#maintenanceTimer = undefined;
+    await this.#maintenance;
     await Promise.allSettled(this.#executions.values());
     this.#started = false;
     await this.#config.dependencies.relay.disconnect();
@@ -834,24 +883,21 @@ export class PactAgentRuntime {
     });
   }
 
-  async #loadRecord(transactionId: string): Promise<DurableTransactionRecord | undefined> {
-    const raw = await this.#config.privateStore.read(TRANSACTION_SCOPE, transactionId);
+  async #loadRecord(transactionId: string, migrate = true): Promise<DurableTransactionRecord | undefined> {
+    const raw = await this.#records.read(transactionId, migrate);
     if (raw === undefined) return undefined;
-    return parseDurableTransactionRecord(raw);
+    try { return parseDurableTransactionRecord(raw); } catch { throw new PrivateDataError(); }
   }
 
   async #persistRecord(record: DurableTransactionRecord): Promise<void> {
-    await this.#config.privateStore.write(
-      TRANSACTION_SCOPE,
-      record.transactionId,
-      serializeDurableTransactionRecord(record),
-    );
+    await this.#records.write(record.transactionId, serializeDurableTransactionRecord(record), record.storageRevision ?? 0);
   }
 
   async #reconstructAgreementState(
     agreementId: string,
     privateTerms: DocumentSummaryPrivateTerms,
     privateSaltHex: string,
+    historical = false,
   ): Promise<ReconstructedAgreementState> {
     const root = await retrievePactServiceAgreementRoot({
       agreementId,
@@ -861,7 +907,18 @@ export class PactAgentRuntime {
     const expectedAuthoritySourceReference = await this.#readEscrowAuthoritySourceReference(
       root.event.id,
     );
-    const baseContext = await reconstructContext(
+    const source = historical ? await retrieveEscrowAuthoritySource({
+      agreementRootEventId: root.event.id, providerPublicKey: this.#config.identities.providerSigner.publicKey,
+      relay: this.#config.dependencies.relay,
+    }) : undefined;
+    if (historical && (!source || (expectedAuthoritySourceReference !== undefined && source.id !== expectedAuthoritySourceReference))) {
+      throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+    }
+    const baseContext = historical ? {
+      root, references: this.#config.references,
+      escrowAuthority: createPactEscrowAuthorityBinding({ root, references: this.#config.references,
+        authority: this.#config.identities.escrowAuthoritySigner.publicKey, source: source! }),
+    } : await reconstructContext(
       root,
       this.#config.references,
       this.#config.identities,
@@ -1127,6 +1184,7 @@ export class PactAgentRuntime {
   }
 
   async #executeAndPersist(record: DurableTransactionRecord): Promise<PactAgentWorkflowReport> {
+    if (record.purgedAt !== undefined) return this.#storedReport(record);
     let workflow: ReturnType<typeof createPactAgentWorkflow> | undefined;
     try {
       let report: PactAgentWorkflowReport;
@@ -1147,6 +1205,7 @@ export class PactAgentRuntime {
       await this.#persistRecoveredRecord(latest, report);
       return report;
     } catch (error) {
+      if (isPrivateDataError(error)) throw error;
       const latest = (await this.#loadRecord(record.transactionId)) ?? record;
       await this.#persistInterruptedRecord(latest, workflow?.escrowCheckpoint, error);
       throw error;
@@ -1157,6 +1216,7 @@ export class PactAgentRuntime {
     record: DurableTransactionRecord,
     workflow: ReturnType<typeof createPactAgentWorkflow>,
   ): Promise<PactAgentWorkflowReport> {
+    requirePrivateData(record);
     const funding = await this.#config.resolveFunding(record.fundingReference);
     const salt = new PactPrivateCommitmentSalt(Buffer.from(record.privateSaltHex, "hex"));
     const onRequesterDecision = async (decision: ApprovedRequesterDecision): Promise<void> => {
@@ -1201,6 +1261,7 @@ export class PactAgentRuntime {
     escrowCheckpoint: Readonly<{ escrowReference?: string; escrowVersion?: number }> | undefined,
     error?: unknown,
   ): Promise<void> {
+    requirePrivateData(initialRecord);
     let recoveredRecord = initialRecord;
     try {
       const { root, history, phase } = await this.#reconstructAgreementState(
@@ -1265,6 +1326,8 @@ export class PactAgentRuntime {
         record.requesterDecision ?? buildRequesterDecisionProjection(this.#decisionSource, this.#decision),
       kind: report.finalOutcome === "refunded" ? "refund" : "successful",
       phase: report.finalOutcome === "refunded" ? "refunded" : "settled",
+      terminalReport: report,
+      reportUnavailable: undefined,
       agreementRootEventId: report.agreementRootEventId,
       escrowReference: report.escrowReference,
       ...(escrow === undefined ? {} : { escrowVersion: escrow.revision }),
@@ -1314,7 +1377,8 @@ export class PactAgentRuntime {
       ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
       : undefined;
     const executing = this.#executions.has(record.transactionId);
-    const reportAvailable = record.phase === "settled" || record.phase === "refunded";
+    const terminal = record.phase === "settled" || record.phase === "refunded";
+    const reportAvailable = terminal && record.terminalReport !== undefined;
     const resolvedNotFunded =
       record.phase === "accepted" &&
       escrow?.operationalState === "prepared" &&
@@ -1350,7 +1414,7 @@ export class PactAgentRuntime {
       (escrowFundedNotReleased && locktimePassed) || refundRecovery || executionDeadlineRefundEligible;
     const resumable =
       !executing &&
-      !reportAvailable &&
+      !terminal &&
       operationalState !== "reconciliation_required" &&
       operationalState !== "resolved_not_funded" &&
       (!expired || escrow !== undefined) &&
@@ -1358,7 +1422,7 @@ export class PactAgentRuntime {
       !refundRecovery;
     const refundable =
       !executing &&
-      !reportAvailable &&
+      !terminal &&
       operationalState !== "reconciliation_required" &&
       operationalState !== "resolved_not_funded" &&
       refundEligible;
@@ -1446,6 +1510,7 @@ export class PactAgentRuntime {
         if (!record) {
           throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
         }
+        if (record.purgedAt !== undefined) return this.#statusForRecord(record);
         const before = record.agreementRootEventId
           ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
           : undefined;
@@ -1519,6 +1584,7 @@ export class PactAgentRuntime {
       if (record.phase === "refunded") {
         return this.#resumeExisting(record);
       }
+      requirePrivateData(record);
       const escrow = record.agreementRootEventId
         ? await this.#readEscrowReferenceAndVersion(record.agreementRootEventId)
         : undefined;
@@ -1640,6 +1706,7 @@ export class PactAgentRuntime {
     escrow: { reference: string; revision: number },
     reconstructed?: ReconstructedAgreementState,
   ): Promise<PactAgentWorkflowReport> {
+    requirePrivateData(record);
     const { root, context, phase, completionDecision } = reconstructed ?? await this.#reconstructAgreementState(
       record.agreementId,
       record.privateTerms,
@@ -1800,11 +1867,126 @@ export class PactAgentRuntime {
     return this.#config.walletBalance(walletKey);
   }
 
+  #storedReport(record: DurableTransactionRecord): PactAgentWorkflowReport {
+    if (!record.terminalReport) throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+    return record.terminalReport;
+  }
+
+  /** Computes a report only. Never invokes resume, reconciliation, signing, publication or Cashu. */
+  async #historicalReport(record: DurableTransactionRecord): Promise<PactAgentWorkflowReport> {
+    if (record.terminalReport) return record.terminalReport;
+    if (record.purgedAt !== undefined) return this.#storedReport(record);
+    requirePrivateData(record);
+    await this.#ensureRelayConnected();
+    try {
+      const reconstructed = await this.#reconstructAgreementState(record.agreementId, record.privateTerms, record.privateSaltHex, true);
+      if (reconstructed.phase !== record.phase || (record.phase !== "settled" && record.phase !== "refunded") ||
+          reconstructed.root.event.id !== record.agreementRootEventId) throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+      const proof = await this.#config.dependencies.settlementStore.read(`escrow:${record.escrowReference}`) as { state?: unknown; settlementReference?: string; refundReference?: string } | undefined;
+      if (proof?.state !== record.phase) throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+      return this.#newWorkflow().historicalReport({
+        kind: record.phase === "refunded" ? "refund" : "successful", phase: record.phase,
+        context: reconstructed.context, privateTerms: record.privateTerms,
+        privateSalt: new PactPrivateCommitmentSalt(Buffer.from(record.privateSaltHex, "hex")),
+        decision: this.#decision, escrowReference: record.escrowReference,
+        escrowVersion: record.escrowVersion, resultReference: record.resultReference ?? resultReferenceFromHistory(reconstructed.history),
+        settlementReference: proof.settlementReference, refundReference: proof.refundReference,
+        completionDecision: reconstructed.completionDecision,
+      });
+    } catch (error) {
+      if (error instanceof PrivateTaskPublicationError && error.code === "task_not_found") {
+        throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+      }
+      if (error instanceof PactAgreementPublicationError && error.code === "agreement_not_found") {
+        throw new PactAgentRuntimeError("report_not_available", "Required historical report material is unavailable");
+      }
+      throw error;
+    }
+  }
+
+  #scheduleMaintenance(): void {
+    if (!this.#started || this.#stopping) return;
+    this.#maintenanceTimer = setTimeout(() => {
+      this.#maintenanceTimer = undefined;
+      void this.maintainPrivateData().then(() => this.#scheduleMaintenance());
+    }, PRIVATE_DATA_SWEEP_INTERVAL_MS);
+    this.#maintenanceTimer.unref();
+  }
+
+  async #accountingComplete(record: DurableTransactionRecord): Promise<boolean> {
+    if ((record.phase !== "settled" && record.phase !== "refunded") || !record.escrowReference) return false;
+    if (this.#config.privateDataAccountingComplete) return this.#config.privateDataAccountingComplete(record.fundingReference, record.transactionId, record.phase, record.escrowReference);
+    // Live mode has operator-managed outputs, not the Demo generation/collection model.
+    return this.#config.economicMode === "live";
+  }
+
+  async #maintainRecord(transactionId: string): Promise<boolean> {
+    if (this.#executions.has(transactionId)) return false;
+    return this.#config.privateStore.withExclusiveLock(TRANSACTION_SCOPE, transactionId, async () => {
+      if (this.#executions.has(transactionId) || this.#stopping) return false;
+      let record = await this.#loadRecord(transactionId);
+      if (!record || record.purgedAt !== undefined || (record.phase !== "settled" && record.phase !== "refunded")) return false;
+      const proof = await this.#config.dependencies.settlementStore.read(`escrow:${record.escrowReference}`);
+      if (!privateTransactionFinality(record, proof, await this.#accountingComplete(record))) return false;
+      let report = record.terminalReport;
+      let unavailable = false;
+      if (!report) {
+        try { report = await this.#historicalReport(record); }
+        catch (error) {
+          if (error instanceof PactAgentRuntimeError && error.code === "report_not_available") unavailable = true;
+          else throw error; // Retrieval failure is not evidence that history is missing.
+        }
+      }
+      if (report && report.lifecycle.at(-1)?.eventId !== (proof as { lastPublishedTransitionId: string }).lastPublishedTransitionId) throw new PrivateDataError();
+      const now = this.#config.dependencies.clock.now();
+      if (!Number.isSafeInteger(now) || now < 0) throw new PrivateDataError();
+      if (record.retentionStartedAt === undefined || report !== record.terminalReport || unavailable !== (record.reportUnavailable === true)) {
+        await this.#persistRecord({ ...record, terminalReport: report, reportUnavailable: unavailable ? true : undefined,
+          retentionStartedAt: record.retentionStartedAt ?? now });
+        record = (await this.#loadRecord(transactionId))!;
+      }
+      const latestProof = await this.#config.dependencies.settlementStore.read(`escrow:${record.escrowReference}`);
+      if (!latestProof || typeof latestProof !== "object" ||
+          (latestProof as { revision?: unknown }).revision !== (proof as { revision: number }).revision ||
+          (latestProof as { lastPublishedTransitionId?: unknown }).lastPublishedTransitionId !== (proof as { lastPublishedTransitionId: string }).lastPublishedTransitionId) return false;
+      if (!privateRetentionEligible(record, latestProof, await this.#accountingComplete(record), now, this.#config.privateData.retentionSeconds)) return false;
+      await this.#persistRecord({ ...record, privateTerms: undefined, privateSaltHex: undefined, purgedAt: now });
+      return true;
+    });
+  }
+
+  /** Coalesced, bounded-page maintenance; no economic work and no execution permits. */
+  maintainPrivateData(): Promise<Readonly<{ inspected: number; purged: number; failed: number }>> {
+    if (this.#maintenance) return this.#maintenance;
+    const operation = (async () => {
+      let inspected = 0, purged = 0, failed = 0;
+      let after: string | undefined;
+      try {
+        if (!this.#config.privateStore.listPage) throw new PrivateDataError();
+        while (this.#started && !this.#stopping) {
+          const page = await this.#config.privateStore.listPage(TRANSACTION_SCOPE, after, 100);
+          if (page.length === 0) break;
+          for (const id of page) {
+            if (this.#stopping) break;
+            inspected++;
+            try { if (await this.#maintainRecord(id)) purged++; } catch { failed++; }
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }
+          after = page.at(-1);
+        }
+      } catch { failed++; }
+      if (failed) console.warn("Private-data maintenance could not process some records");
+      return Object.freeze({ inspected, purged, failed });
+    })();
+    this.#maintenance = operation;
+    void operation.finally(() => { if (this.#maintenance === operation) this.#maintenance = undefined; });
+    return operation;
+  }
+
   /** Safe terminal report; only available once the transaction reached a terminal outcome. */
   async report(transactionId: string): Promise<PactAgentWorkflowReport> {
     this.#ensureRunning();
-    await this.#ensureRelayConnected();
-    const record = await this.#loadRecord(transactionId);
+    const record = await this.#loadRecord(transactionId, false);
     if (!record) {
       throw new PactAgentRuntimeError("transaction_not_found", "Transaction was not found");
     }
@@ -1814,7 +1996,8 @@ export class PactAgentRuntime {
     if (record.phase !== "settled" && record.phase !== "refunded") {
       throw new PactAgentRuntimeError("report_not_available", "Report is not available");
     }
-    return this.#admission.run("recovery", () => this.#resumeExisting(record));
+    if (record.terminalReport || record.purgedAt !== undefined) return this.#storedReport(record);
+    return this.#admission.run("recovery", () => this.#historicalReport(record));
   }
 
   /** Complete private summary, available only to the authorized requester. */
@@ -1867,6 +2050,8 @@ export class PactAgentRuntime {
     record: DurableTransactionRecord,
     reconcileOnly = false,
   ): Promise<PactAgentWorkflowReport> {
+    if (record.purgedAt !== undefined) return this.#storedReport(record);
+    requirePrivateData(record);
     const { root, context, history, phase, completionDecision } = await this.#reconstructAgreementState(
       record.agreementId,
       record.privateTerms,

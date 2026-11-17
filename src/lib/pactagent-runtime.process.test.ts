@@ -17,6 +17,7 @@ import {
 import type { SignedNostrEvent } from "../domain/nostr";
 import { buildFixture, transactionId } from "./pactagent-runtime-test-fixture";
 import { createSqlitePactCashuEscrowSettlementStore } from "./cashu-escrow-settlement";
+import { testPrivateData } from "./private-data-test-fixture";
 
 interface ProcessMessage {
   type: "checkpoint" | "ready" | "result" | "error" | "fatal";
@@ -261,7 +262,9 @@ function publicStates(directory: string): string[] {
 function privateStoreMarkers(directory: string): string[] {
   const database = new DatabaseSync(join(directory, "cashu-private.sqlite"), { readOnly: true });
   try {
-    const rows = database.prepare("SELECT value_json FROM pact_cashu_private_values").all() as Array<{
+    const rows = database.prepare("SELECT scope, store_key, value_json FROM pact_cashu_private_values").all() as Array<{
+      scope: string;
+      store_key: string;
       value_json: string;
     }>;
     const markers: string[] = [];
@@ -286,7 +289,10 @@ function privateStoreMarkers(directory: string): string[] {
         Object.entries(value).forEach(([entryKey, entry]) => visit(entry, entryKey));
       }
     };
-    rows.forEach((row) => visit(JSON.parse(row.value_json) as unknown));
+    rows.forEach((row) => {
+      const raw = JSON.parse(row.value_json) as unknown;
+      visit(row.scope === "transaction" ? testPrivateData().cipher.open(row.scope, row.store_key, raw) : raw);
+    });
     return markers;
   } finally {
     database.close();
