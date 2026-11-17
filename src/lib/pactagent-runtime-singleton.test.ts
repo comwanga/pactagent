@@ -29,6 +29,7 @@ function environment() {
 }
 
 beforeEach(() => {
+  vi.stubEnv("PACTAGENT_RUNTIME_API_TOKEN", "test-runtime-token-valid-0123");
   singleton.resetPactAgentRuntime();
   factories.environment.mockReset();
   factories.runtime.mockReset();
@@ -36,6 +37,7 @@ beforeEach(() => {
 afterEach(async () => {
   await singleton.shutdownPactAgentRuntime().catch(() => undefined);
   singleton.resetPactAgentRuntime();
+  vi.unstubAllEnvs();
 });
 
 describe("shared runtime initialization ownership", () => {

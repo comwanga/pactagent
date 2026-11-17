@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { isAdmissionLimitError } from "./admission-control";
 import {
   createPactAgentRuntime,
@@ -72,6 +73,10 @@ export async function getPactAgentRuntime(): Promise<PactAgentRuntime> {
       state.runtime ??= createPactAgentRuntime(state.explicitConfig);
       await state.runtime.start();
     } else {
+      // The env-based (live) path requires a valid runtime API token before
+      // initializing privileged runtime resources. The explicit-config path
+      // is used by deterministic tests that do not rely on bearer auth.
+      validateRuntimeApiToken();
       // The factory owns cleanup on failure. Publish only its completed environment.
       const environment = await createPactAgentRuntimeFromEnv();
       state.liveEnv = environment;
@@ -214,9 +219,46 @@ export function apiStatusForError(error: unknown): number {
   }
 }
 
-/** Bearer-token authorization for the API surface. */
+/*
+ * Runtime API bearer-token policy (Issue #67).
+ *
+ * The token is a privileged operator credential, not per-user authorization.
+ * It grants read access to every transaction's private result and control of
+ * refund, reconcile, and reset. Its format is validated at startup; its
+ * comparison is constant-time over SHA-256 digests so the comparison itself
+ * does not leak the configured value through timing.
+ */
+
+const BEARER_PREFIX = "Bearer ";
+const TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,512}$/;
+const MAX_PRESENTED_LENGTH = 512;
+
+/** Validates PACTAGENT_RUNTIME_API_TOKEN at startup; never prints the token. */
+export function validateRuntimeApiToken(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): void {
+  const token = env.PACTAGENT_RUNTIME_API_TOKEN;
+  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) {
+    throw new PactAgentRuntimeError(
+      "invalid_configuration",
+      "PACTAGENT_RUNTIME_API_TOKEN is missing or below the minimum required format (at least 16 alphanumeric, dash, or underscore characters); generate a cryptographically random token",
+    );
+  }
+}
+
+/** Bearer-token authorization for the API surface. Constant-time over SHA-256 digests. */
 export function isAuthorized(request: Request, token: string | undefined): boolean {
-  if (!token) return false;
+  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) return false;
   const header = request.headers.get("authorization");
-  return header === `Bearer ${token}`;
+  if (
+    header === null ||
+    header.length < BEARER_PREFIX.length ||
+    header.length > BEARER_PREFIX.length + MAX_PRESENTED_LENGTH
+  ) return false;
+  if (header.slice(0, BEARER_PREFIX.length) !== BEARER_PREFIX) return false;
+  const presented = header.slice(BEARER_PREFIX.length);
+  if (presented.length === 0) return false;
+  const presentedDigest = createHash("sha256").update(presented).digest();
+  const expectedDigest = createHash("sha256").update(token).digest();
+  return timingSafeEqual(presentedDigest, expectedDigest);
 }
