@@ -1,3 +1,5 @@
+import { testPrivateData, readPrivateTransaction, writeLegacyPrivateTransaction } from "./private-data-test-fixture";
+import { PrivateDataError } from "./private-data";
 import { TransactionAdmission } from "./admission-control";
 import { createHash } from "node:crypto";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
@@ -337,8 +339,9 @@ function crashAfterSettlementState(
 function crashBeforeTerminalTransactionWrite(store: CashuPrivateStore): CashuPrivateStore {
   let armed = true;
   return {
-    read: (scope, key) => store.read(scope, key),
-    async write(scope, key, value) {
+    ...store,
+    async compareAndSet(scope, key, expected, encrypted) {
+      const value = scope === "transaction" ? testPrivateData().cipher.open(scope, key, encrypted) : encrypted;
       if (
         armed &&
         typeof value === "object" &&
@@ -349,7 +352,7 @@ function crashBeforeTerminalTransactionWrite(store: CashuPrivateStore): CashuPri
         armed = false;
         throw new Error("simulated_process_crash_before_terminal_transaction_write");
       }
-      await store.write(scope, key, value);
+      return store.compareAndSet!(scope, key, expected, encrypted);
     },
     withExclusiveLock: (scope, key, operation) => store.withExclusiveLock(scope, key, operation),
   };
@@ -392,6 +395,8 @@ function buildRuntime(
     refundSpendKey: fixture.refundSpendKey,
   };
   const runtime = createPactAgentRuntime({
+    privateData: testPrivateData(),
+    privateDataAccountingComplete: async () => true,
     transactionAdmission: options.transactionAdmission,
     identities: fixture.identities,
     dependencies,
@@ -785,9 +790,7 @@ describe("Pre-#37 recovery remediation", () => {
       code: "private_transport_failed",
     });
     clock.advanceTo(ROOT_TIME + 1000);
-    await expect(first.runtime.refund(id)).rejects.toThrow(
-      "simulated_process_crash_before_terminal_transaction_write",
-    );
+    await expect(first.runtime.refund(id)).rejects.toThrow(PrivateDataError);
     expect(cashu.spendSubmissions).toBe(1);
     expect((await first.runtime.status(id)).availableActions).toEqual({
       resume: false,
@@ -932,7 +935,7 @@ describe("Pre-#37 recovery remediation", () => {
       escrowReference: string;
     };
     const escrowKey = `escrow:${binding.escrowReference}`;
-    const originalTransaction = (await shared.privateStore.read("transaction", fundedId)) as Record<string, unknown>;
+    const originalTransaction = (await readPrivateTransaction(shared.privateStore, fundedId)) as Record<string, unknown>;
 
     const setEscrowState = async (
       state: string,
@@ -953,8 +956,8 @@ describe("Pre-#37 recovery remediation", () => {
       ).toBe(true);
     };
     const setTransactionPhase = async (phase: string) => {
-      const current = (await shared.privateStore.read("transaction", fundedId)) as Record<string, unknown>;
-      await shared.privateStore.write("transaction", fundedId, { ...current, phase });
+      const current = (await readPrivateTransaction(shared.privateStore, fundedId)) as Record<string, unknown>;
+      await writeLegacyPrivateTransaction(shared.privateStore, fundedId, { ...current, phase });
     };
     const expectActions = async (resume: boolean, reconcile: boolean, refund: boolean) => {
       expect((await runtime.status(fundedId)).availableActions).toEqual({ resume, reconcile, refund });
@@ -1000,7 +1003,7 @@ describe("Pre-#37 recovery remediation", () => {
     await setTransactionPhase("refunded");
     await expectActions(false, false, false);
 
-    await shared.privateStore.write("transaction", fundedId, {
+    await writeLegacyPrivateTransaction(shared.privateStore, fundedId, {
       ...originalTransaction,
       phase: "accepted",
     });

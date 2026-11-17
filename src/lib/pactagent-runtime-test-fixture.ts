@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { testPrivateData } from "./private-data-test-fixture";
 import { deserializeProofs } from "@cashu/cashu-ts";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 
@@ -344,6 +345,8 @@ export function buildRuntimeConfig(
     refundSpendKey: fixture.refundSpendKey,
   };
   const config: PactAgentRuntimeConfig = {
+    privateData: testPrivateData(),
+    privateDataAccountingComplete: async () => true,
     identities: fixture.identities,
     dependencies,
     privateStore: shared.privateStore,

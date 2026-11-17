@@ -38,6 +38,7 @@ import {
 } from "@/lib/requester-ui-model";
 
 import { PactAgentLogo } from "./pactagent-logo";
+import { DEFAULT_PRIVATE_DATA_RETENTION_DAYS } from "@/lib/private-data-policy";
 
 type Screen = "landing" | "form" | "review" | "status";
 type RecoveryAction = "resume" | "reconcile" | "refund";
@@ -57,6 +58,7 @@ function withoutFormError(errors: FormErrors, key: keyof FormErrors): FormErrors
 export interface RequesterTransactionAppProps {
   readonly api?: RequesterTransactionApi;
   readonly pollIntervalMs?: number;
+  readonly retentionDays?: number;
 }
 
 const SUCCESS_PHASES = [
@@ -95,7 +97,7 @@ const ERROR_COPY: Readonly<Partial<Record<RequesterApiErrorCode, string>>> = {
   invalid_request: "The transaction request was rejected as invalid.",
   document_too_large: "The document exceeds the 1 MiB upload limit.",
   result_not_available: "The private result is not available yet.",
-  report_not_available: "The safe transaction report is not available yet.",
+  report_not_available: "The safe transaction report is unavailable; required historical material may be missing.",
   runtime_unavailable: "The transaction service is temporarily unavailable.",
   transaction_not_found: "The transaction was not found.",
   transaction_in_progress: "The transaction is already in progress.",
@@ -436,6 +438,7 @@ export function TransactionStatusView({
 export function RequesterTransactionApp({
   api,
   pollIntervalMs = 2_500,
+  retentionDays = DEFAULT_PRIVATE_DATA_RETENTION_DAYS,
 }: RequesterTransactionAppProps): React.ReactNode {
   const client = useMemo<RequesterTransactionApi>(() => api ?? new RequesterApiClient(), [api]);
   const [screen, setScreen] = useState<Screen>("landing");
@@ -1044,6 +1047,12 @@ export function RequesterTransactionApp({
                 The source document and optional prompt are private transaction inputs. This integrated
                 PoC uses configured test ecash, and submission may begin an economic workflow against the
                 configured test mint. It does not support real sats.
+              </p>
+              <p>
+                Private documents, prompts, and commitment salts become eligible for removal {retentionDays} days after verified settlement or refund,
+                completed wallet accounting, and the first successful retention check. Safe reports and public references remain when available.
+                Unfinished transactions stay available for recovery. Historical reports may be unavailable if required evidence is missing.
+                Relay, provider, and backup copies have separate lifetimes; removal here does not erase every copy.
               </p>
             </div>
             {submissionError ? (

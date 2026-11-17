@@ -1,3 +1,5 @@
+import { PrivateDataError } from "./private-data";
+import { testPrivateData, readPrivateTransaction, writeLegacyPrivateTransaction, PRIVATE_DATA_TEST_ENV } from "./private-data-test-fixture";
 import { TransactionAdmission } from "./admission-control";
 import { createHash } from "node:crypto";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
@@ -48,7 +50,6 @@ import { createLocalNostrEncrypter } from "./private-task-transport";
 import type { NostrFilter, NostrRelayAdapter } from "./nostr-relay";
 import {
   createPactAgentRuntime,
-  PactAgentRuntimeError,
   type PactAgentRuntime,
 } from "./pactagent-runtime";
 import {
@@ -383,6 +384,8 @@ function buildRuntime(
     refundSpendKey: fixture.refundSpendKey,
   };
   const runtime = createPactAgentRuntime({
+    privateData: testPrivateData(),
+    privateDataAccountingComplete: async () => true,
     transactionAdmission: options.transactionAdmission,
     identities: fixture.identities,
     dependencies,
@@ -503,6 +506,7 @@ describe("PactAgent runtime", () => {
       refundSpendKey: fixture.refundSpendKey,
     };
     const environment = {
+      ...PRIVATE_DATA_TEST_ENV,
       PACTAGENT_ECONOMIC_MODE: "live",
       PACTAGENT_LIVE_RELAY_URL: relay.url,
       PACTAGENT_CASHU_TEST_MINT_URL: MINT_URL,
@@ -608,7 +612,7 @@ describe("PactAgent runtime", () => {
     const shared = sharedStores();
     const expectedTransactionId = transactionId("identity-boundary-0001");
     const relay = new InspectingRootRelay(async (event) => {
-      const stored = await shared.privateStore.read("transaction", expectedTransactionId) as {
+      const stored = await readPrivateTransaction(shared.privateStore, expectedTransactionId) as {
         phase?: string;
         agreementId?: string;
       } | undefined;
@@ -628,15 +632,15 @@ describe("PactAgent runtime", () => {
     let transactionWrites = 0;
     let blockCheckpoints = true;
     const privateStore: CashuPrivateStore = {
-      read: (scope, key) => base.read(scope, key),
-      async write(scope, key, value) {
+      ...base,
+      async compareAndSet(scope, key, expected, value) {
         if (scope === "transaction") {
           transactionWrites += 1;
           if (blockCheckpoints && transactionWrites > 1) {
             throw new Error("simulated hard-stop checkpoint loss");
           }
         }
-        await base.write(scope, key, value);
+        return base.compareAndSet!(scope, key, expected, value);
       },
       withExclusiveLock: (scope, key, operation) => base.withExclusiveLock(scope, key, operation),
     };
@@ -648,8 +652,8 @@ describe("PactAgent runtime", () => {
     await first.runtime.start();
     await expect(
       first.runtime.startTransaction(startInput("hard-stop-identity")),
-    ).rejects.toThrow("simulated hard-stop checkpoint loss");
-    const durable = await base.read("transaction", transactionId("hard-stop-identity")) as {
+    ).rejects.toThrow(PrivateDataError);
+    const durable = await readPrivateTransaction(base, transactionId("hard-stop-identity")) as {
       phase?: string;
       agreementId?: string;
     };
@@ -1059,8 +1063,8 @@ describe("PactAgent runtime", () => {
     const shared = sharedStores();
     const { runtime } = buildRuntime(fixture, shared);
     await runtime.start();
-    await shared.privateStore.write("transaction", "txn_bad", { version: 1, phase: "not-a-phase" });
-    await expect(runtime.resume("txn_bad")).rejects.toBeInstanceOf(PactAgentRuntimeError);
+    await writeLegacyPrivateTransaction(shared.privateStore, "txn_bad", { version: 1, phase: "not-a-phase" });
+    await expect(runtime.resume("txn_bad")).rejects.toBeInstanceOf(PrivateDataError);
     await runtime.shutdown();
   }, 30_000);
 
@@ -1083,7 +1087,7 @@ describe("PactAgent runtime", () => {
     const { runtime } = buildRuntime(fixture, shared);
     await runtime.start();
     const started = await runtime.startTransaction(startInput("refunded-action-projection"));
-    const raw = await shared.privateStore.read("transaction", started.transactionId) as Record<string, unknown>;
+    const raw = await readPrivateTransaction(shared.privateStore, started.transactionId) as Record<string, unknown>;
     const refunded: Record<string, unknown> = {
       ...raw,
       kind: "refund",
@@ -1092,13 +1096,13 @@ describe("PactAgent runtime", () => {
     };
     delete refunded.settlementReference;
     delete refunded.resultReference;
-    await shared.privateStore.write("transaction", started.transactionId, refunded);
+    await writeLegacyPrivateTransaction(shared.privateStore, started.transactionId, refunded);
     expect(await runtime.status(started.transactionId)).toMatchObject({
       operationalState: "refunded",
       finalOutcome: "refunded",
       availableActions: { resume: false, reconcile: false },
       resultAvailable: false,
-      reportAvailable: true,
+      reportAvailable: false,
     });
     await runtime.shutdown();
   }, 30_000);

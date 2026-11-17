@@ -413,6 +413,9 @@ async function main() {
     PACTAGENT_LIVE_ESCROW_AUTHORITY_PUBLIC_KEY: escrowPubkey,
     PACTAGENT_ECONOMIC_MODE: "demo",
     PACTAGENT_RUNTIME_MODE: "hosted",
+    // Ephemeral key for this disposable acceptance state only; never a production default.
+    PACTAGENT_PRIVATE_DATA_KEYRING: JSON.stringify({ acceptance: randomBytes(32).toString("hex") }),
+    PACTAGENT_PRIVATE_DATA_ACTIVE_KEY_ID: "acceptance",
     PACTAGENT_DEMO_CASHU_MINT_URL: `http://localhost:${mintPort}`,
     PACTAGENT_DEMO_STATE_DIRECTORY: resolve(ACCEPTANCE_STATE, "demo-state"),
     PACTAGENT_LIVE_STATE_DIRECTORY: resolve(ACCEPTANCE_STATE, "unused-live-state"),

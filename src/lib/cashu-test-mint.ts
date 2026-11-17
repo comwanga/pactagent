@@ -718,6 +718,8 @@ export interface CashuTestMintPort {
 export interface CashuPrivateStore {
   read(scope: string, key: string): Promise<unknown | undefined>;
   write(scope: string, key: string, value: unknown): Promise<void>;
+  /** Atomic replacement for private-record migration and retention; never replays an economic operation. */
+  compareAndSet?(scope: string, key: string, expected: unknown | undefined, value: unknown): Promise<boolean>;
   withExclusiveLock<T>(scope: string, key: string, operation: () => Promise<T>): Promise<T>;
   /**
    * Optional enumeration of the keys persisted under a scope. Durable and
@@ -727,6 +729,7 @@ export interface CashuPrivateStore {
    * fail safe rather than assuming an empty store.
    */
   list?(scope: string): Promise<readonly string[]>;
+  listPage?(scope: string, after: string | undefined, limit: number): Promise<readonly string[]>;
 }
 
 export class PrivateCashuProofImport {
@@ -748,6 +751,12 @@ export function createInMemoryCashuPrivateStore(): CashuPrivateStore {
     async write(scope: string, key: string, value: unknown): Promise<void> {
       records.set(`${scope}:${key}`, value);
     },
+    async compareAndSet(scope: string, key: string, expected: unknown | undefined, value: unknown): Promise<boolean> {
+      const id = `${scope}:${key}`;
+      if (JSON.stringify(records.get(id)) !== JSON.stringify(expected)) return false;
+      records.set(id, value);
+      return true;
+    },
     async list(scope: string): Promise<readonly string[]> {
       const prefix = `${scope}:`;
       return Object.freeze(
@@ -755,6 +764,11 @@ export function createInMemoryCashuPrivateStore(): CashuPrivateStore {
           .filter((composite) => composite.startsWith(prefix))
           .map((composite) => composite.slice(prefix.length)),
       );
+    },
+    async listPage(scope: string, after: string | undefined, limit: number): Promise<readonly string[]> {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) return privateStoreFailure();
+      const prefix = `${scope}:`;
+      return [...records.keys()].filter(id => id.startsWith(prefix)).map(id => id.slice(prefix.length)).sort().filter(id => after === undefined || id > after).slice(0, limit);
     },
     async withExclusiveLock<T>(
       scope: string,
@@ -879,6 +893,7 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
   const listStatement = database.prepare(
     "SELECT store_key FROM pact_cashu_private_values WHERE scope = ?",
   );
+  const pageStatement = database.prepare("SELECT store_key FROM pact_cashu_private_values WHERE scope = ? AND store_key > ? ORDER BY store_key LIMIT ?");
   const writeStatement = database.prepare(`
     INSERT INTO pact_cashu_private_values (scope, store_key, value_json)
     VALUES (?, ?, ?)
@@ -999,6 +1014,14 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
         return privateStoreFailure();
       }
     },
+    async listPage(scope: string, after: string | undefined, limit: number): Promise<readonly string[]> {
+      ensureOpen();
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) return privateStoreFailure();
+      try {
+        const rows = pageStatement.all(privateStoreIdentifier(scope), after === undefined ? "" : privateStoreIdentifier(after), limit) as { store_key: string }[];
+        return rows.map(row => row.store_key);
+      } catch { return privateStoreFailure(); }
+    },
     async write(scope: string, key: string, value: unknown): Promise<void> {
       ensureOpen();
       const normalizedScope = privateStoreIdentifier(scope);
@@ -1014,6 +1037,34 @@ export function createSqliteCashuPrivateStore(databasePath: string): SqliteCashu
         );
         restrictPrivateStoreFiles(resolvedPath);
       } catch (error) {
+        if (error instanceof CashuTestMintError) throw error;
+        return privateStoreFailure();
+      }
+    },
+    async compareAndSet(scope: string, key: string, expected: unknown | undefined, value: unknown): Promise<boolean> {
+      ensureOpen();
+      const normalizedScope = privateStoreIdentifier(scope);
+      const normalizedKey = privateStoreIdentifier(key);
+      const serialized = serializePrivateStoreValue(value);
+      let transaction = false;
+      try {
+        database.exec("BEGIN IMMEDIATE");
+        transaction = true;
+        const row = readStatement.get(normalizedScope, normalizedKey) as { value_json: string } | undefined;
+        const current = row === undefined ? undefined : parsePrivateStoreValue(row.value_json);
+        if (JSON.stringify(current) !== JSON.stringify(expected)) {
+          database.exec("ROLLBACK");
+          transaction = false;
+          return false;
+        }
+        for (const lease of activeLeasesByScope.get(normalizedScope) ?? []) lease.assertOwned();
+        writeStatement.run(normalizedScope, normalizedKey, serialized);
+        database.exec("COMMIT");
+        transaction = false;
+        restrictPrivateStoreFiles(resolvedPath);
+        return true;
+      } catch (error) {
+        if (transaction) { try { database.exec("ROLLBACK"); } catch { /* Preserve failure. */ } }
         if (error instanceof CashuTestMintError) throw error;
         return privateStoreFailure();
       }

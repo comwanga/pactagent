@@ -1625,6 +1625,23 @@ export class PactAgentWorkflow {
     return this.#finishRefund(context, finalHistory, refunded.escrow.refundReference);
   }
 
+  /** Historical inspection only: never advances a lifecycle or submits any operation. */
+  async historicalReport(state: PactAgentWorkflowResumeState): Promise<PactAgentWorkflowReport> {
+    return this.#runExclusive(async () => {
+      this.#resetState();
+      this.#seedResumeState(state);
+      const history = await this.#reconstructHistory(state.context);
+      if (history.currentState !== state.phase) workflowError("reconstruction_failed", "Historical terminal state is unavailable");
+      if (state.phase === "settled" && state.kind === "successful" && state.settlementReference) {
+        return this.#finishSuccessful(state.context, history, state.settlementReference);
+      }
+      if (state.phase === "refunded" && state.kind === "refund" && state.refundReference) {
+        return this.#finishRefund(state.context, history, state.refundReference);
+      }
+      workflowError("reconstruction_failed", "Historical terminal references are unavailable");
+    });
+  }
+
   /**
    * Continues a previously interrupted successful transaction from a persisted
    * resume state. It reconstructs the authoritative agreement state from the
