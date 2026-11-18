@@ -57,7 +57,7 @@
     "runtime:bootstrap": "node scripts/runtime-bootstrap.mjs"
   },
   "dependencies": {
-    "@cashu/cashu-ts": "4.10.1",
+    "@cashu/cashu-ts": "4.13.1",
     "next": "16.4.6",
     "nostr-tools": "2.25.2",
     "react": "19.3.1",
